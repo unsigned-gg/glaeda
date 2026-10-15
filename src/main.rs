@@ -16,12 +16,16 @@ use std::{
     io::{Seek as _, SeekFrom},
 };
 
+use std::net::{SocketAddr, TcpListener};
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
-#[cfg(unix)]
 use glaeda::artifact::Sha256Digest;
 use glaeda::cache_inventory::{
     CacheReportRequest, CacheStateId, MAX_CACHE_INVENTORY_DOCUMENT_BYTES,
     build_cache_inventory_report, decode_cache_inventory, render_cache_inventory_human,
+};
+use glaeda::cortex_revenant_bridge::{
+    CortexDelegatedLaneSvid, CortexLaneSpiffeId, CortexRevenantBridge, GodseatLanePrincipal,
 };
 use glaeda::disposable_launchd_service::DisposableLaunchdServiceDesiredState;
 #[cfg(target_os = "macos")]
@@ -45,6 +49,8 @@ use glaeda::doctor::{inspect_host, render_human as render_doctor};
 use glaeda::durable_journal::StateStoreJournalCheckpoint;
 #[cfg(target_os = "linux")]
 use glaeda::durable_lane_execution::SystemLaneCommandRunner;
+use glaeda::estate_http_admission::{serve_bounded_loopback_requests, validate_loopback_bind_addr};
+use glaeda::execution_admission::EpochMillis;
 #[cfg(target_os = "linux")]
 use glaeda::host_preparation_command::{
     HostPreparationCommandDecision, HostPreparationCommandDisposition, decide_host_preparation,
@@ -88,6 +94,7 @@ use glaeda::runner_user_observation::observe_verified_runner_user;
 use glaeda::state::JournalId;
 #[cfg(target_os = "linux")]
 use glaeda::trusted_guest_control_dispatcher::serve_trusted_guest_control_stdio;
+use glaeda::worker_pool_kernel_solver::{WorkerPoolConfig, WorkerPoolKernelSolver};
 use personal_worker_cancel_command::{
     PersonalWorkerCancelCommandError, cancel_queued_job, render_cancel_receipt_human,
 };
@@ -174,6 +181,8 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+    /// Serve bounded loopback HTTP/1.1 /v1/health and /v1/admission/evaluate exchanges.
+    EstateServe(Box<EstateServeArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -469,6 +478,67 @@ enum JobCommand {
     },
 }
 
+#[derive(Debug, Args)]
+struct EstateServeArgs {
+    /// Loopback socket address to bind (must be 127.0.0.1:<port> or [::1]:<port>).
+    #[arg(long, default_value = "127.0.0.1:9471")]
+    bind: SocketAddr,
+    /// Exact bounded number of HTTP/1.1 requests to serve before exiting cleanly.
+    #[arg(long)]
+    max_requests: usize,
+    /// Machine label for Cortex lane SPIFFE ID (e.g. ceres).
+    #[arg(long)]
+    machine: String,
+    /// Session label for Cortex lane SPIFFE ID (e.g. session-agy-ceres-estate-w4g-p1).
+    #[arg(long)]
+    session: String,
+    /// Content digest of the delegated lane SVID (sha256:<64-hex>).
+    #[arg(long)]
+    svid_digest: String,
+    /// Delegated lane SVID issuance timestamp in epoch milliseconds.
+    #[arg(long)]
+    svid_issued_at: u64,
+    /// Delegated lane SVID expiration timestamp in epoch milliseconds.
+    #[arg(long)]
+    svid_expires_at: u64,
+    /// Godseat lane name for lane.<name>@godseat.unsigned.gg.
+    #[arg(long, default_value = "aegis")]
+    godseat_lane: String,
+    /// Authorized SSH public key line for the Godseat lane principal.
+    #[arg(long)]
+    godseat_public_key: String,
+    /// Baseline observation timestamp in epoch milliseconds for GET /v1/health probes.
+    #[arg(long)]
+    observed_at: u64,
+    /// Maximum concurrent workers in the worker-pool solver.
+    #[arg(long, default_value_t = 4)]
+    max_workers: usize,
+    /// Drum-Buffer-Rope buffer cap for queued items.
+    #[arg(long, default_value_t = 4)]
+    dbr_buffer_cap: usize,
+    /// Maximum in-flight memory bytes across active + buffered work.
+    #[arg(long, default_value_t = 1_073_741_824)]
+    max_in_flight_bytes: u64,
+    /// Maximum in-flight CPU millicores across active + buffered work.
+    #[arg(long, default_value_t = 4_000)]
+    max_in_flight_cpu_millis: u32,
+    /// Baseline service rate per worker in milli-items/sec.
+    #[arg(long, default_value_t = 2_000)]
+    service_rate_milli_per_sec: u64,
+    /// Kingman utilization cliff threshold in basis points.
+    #[arg(long, default_value_t = 8_500)]
+    utilization_cliff_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct EstateServeReceipt {
+    schema_version: u8,
+    bound_addr: String,
+    served_requests: usize,
+    lane_spiffe_id: String,
+    godseat_principal: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorReport<'a> {
     schema_version: u8,
@@ -693,6 +763,7 @@ fn main() -> ExitCode {
                 run_cache_inventory(cli.output, &inventory, CacheReportRequest::ReclaimDryRun)
             }
         },
+        Command::EstateServe(arguments) => run_estate_serve(cli.output, &arguments),
     }
 }
 
@@ -704,6 +775,127 @@ fn run_trusted_guest_control_stdio() -> ExitCode {
             eprintln!("guest-control transport failure: {}", error.code());
             ExitCode::from(2)
         }
+    }
+}
+
+fn build_estate_bridge_from_args(
+    args: &EstateServeArgs,
+) -> Result<(SocketAddr, EpochMillis, CortexRevenantBridge), (&'static str, String)> {
+    let validated_addr =
+        validate_loopback_bind_addr(args.bind).map_err(|err| (err.code, err.to_string()))?;
+    if args.max_requests == 0 {
+        return Err((
+            "invalid_max_requests",
+            "estate-serve requires --max-requests to be at least 1".to_owned(),
+        ));
+    }
+    let observed_at = EpochMillis::new(args.observed_at).map_err(|_| {
+        (
+            "invalid_observed_at",
+            "observed_at must be a positive epoch millisecond timestamp".to_owned(),
+        )
+    })?;
+    let spiffe_id = CortexLaneSpiffeId::new(&args.machine, &args.session)
+        .map_err(|err| (err.code, err.to_string()))?;
+    let svid_digest = Sha256Digest::parse(&args.svid_digest).map_err(|_| {
+        (
+            "invalid_svid_digest",
+            "svid_digest must be a canonical sha256:<64-hex> digest".to_owned(),
+        )
+    })?;
+    let issued_at = EpochMillis::new(args.svid_issued_at).map_err(|_| {
+        (
+            "invalid_svid_issued_at",
+            "svid_issued_at must be a positive epoch millisecond timestamp".to_owned(),
+        )
+    })?;
+    let expires_at = EpochMillis::new(args.svid_expires_at).map_err(|_| {
+        (
+            "invalid_svid_expires_at",
+            "svid_expires_at must be a positive epoch millisecond timestamp".to_owned(),
+        )
+    })?;
+    let svid = CortexDelegatedLaneSvid::new(spiffe_id, issued_at, expires_at, svid_digest)
+        .map_err(|err| (err.code, err.to_string()))?;
+    let godseat_principal = GodseatLanePrincipal::new(&args.godseat_lane, &args.godseat_public_key)
+        .map_err(|err| (err.code, err.to_string()))?;
+    let mut pool_config = WorkerPoolConfig::default_personal_worker(args.max_workers);
+    pool_config.worker_lanes = args.max_workers;
+    pool_config.max_wip_cap = args.max_workers.saturating_add(args.dbr_buffer_cap);
+    pool_config.max_in_flight_bytes = args.max_in_flight_bytes;
+    pool_config.schedulable_cpu_millis = args.max_in_flight_cpu_millis;
+    pool_config.utilization_cliff_bps = u32::from(args.utilization_cliff_bps);
+    if args.service_rate_milli_per_sec > 0 {
+        pool_config.base_service_time_ms = (1_000_000_u64 / args.service_rate_milli_per_sec).max(1);
+    }
+    let solver =
+        WorkerPoolKernelSolver::new(pool_config).map_err(|err| (err.code, err.to_string()))?;
+    let bridge = CortexRevenantBridge::new(svid, godseat_principal, solver);
+    Ok((validated_addr, observed_at, bridge))
+}
+
+fn run_estate_serve(output: OutputFormat, args: &EstateServeArgs) -> ExitCode {
+    let (validated_addr, observed_at, bridge) = match build_estate_bridge_from_args(args) {
+        Ok(tuple) => tuple,
+        Err((code, message)) => return emit_runtime_error(output, code, message),
+    };
+    let listener = match TcpListener::bind(validated_addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                "estate_http_bind_failed",
+                format!("failed to bind loopback estate HTTP listener: {error}"),
+            );
+        }
+    };
+    let bound_addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            return emit_runtime_error(
+                output,
+                "estate_http_local_addr_failed",
+                format!("failed to inspect local address of estate HTTP listener: {error}"),
+            );
+        }
+    };
+    let served_requests = match serve_bounded_loopback_requests(
+        &listener,
+        &bridge,
+        args.max_requests,
+        observed_at,
+        0,
+        0,
+        0,
+        0,
+        500,
+        100,
+    ) {
+        Ok(count) => count,
+        Err(err) => return emit_runtime_error(output, err.code, err.to_string()),
+    };
+    let receipt = EstateServeReceipt {
+        schema_version: 1,
+        bound_addr: bound_addr.to_string(),
+        served_requests,
+        lane_spiffe_id: bridge.lane_svid().identity.spiffe_id.clone(),
+        godseat_principal: bridge.godseat_principal().principal.clone(),
+    };
+    match output {
+        OutputFormat::Human => {
+            println!(
+                "estate-serve completed: bound={} served_requests={} spiffe={} principal={}",
+                receipt.bound_addr,
+                receipt.served_requests,
+                receipt.lane_spiffe_id,
+                receipt.godseat_principal
+            );
+            ExitCode::SUCCESS
+        }
+        OutputFormat::Json => match print_json(&receipt) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(2),
+        },
     }
 }
 
@@ -2017,7 +2209,7 @@ mod tests {
 
     use super::{
         CacheCommand, Cli, Command, HostCommand, JobCommand, QueueCommand, ServiceCommand,
-        ServiceDesiredState, WorkerCommand,
+        ServiceDesiredState, WorkerCommand, build_estate_bridge_from_args,
     };
     #[cfg(target_os = "linux")]
     use super::{
@@ -2614,5 +2806,119 @@ mod tests {
             .is_err()
         );
         assert!(classify_host_prepare_actions(&[]).is_err());
+    }
+
+    #[test]
+    fn estate_serve_parses_loopback_flags_and_builds_validated_bridge() {
+        let cli = Cli::try_parse_from([
+            "glaeda",
+            "--output",
+            "json",
+            "estate-serve",
+            "--bind",
+            "127.0.0.1:0",
+            "--max-requests",
+            "2",
+            "--machine",
+            "ceres",
+            "--session",
+            "session-agy-ceres-estate-w4g-p1",
+            "--svid-digest",
+            "sha256:abababababababababababababababababababababababababababababababab",
+            "--svid-issued-at",
+            "10000",
+            "--svid-expires-at",
+            "60000",
+            "--godseat-lane",
+            "aegis",
+            "--godseat-public-key",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGlaedaAegisTestKey0001",
+            "--observed-at",
+            "20000",
+        ])
+        .expect("parse estate-serve command");
+
+        let Command::EstateServe(args) = cli.command else {
+            panic!("expected estate-serve command");
+        };
+        let (addr, observed_at, bridge) =
+            build_estate_bridge_from_args(&args).expect("valid estate bridge args");
+        assert!(addr.ip().is_loopback());
+        assert_eq!(observed_at.get(), 20_000);
+        assert_eq!(
+            bridge.lane_svid().identity.spiffe_id,
+            "spiffe://unsigned.gg/host/ceres/lane/session-agy-ceres-estate-w4g-p1"
+        );
+        assert_eq!(
+            bridge.godseat_principal().principal,
+            "harness-aegis@agents.cerebral.work"
+        );
+    }
+
+    #[test]
+    fn estate_serve_rejects_wildcard_bind_and_zero_max_requests() {
+        let wildcard_cli = Cli::try_parse_from([
+            "glaeda",
+            "estate-serve",
+            "--bind",
+            "0.0.0.0:9471",
+            "--max-requests",
+            "2",
+            "--machine",
+            "ceres",
+            "--session",
+            "session-agy-ceres-estate-w4g-p1",
+            "--svid-digest",
+            "sha256:abababababababababababababababababababababababababababababababab",
+            "--svid-issued-at",
+            "10000",
+            "--svid-expires-at",
+            "60000",
+            "--godseat-lane",
+            "aegis",
+            "--godseat-public-key",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGlaedaAegisTestKey0001",
+            "--observed-at",
+            "20000",
+        ])
+        .expect("parse wildcard estate-serve command");
+        let Command::EstateServe(wildcard_args) = wildcard_cli.command else {
+            panic!("expected estate-serve command");
+        };
+        let err = build_estate_bridge_from_args(&wildcard_args)
+            .expect_err("wildcard bind must be rejected");
+        assert_eq!(err.0, "non_loopback_bind_forbidden");
+
+        let zero_req_cli = Cli::try_parse_from([
+            "glaeda",
+            "estate-serve",
+            "--bind",
+            "127.0.0.1:9471",
+            "--max-requests",
+            "0",
+            "--machine",
+            "ceres",
+            "--session",
+            "session-agy-ceres-estate-w4g-p1",
+            "--svid-digest",
+            "sha256:abababababababababababababababababababababababababababababababab",
+            "--svid-issued-at",
+            "10000",
+            "--svid-expires-at",
+            "60000",
+            "--godseat-lane",
+            "aegis",
+            "--godseat-public-key",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGlaedaAegisTestKey0001",
+            "--observed-at",
+            "20000",
+        ])
+        .expect("parse zero max-requests estate-serve command");
+        let Command::EstateServe(zero_req_args) = zero_req_cli.command else {
+            panic!("expected estate-serve command");
+        };
+        let err = build_estate_bridge_from_args(&zero_req_args)
+            .expect_err("zero max_requests must be rejected");
+        assert_eq!(err.0, "invalid_max_requests");
     }
 }

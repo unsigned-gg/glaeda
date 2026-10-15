@@ -100,7 +100,7 @@ let the gate hold the line.
 | `cmux_workload_verification_adapter` | `all` | library | 1 |
 | `compute_execution_request` | `all` | binary | 2 |
 | `compute_workload` | `all` | binary | 6 |
-| `cortex_revenant_bridge` | `all` | binary | 4 |
+| `cortex_revenant_bridge` | `all` | binary | 5 |
 | `debian_package_plan` | `target_os="linux"` | binary | 16 |
 | `debian_package_probe` | `target_os="linux"` | binary | 2 |
 | `debian_package_recovery` | `target_os="linux"` | none | 0 |
@@ -121,8 +121,8 @@ let the gate hold the line.
 | `doctor` | `all` | binary | 1 |
 | `durable_journal` | `all` | binary | 9 |
 | `durable_lane_execution` | `target_os="linux"` | binary | 6 |
-| `estate_http_admission` | `all` | binary | 2 |
-| `execution_admission` | `all` | binary | 88 |
+| `estate_http_admission` | `all` | binary | 3 |
+| `execution_admission` | `all` | binary | 89 |
 | `execution_capacity` | `all` | binary | 3 |
 | `execution_receipt` | `all` | binary | 9 |
 | `execution_receipt_store` | `all` | tests | 1 |
@@ -296,4 +296,4 @@ let the gate hold the line.
 | `verification_profile` | `all` | binary | 50 |
 | `verification_profile_preflight_adapter` | `all` | library | 1 |
 | `verification_profile_registry` | `all` | library | 8 |
-| `worker_pool_kernel_solver` | `all` | binary | 6 |
+| `worker_pool_kernel_solver` | `all` | binary | 7 |

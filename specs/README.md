@@ -10,3 +10,4 @@ This directory tracks architectural specifications for `glaeda` in the estate pl
 | [0002](./0002-littles-law-dbr-worker-pool-kernel-solver.md) | Active | Little's Law, Drum-Buffer-Rope, and Byte-Weighted Worker-Pool Kernel Solver | `src/worker_pool_kernel_solver.rs`, `src/personal_worker_queue.rs`, `src/execution_admission.rs` |
 | [0003](./0003-cortex-revenant-lane-and-mesh-pool-bridge.md) | Active | Cortex + Revenant Lane & Mesh-Pool Execution Bridge | `src/cortex_revenant_bridge.rs`, `src/worker_pool_kernel_solver.rs`, `src/personal_worker_queue.rs` |
 | [0004](./0004-http-health-and-admission-surface.md) | Active | Bounded HTTP/1.1 `/v1/health` and Admission Surface | `src/estate_http_admission.rs`, `src/cortex_revenant_bridge.rs` |
+| [0005](./0005-estate-serve-cli-subcommand.md) | Active | `glaeda estate-serve` CLI Subcommand | `src/main.rs`, `src/estate_http_admission.rs`, `src/cortex_revenant_bridge.rs` |
