@@ -24,6 +24,8 @@ pub mod cmux_workload_verification_adapter;
 pub mod compute_execution_request;
 /// Pure workload-family-neutral identity for declared compute semantics.
 pub mod compute_workload;
+/// Three-way bridge connecting Cortex delegated lane SVIDs, Revenant Wayfinder/mesh-pool, and Glaeda worker-pool solver.
+pub mod cortex_revenant_bridge;
 #[cfg(target_os = "linux")]
 pub mod debian_package_plan;
 #[cfg(target_os = "linux")]
@@ -461,6 +463,8 @@ pub mod verification_isolation_referee;
 pub mod verification_profile;
 pub mod verification_profile_preflight_adapter;
 pub mod verification_profile_registry;
+/// Deterministic Little's Law (`L = λW`), Kingman `G/G/m`, Drum-Buffer-Rope, and `MemoryBound` worker-pool kernel solver.
+pub mod worker_pool_kernel_solver;
 
 use serde::Serialize;
 
