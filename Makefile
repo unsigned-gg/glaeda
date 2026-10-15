@@ -28,6 +28,7 @@ test-solver:
 	$(CARGO) test -j $(JOBS) --locked --lib worker_pool_kernel_solver
 	$(CARGO) test -j $(JOBS) --locked --lib cortex_revenant_bridge
 	$(CARGO) test -j $(JOBS) --locked --lib estate_http_admission
+	$(CARGO) test -j $(JOBS) --locked --bin glaeda estate_serve
 	$(CARGO) test -j $(JOBS) --locked --test worker_pool_kernel_solver_contract
 	$(CARGO) test -j $(JOBS) --locked --test cortex_revenant_bridge_contract
 	$(CARGO) test -j $(JOBS) --locked --test estate_http_admission_contract
@@ -44,6 +45,7 @@ spec-check:
 	@test -f specs/0002-littles-law-dbr-worker-pool-kernel-solver.md
 	@test -f specs/0003-cortex-revenant-lane-and-mesh-pool-bridge.md
 	@test -f specs/0004-http-health-and-admission-surface.md
+	@test -f specs/0005-estate-serve-cli-subcommand.md
 	@test -f .agents/persona.md
 	@echo "specs verified"
 
