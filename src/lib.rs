@@ -80,6 +80,8 @@ pub mod doctor;
 pub mod durable_journal;
 #[cfg(target_os = "linux")]
 pub mod durable_lane_execution;
+/// Bounded HTTP/1.1 `/v1/health` and `/v1/admission/evaluate` control-plane surface.
+pub mod estate_http_admission;
 #[cfg_attr(test, allow(clippy::too_many_arguments))]
 pub mod execution_admission;
 /// Pure product-neutral resource ownership and fail-closed capacity arithmetic.

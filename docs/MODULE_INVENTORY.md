@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **208**
-- Reach: **100 binary**, **63 library**, **11 tests**, **34 none**
+- Exported modules: **209**
+- Reach: **101 binary**, **63 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -91,7 +91,7 @@ let the gate hold the line.
 | `actions_runner_readiness` | `all` | library | 7 |
 | `adaptive_ci_routing` | `all` | none | 0 |
 | `adaptive_verification_compiler` | `all` | library | 2 |
-| `artifact` | `all` | binary | 165 |
+| `artifact` | `all` | binary | 167 |
 | `cache_inventory` | `all` | binary | 5 |
 | `cargo_target_holder_observation` | `target_os="linux"` | binary | 4 |
 | `cargo_target_observation` | `target_os="linux"` | binary | 7 |
@@ -100,7 +100,7 @@ let the gate hold the line.
 | `cmux_workload_verification_adapter` | `all` | library | 1 |
 | `compute_execution_request` | `all` | binary | 2 |
 | `compute_workload` | `all` | binary | 6 |
-| `cortex_revenant_bridge` | `all` | binary | 2 |
+| `cortex_revenant_bridge` | `all` | binary | 4 |
 | `debian_package_plan` | `target_os="linux"` | binary | 16 |
 | `debian_package_probe` | `target_os="linux"` | binary | 2 |
 | `debian_package_recovery` | `target_os="linux"` | none | 0 |
@@ -121,7 +121,8 @@ let the gate hold the line.
 | `doctor` | `all` | binary | 1 |
 | `durable_journal` | `all` | binary | 9 |
 | `durable_lane_execution` | `target_os="linux"` | binary | 6 |
-| `execution_admission` | `all` | binary | 86 |
+| `estate_http_admission` | `all` | binary | 2 |
+| `execution_admission` | `all` | binary | 88 |
 | `execution_capacity` | `all` | binary | 3 |
 | `execution_receipt` | `all` | binary | 9 |
 | `execution_receipt_store` | `all` | tests | 1 |
@@ -213,7 +214,7 @@ let the gate hold the line.
 | `personal_worker_operator_read` | `all` | library | 7 |
 | `personal_worker_operator_store` | `all` | library | 5 |
 | `personal_worker_pid_capacity` | `all` | binary | 2 |
-| `personal_worker_queue` | `all` | binary | 54 |
+| `personal_worker_queue` | `all` | binary | 55 |
 | `personal_worker_read_model` | `all` | library | 11 |
 | `personal_worker_repository_result` | `all` | library | 4 |
 | `personal_worker_runner_readiness` | `all` | library | 2 |
@@ -295,4 +296,4 @@ let the gate hold the line.
 | `verification_profile` | `all` | binary | 50 |
 | `verification_profile_preflight_adapter` | `all` | library | 1 |
 | `verification_profile_registry` | `all` | library | 8 |
-| `worker_pool_kernel_solver` | `all` | binary | 4 |
+| `worker_pool_kernel_solver` | `all` | binary | 6 |
