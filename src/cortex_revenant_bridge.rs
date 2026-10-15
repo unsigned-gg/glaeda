@@ -600,6 +600,32 @@ impl CortexRevenantBridge {
             bridge_receipt_digest,
         })
     }
+
+    /// Build a content-addressed [`crate::estate_http_admission::EstateHealthReport`] for this
+    /// bridge and the observed worker-pool state.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_health_report(
+        &self,
+        observed_at: EpochMillis,
+        active_workers: usize,
+        queue_depth: usize,
+        in_flight_bytes: u64,
+        in_flight_cpu_millis: u32,
+        arrival_rate_milli_per_sec: u64,
+        context_switch_rate_bps: u32,
+    ) -> crate::estate_http_admission::EstateHealthReport {
+        crate::estate_http_admission::build_estate_health_report(
+            self,
+            observed_at,
+            active_workers,
+            queue_depth,
+            in_flight_bytes,
+            in_flight_cpu_millis,
+            arrival_rate_milli_per_sec,
+            context_switch_rate_bps,
+        )
+    }
 }
 
 fn compute_bridge_receipt_digest(
