@@ -91,6 +91,14 @@ impl PersonalWorkerPriority {
             u8::try_from(age_millis / PERSONAL_WORKER_PRIORITY_AGING_MILLIS).unwrap_or(u8::MAX);
         self.base_rank().saturating_add(promotions).min(2)
     }
+
+    /// Map a Revenant `wayfinder` 4-rank priority into a Glaeda personal-worker priority class.
+    #[must_use]
+    pub const fn from_wayfinder(
+        priority: crate::cortex_revenant_bridge::WayfinderPriority,
+    ) -> Self {
+        priority.to_personal_worker_priority()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

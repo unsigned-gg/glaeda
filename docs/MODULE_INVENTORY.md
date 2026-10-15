@@ -36,7 +36,7 @@ being measured.
 ## Totals
 
 - Exported modules: **208**
-- Reach: **99 binary**, **63 library**, **12 tests**, **34 none**
+- Reach: **100 binary**, **63 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -100,7 +100,7 @@ let the gate hold the line.
 | `cmux_workload_verification_adapter` | `all` | library | 1 |
 | `compute_execution_request` | `all` | binary | 2 |
 | `compute_workload` | `all` | binary | 6 |
-| `cortex_revenant_bridge` | `all` | tests | 1 |
+| `cortex_revenant_bridge` | `all` | binary | 2 |
 | `debian_package_plan` | `target_os="linux"` | binary | 16 |
 | `debian_package_probe` | `target_os="linux"` | binary | 2 |
 | `debian_package_recovery` | `target_os="linux"` | none | 0 |
