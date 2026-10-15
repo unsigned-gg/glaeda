@@ -1,4 +1,50 @@
-.PHONY: work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove quarry-runner-autoidle-enable quarry-runner-autoidle-disable quarry-runner-autoidle-status
+# Glaeda Makefile — enforces host ceres -j 2 throttling rule for estate targets
+JOBS ?= 2
+CARGO ?= cargo
+
+.PHONY: all build release check test test-solver fmt clippy module-inventory threat-model-check spec-check smoke work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove quarry-runner-autoidle-enable quarry-runner-autoidle-disable quarry-runner-autoidle-status
+
+all: check test
+
+build:
+	$(CARGO) build -j $(JOBS) --locked
+
+release:
+	$(CARGO) build -j $(JOBS) --locked --release
+
+check:
+	$(CARGO) check -j $(JOBS) --locked --all-targets
+
+fmt:
+	$(CARGO) fmt --all -- --check
+
+clippy:
+	$(CARGO) clippy -j $(JOBS) --locked --all-targets -- -D warnings
+
+test:
+	$(CARGO) test -j $(JOBS) --locked
+
+test-solver:
+	$(CARGO) test -j $(JOBS) --locked --lib worker_pool_kernel_solver
+	$(CARGO) test -j $(JOBS) --locked --lib cortex_revenant_bridge
+	$(CARGO) test -j $(JOBS) --locked --test worker_pool_kernel_solver_contract
+	$(CARGO) test -j $(JOBS) --locked --test cortex_revenant_bridge_contract
+
+module-inventory:
+	GLAEDA_WRITE_MODULE_INVENTORY=1 $(CARGO) test -j $(JOBS) --locked --test module_inventory
+
+threat-model-check:
+	$(CARGO) test -j $(JOBS) --locked --test threat_model_enforcement_bindings
+
+spec-check:
+	@test -f specs/README.md
+	@test -f specs/0001-trust-tiered-hot-runtime-and-workload-identity.md
+	@test -f specs/0002-littles-law-dbr-worker-pool-kernel-solver.md
+	@test -f specs/0003-cortex-revenant-lane-and-mesh-pool-bridge.md
+	@test -f .agents/persona.md
+	@echo "specs verified"
+
+smoke: test-solver threat-model-check spec-check
 
 work:
 	@bash scripts/macbook-workspace.sh tmux
@@ -76,4 +122,3 @@ quarry-runner-autoidle-disable:
 
 quarry-runner-autoidle-status:
 	@bash scripts/quarry-trusted-runner.sh autoidle-status
-

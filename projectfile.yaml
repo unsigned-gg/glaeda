@@ -1,0 +1,60 @@
+# Schema v1 — canonical reference: cerebral-docs/specs/projectfile-schema.md
+name: glaeda
+description: "Sandboxed execution fabric and hot-runtime platform with Little's Law / DBR worker-pool kernel solver, Landlock/bwrap/cgroup isolation, and verified receipt digests"
+kind: service
+domain: platform
+category: runtime
+tier: core
+status: active
+visibility: private
+
+languages: [rust]
+frameworks: [axum, tokio]
+
+build:
+  install: "cargo fetch"
+  dev: "cargo run -j 2 --bin glaeda -- daemon"
+  build: "cargo build -j 2 --release"
+  test: "cargo test -j 2 --locked"
+  lint: "cargo clippy -j 2 --all-targets -- -D warnings"
+  fmt: "cargo fmt --check"
+  typecheck: "cargo check -j 2 --all-targets"
+
+ports:
+  http: 8420
+
+health:
+  endpoint: /v1/health
+  protocol: http
+
+deploy:
+  target: systemd
+  environments:
+    local:
+      host: 127.0.0.1
+
+specs:
+  dir: specs
+  framework: leanspec
+
+depends_on:
+  - cortex
+
+consumers:
+  - cortex
+  - agent-sandbox
+  - reverie
+
+tags:
+  - sandbox
+  - runtime
+  - worker-pool
+  - queueing-theory
+  - littles-law
+  - landlock
+  - execution-fabric
+
+links:
+  repo: https://github.com/unsigned-gg/glaeda
+  docs: docs/
+  upstream: https://github.com/manaflow-ai/glaeda

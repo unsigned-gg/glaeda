@@ -91,6 +91,14 @@ impl PersonalWorkerPriority {
             u8::try_from(age_millis / PERSONAL_WORKER_PRIORITY_AGING_MILLIS).unwrap_or(u8::MAX);
         self.base_rank().saturating_add(promotions).min(2)
     }
+
+    /// Map a Revenant `wayfinder` 4-rank priority into a Glaeda personal-worker priority class.
+    #[must_use]
+    pub const fn from_wayfinder(
+        priority: crate::cortex_revenant_bridge::WayfinderPriority,
+    ) -> Self {
+        priority.to_personal_worker_priority()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1166,4 +1174,40 @@ fn visibility_for_request(
         start_time,
         worker_profile,
     }
+}
+
+/// Evaluate Little's Law (`W = L / λ`), Kingman `G/G/m` queue delay, and Drum-Buffer-Rope
+/// admission for a [`PersonalWorkerQueueInput`] snapshot.
+#[must_use]
+pub fn evaluate_queue_flow_metrics(
+    input: &PersonalWorkerQueueInput,
+    arrival_rate_milli_per_sec: u64,
+    context_switch_rate_bps: u32,
+    candidate_limits: ExecutionResourceLimits,
+    candidate_priority: PersonalWorkerPriority,
+) -> crate::worker_pool_kernel_solver::WorkerPoolFlowMetrics {
+    let config = crate::worker_pool_kernel_solver::WorkerPoolConfig::default_personal_worker(
+        MAX_PERSONAL_WORKER_ACTIVE_RESERVATIONS,
+    );
+    let in_flight_bytes: u64 = input
+        .active
+        .iter()
+        .filter_map(|a| a.admission.applied_limits().map(|l| l.memory_bytes))
+        .sum();
+    let in_flight_cpu_millis: u32 = input
+        .active
+        .iter()
+        .filter_map(|a| a.admission.applied_limits().map(|l| l.cpu_millis))
+        .sum();
+    crate::worker_pool_kernel_solver::WorkerPoolFlowMetrics::evaluate(
+        &config,
+        input.active.len(),
+        input.queued.len(),
+        in_flight_bytes,
+        in_flight_cpu_millis,
+        arrival_rate_milli_per_sec,
+        context_switch_rate_bps,
+        candidate_limits,
+        candidate_priority,
+    )
 }
