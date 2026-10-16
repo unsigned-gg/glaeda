@@ -253,7 +253,7 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
         };
         let body = serde_json::to_string(&wire_req).expect("json");
         let req = format!(
-            "POST /v1/admission/evaluate HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /v1/estate/admit HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -262,6 +262,7 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
         let mut resp = String::new();
         client.read_to_string(&mut resp).expect("read 2");
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("\"admitted\":true"));
         assert!(resp.contains("\"tasks_solved\":2"));
         assert!(resp.contains("\"bridge_receipt_digest\":\"sha256:"));
     }
