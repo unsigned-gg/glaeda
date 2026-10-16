@@ -2,7 +2,7 @@
 JOBS ?= 2
 CARGO ?= cargo
 
-.PHONY: all build release check test test-solver fmt clippy module-inventory threat-model-check spec-check smoke work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove quarry-runner-autoidle-enable quarry-runner-autoidle-disable quarry-runner-autoidle-status
+.PHONY: all build release check test test-solver fmt clippy deny module-inventory threat-model-check spec-check smoke work work-cmux work-cmux-setup work-tmux vm vm-create vm-bootstrap vm-check vm-up vm-tmux vm-status vm-sync vm-doctor vm-observe vm-stop quarry-runner-install quarry-runner-status quarry-runner-route quarry-runner-unroute quarry-runner-pause quarry-runner-resume quarry-runner-remove quarry-runner-autoidle-enable quarry-runner-autoidle-disable quarry-runner-autoidle-status
 
 all: check test
 
@@ -20,6 +20,9 @@ fmt:
 
 clippy:
 	$(CARGO) clippy -j $(JOBS) --locked --all-targets -- -D warnings
+
+deny:
+	$(CARGO) deny check
 
 test:
 	$(CARGO) test -j $(JOBS) --locked
@@ -51,6 +54,10 @@ spec-check:
 	@test -f specs/0008-estate-durable-execution-receipt-composition.md
 	@test -f specs/0009-estate-diagnostic-kernel-composition.md
 	@test -f specs/0010-estate-failure-diagnostic-and-remediation-composition.md
+	@test -f specs/0011-estate-rust-tooling-and-config.md
+	@test -f .cargo/config.toml
+	@test -f clippy.toml
+	@test -f deny.toml
 	@test -f .agents/persona.md
 	@echo "specs verified"
 
