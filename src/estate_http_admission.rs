@@ -21,10 +21,18 @@ use crate::execution_receipt_store::{
     ExecutionReceiptPublication, ExecutionReceiptStoreErrorKind, publish_execution_receipt,
     read_execution_receipt,
 };
+use crate::failure_diagnostic::{
+    FailureDiagnosis, FailureEvidence, ProbeObservation, diagnose_failure,
+};
 use crate::hot_fleet_latency_summary::{
     HotFleetLatencyComparisonReportV1, compare_hot_fleet_abba_with_latency,
 };
 use crate::hot_fleet_window::HotFleetWindowReceiptV1;
+use crate::operator_error::OperatorErrorCode;
+use crate::operator_remediation::{
+    OperatorRemediationCandidate, RemediationApplicability, RemediationConfidence,
+    RemediationSafety,
+};
 use crate::personal_worker_queue::PersonalWorkerPriority;
 use crate::rust_memory_diagnostic::{
     RustMemoryDiagnosticInput, RustMemoryDiagnosticReport, classify_rust_memory,
@@ -467,16 +475,16 @@ pub fn handle_http_request_bytes(
         }
     }
 
-    if let Some(expected_len) = declared_content_length {
-        if expected_len > MAX_ESTATE_HTTP_REQUEST_BYTES || body_bytes.len() < expected_len {
-            return error_response(
-                400,
-                "Bad Request",
-                "request.content_length",
-                "content_length_mismatch",
-                "HTTP request body length does not match declared Content-Length",
-            );
-        }
+    if let Some(expected_len) = declared_content_length
+        && (expected_len > MAX_ESTATE_HTTP_REQUEST_BYTES || body_bytes.len() < expected_len)
+    {
+        return error_response(
+            400,
+            "Bad Request",
+            "request.content_length",
+            "content_length_mismatch",
+            "HTTP request body length does not match declared Content-Length",
+        );
     }
 
     let effective_body = match declared_content_length {
@@ -845,6 +853,68 @@ pub fn evaluate_estate_hot_fleet_latency(
             "hot_fleet_latency",
             "hot_fleet_comparison_refused",
             "hot-fleet A-B-B-A windows are not comparable",
+        )
+    })
+}
+
+/// Evaluate structured [`FailureEvidence`] and an optional [`ProbeObservation`] through the
+/// canonical [`diagnose_failure`] advisory diagnostic kernel without side effects.
+///
+/// # Errors
+///
+/// Returns an [`EstateHttpAdmissionError`] if the evidence or probe fails validation.
+pub fn evaluate_estate_failure_diagnostic(
+    evidence: &FailureEvidence,
+    probe: Option<ProbeObservation>,
+) -> Result<FailureDiagnosis, EstateHttpAdmissionError> {
+    diagnose_failure(evidence, probe).map_err(|_| {
+        EstateHttpAdmissionError::new(
+            "failure_diagnostic",
+            "failure_diagnostic_invalid",
+            "failure diagnostic evidence or probe observation failed validation",
+        )
+    })
+}
+
+/// Construct and validate a non-authorizing [`OperatorRemediationCandidate`] for the estate
+/// control plane without side effects.
+///
+/// # Errors
+///
+/// Returns an [`EstateHttpAdmissionError`] if the candidate violates policy, safety, rollback,
+/// or evidence preconditions.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_estate_operator_remediation(
+    source_error: OperatorErrorCode,
+    action_id: impl Into<String>,
+    summary: impl Into<String>,
+    confidence: RemediationConfidence,
+    safety: RemediationSafety,
+    applicability: RemediationApplicability,
+    repair_budget_units: u16,
+    checkpoint_required: bool,
+    fresh_verification_required: bool,
+    circuit_breaker_required: bool,
+    required_evidence: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<OperatorRemediationCandidate, EstateHttpAdmissionError> {
+    OperatorRemediationCandidate::new(
+        source_error,
+        action_id,
+        summary,
+        confidence,
+        safety,
+        applicability,
+        repair_budget_units,
+        checkpoint_required,
+        fresh_verification_required,
+        circuit_breaker_required,
+        required_evidence,
+    )
+    .map_err(|_| {
+        EstateHttpAdmissionError::new(
+            "operator_remediation",
+            "operator_remediation_invalid",
+            "operator remediation candidate failed policy or safety validation",
         )
     })
 }
@@ -1687,5 +1757,73 @@ mod tests {
         let invalid_abba = evaluate_estate_hot_fleet_latency([&a1, &a2, &b1, &b2])
             .expect_err("non-ABBA arm order must fail closed");
         assert_eq!(invalid_abba.code, "hot_fleet_comparison_refused");
+    }
+
+    #[test]
+    fn estate_failure_diagnostic_and_operator_remediation_wrappers_validate_and_classify() {
+        use crate::failure_diagnostic::{
+            DiagnosticProbe, DiagnosticProbeResult, FailureClass, FailureExitClass, FailurePhase,
+            KnownFailureSignature, RepositoryCommandStatus, SourceRepairDisposition, SourceScope,
+        };
+        use crate::operator_remediation::RemediationOwnership;
+
+        let evidence = FailureEvidence::new(
+            FailureExitClass::NonZero,
+            FailurePhase::SourceCompile,
+            "Build tagged macOS app",
+            60_000,
+        )
+        .expect("valid failure evidence")
+        .with_source_scope(SourceScope::BranchSpecific)
+        .with_repository_command_status(RepositoryCommandStatus::Executed)
+        .with_signature(KnownFailureSignature::SwiftWarningBudgetExceeded)
+        .expect("signature");
+
+        let diagnosis = evaluate_estate_failure_diagnostic(&evidence, None)
+            .expect("valid failure evidence must classify cleanly");
+        assert_eq!(diagnosis.failure_class(), FailureClass::SourceCompileError);
+        assert_eq!(diagnosis.source_repair(), SourceRepairDisposition::Required);
+        assert!(!diagnosis.authorizes_mutation());
+
+        let disallowed_probe = ProbeObservation::new(
+            DiagnosticProbe::ResolveAndHttpsHead,
+            DiagnosticProbeResult::DnsHealthy,
+        );
+        let diag_err = evaluate_estate_failure_diagnostic(&evidence, Some(disallowed_probe))
+            .expect_err("disallowed probe for failure class must fail closed");
+        assert_eq!(diag_err.code, "failure_diagnostic_invalid");
+
+        let candidate = evaluate_estate_operator_remediation(
+            OperatorErrorCode::CleanupFailed,
+            "remove-owned-expired-worker",
+            "Remove one exactly owned expired disposable worker.",
+            RemediationConfidence::Exact,
+            RemediationSafety::Reversible,
+            RemediationApplicability::PolicyEligible,
+            1,
+            true,
+            true,
+            true,
+            ["exact_ownership", "expired_lease", "no_active_job"],
+        )
+        .expect("valid remediation candidate");
+        assert_eq!(candidate.ownership(), RemediationOwnership::ExactManaged);
+        assert!(!candidate.authorizes_mutation());
+
+        let invalid_candidate = evaluate_estate_operator_remediation(
+            OperatorErrorCode::CleanupFailed,
+            "remove-owned-expired-worker",
+            "Mutating candidate missing repair budget must fail.",
+            RemediationConfidence::Exact,
+            RemediationSafety::Reversible,
+            RemediationApplicability::PolicyEligible,
+            0,
+            true,
+            true,
+            true,
+            ["exact_ownership"],
+        )
+        .expect_err("zero repair budget on mutating candidate must fail closed");
+        assert_eq!(invalid_candidate.code, "operator_remediation_invalid");
     }
 }
