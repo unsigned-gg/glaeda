@@ -23,3 +23,7 @@ protox = "0.9"
 
 # Standalone: not part of the glaeda crate.
 [workspace]
+
+[package.metadata.cargo-machete]
+# Referenced by tonic-prost-build generated protobuf stubs in OUT_DIR.
+ignored = ["tonic-prost"]

@@ -2,7 +2,7 @@
 
 - **Status:** Completed
 - **Primary Files:** `.cargo/config.toml`, `clippy.toml`, `deny.toml`, `Makefile`
-- **Related Specs:** [0001](./0001-trust-tiered-hot-runtime-and-workload-identity.md)
+- **Related Specs:** [0001](./0001-trust-tiered-hot-runtime-and-workload-identity.md), [0012](./0012-estate-xtask-and-gitbutler-stack-workflow.md)
 
 ## Context & Problem
 
