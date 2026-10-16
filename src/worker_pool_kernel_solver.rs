@@ -303,10 +303,10 @@ impl WorkerPoolFlowMetrics {
         // Since L is items and λ is milli-items/sec, W (ms) = (L * 1_000_000) / arrival_rate_milli_per_sec.
         let littles_law_cycle_time_ms = if total_wip == 0 {
             0
-        } else if arrival_rate_milli_per_sec == 0 {
-            u64::MAX
         } else {
-            ((total_wip as u64).saturating_mul(1_000_000)) / arrival_rate_milli_per_sec
+            ((total_wip as u64).saturating_mul(1_000_000))
+                .checked_div(arrival_rate_milli_per_sec)
+                .unwrap_or(u64::MAX)
         };
 
         // Kingman G/G/m heavy-traffic approximation:

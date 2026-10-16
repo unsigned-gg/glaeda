@@ -825,8 +825,8 @@ fn build_estate_bridge_from_args(
     pool_config.max_in_flight_bytes = args.max_in_flight_bytes;
     pool_config.schedulable_cpu_millis = args.max_in_flight_cpu_millis;
     pool_config.utilization_cliff_bps = u32::from(args.utilization_cliff_bps);
-    if args.service_rate_milli_per_sec > 0 {
-        pool_config.base_service_time_ms = (1_000_000_u64 / args.service_rate_milli_per_sec).max(1);
+    if let Some(base_ms) = 1_000_000_u64.checked_div(args.service_rate_milli_per_sec) {
+        pool_config.base_service_time_ms = base_ms.max(1);
     }
     let solver =
         WorkerPoolKernelSolver::new(pool_config).map_err(|err| (err.code, err.to_string()))?;

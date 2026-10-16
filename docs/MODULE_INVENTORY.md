@@ -36,8 +36,8 @@ being measured.
 ## Totals
 
 - Exported modules: **209**
-- Reach: **107 binary**, **60 library**, **10 tests**, **32 none**
-- Gate: at most 32 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
+- Reach: **113 binary**, **56 library**, **10 tests**, **30 none**
+- Gate: at most 30 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
 
@@ -52,7 +52,6 @@ let the gate hold the line.
 | `adaptive_ci_routing` | `all` | 1 |  |
 | `cmux_product_transport_adapter` | `all` | 1 |  |
 | `debian_package_recovery` | `target_os="linux"` | 1 |  |
-| `failure_diagnostic` | `all` | 1 |  |
 | `github_workflow_job_reconciliation` | `all` | 1 |  |
 | `immutable_artifact_distribution` | `all` | 1 |  |
 | `immutable_git_object_pool_generation_audit` | `target_os="linux"` | 1 |  |
@@ -63,7 +62,6 @@ let the gate hold the line.
 | `linux_personal_worker_runtime_linkage_prerequisite` | `target_os="linux"` | 1 |  |
 | `linux_state_recovery` | `target_os="linux"` | 1 |  |
 | `local_install_launcher` | `unix` | 1 |  |
-| `operator_remediation` | `all` | 1 |  |
 | `personal_worker_verification_plan` | `target_os="linux"` | 1 | source read as text, not called, by `tests/personal_worker_verification_plan_contract.rs` |
 | `project_discovery` | `unix` | 1 |  |
 | `project_disk_attachment_state` | `all` | 1 |  |
@@ -124,7 +122,7 @@ let the gate hold the line.
 | `execution_capacity` | `all` | binary | 3 |
 | `execution_receipt` | `all` | binary | 10 |
 | `execution_receipt_store` | `all` | binary | 2 |
-| `failure_diagnostic` | `all` | none | 0 |
+| `failure_diagnostic` | `all` | binary | 1 |
 | `frontier_inference_workload` | `all` | tests | 2 |
 | `git_index_stat_patch` | `all` | binary | 1 |
 | `github_scale_set_protocol` | `all` | binary | 26 |
@@ -144,7 +142,7 @@ let the gate hold the line.
 | `hot_fleet_latency_summary` | `all` | binary | 1 |
 | `hot_fleet_window` | `all` | binary | 2 |
 | `hot_run_cache_observation` | `target_os="linux"` | binary | 1 |
-| `hot_state_path_policy` | `all` | library | 3 |
+| `hot_state_path_policy` | `all` | binary | 3 |
 | `immutable_artifact_distribution` | `all` | none | 0 |
 | `immutable_git_object_pool` | `all` | library | 5 |
 | `immutable_git_object_pool_admin_producer_plan` | `target_os="linux"` | library | 1 |
@@ -198,8 +196,8 @@ let the gate hold the line.
 | `manifest` | `all` | binary | 21 |
 | `operator_config` | `all` | binary | 21 |
 | `operator_config_store` | `all` | tests | 1 |
-| `operator_error` | `all` | library | 14 |
-| `operator_remediation` | `all` | none | 0 |
+| `operator_error` | `all` | binary | 15 |
+| `operator_remediation` | `all` | binary | 1 |
 | `operator_status` | `all` | library | 2 |
 | `operator_status_service` | `all` | tests | 1 |
 | `owned_linux_jit_enrollment` | `target_os="linux"` | binary | 2 |
@@ -251,8 +249,8 @@ let the gate hold the line.
 | `resident_repo_query` | `unix` | binary | 2 |
 | `resident_sandbox_catalog` | `any(target_os="linux",target_os="macos")` | library | 1 |
 | `resource` | `all` | binary | 3 |
-| `reusable_state_hot_state_policy` | `all` | library | 2 |
-| `reusable_state_lifecycle` | `all` | library | 5 |
+| `reusable_state_hot_state_policy` | `all` | binary | 2 |
+| `reusable_state_lifecycle` | `all` | binary | 5 |
 | `rootless_podman_config` | `target_os="linux"` | binary | 2 |
 | `rootless_podman_config_observation` | `target_os="linux"` | binary | 7 |
 | `rootless_podman_config_resolution` | `target_os="linux"` | binary | 11 |

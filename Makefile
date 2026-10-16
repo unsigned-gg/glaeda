@@ -46,6 +46,11 @@ spec-check:
 	@test -f specs/0003-cortex-revenant-lane-and-mesh-pool-bridge.md
 	@test -f specs/0004-http-health-and-admission-surface.md
 	@test -f specs/0005-estate-serve-cli-subcommand.md
+	@test -f specs/0006-estate-admission-gate-and-route-alias.md
+	@test -f specs/0007-estate-prometheus-metrics-surface.md
+	@test -f specs/0008-estate-durable-execution-receipt-composition.md
+	@test -f specs/0009-estate-diagnostic-kernel-composition.md
+	@test -f specs/0010-estate-failure-diagnostic-and-remediation-composition.md
 	@test -f .agents/persona.md
 	@echo "specs verified"
 
