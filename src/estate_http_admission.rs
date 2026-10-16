@@ -267,10 +267,11 @@ pub struct EstateAdmissionWireRequest {
     pub envelopes: Vec<EstateAdmissionWireEnvelope>,
 }
 
-/// Content-addressed response returned by `POST /v1/admission/evaluate`.
+/// Content-addressed response returned by `POST /v1/admission/evaluate` (and `POST /v1/estate/admit`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EstateAdmissionResponse {
     pub schema_version: u8,
+    pub admitted: bool,
     pub flow_metrics: WorkerPoolFlowMetrics,
     pub bridge_receipt: CortexRevenantBridgeReceipt<String>,
     pub response_digest: Sha256Digest,
@@ -435,16 +436,17 @@ pub fn handle_http_request_bytes(
                 body_json,
             }
         }
-        ("POST", "/v1/health" | "/health" | "/healthz") | ("GET", "/v1/admission/evaluate") => {
-            error_response(
-                405,
-                "Method Not Allowed",
-                "request.method",
-                "method_not_allowed",
-                "HTTP method is not allowed for this control-plane endpoint",
-            )
+        ("POST", "/v1/health" | "/health" | "/healthz")
+        | ("GET", "/v1/admission/evaluate" | "/v1/estate/admit") => error_response(
+            405,
+            "Method Not Allowed",
+            "request.method",
+            "method_not_allowed",
+            "HTTP method is not allowed for this control-plane endpoint",
+        ),
+        ("POST", "/v1/admission/evaluate" | "/v1/estate/admit") => {
+            handle_admission_evaluate(bridge, effective_body)
         }
-        ("POST", "/v1/admission/evaluate") => handle_admission_evaluate(bridge, effective_body),
         _ => error_response(
             404,
             "Not Found",
@@ -519,33 +521,60 @@ fn handle_admission_evaluate(
         }
     }
 
-    let first_env = &domain_envelopes[0];
-    let flow_metrics = match bridge.evaluate_envelope_admission(
-        first_env,
-        observed_at,
-        wire_req.active_workers,
-        wire_req.queue_depth,
-        wire_req.in_flight_bytes,
-        wire_req.in_flight_cpu_millis,
-        wire_req.arrival_rate_milli_per_sec,
-        wire_req.context_switch_rate_bps,
-    ) {
-        Ok(m) => m,
-        Err(err) => {
-            return error_response(400, "Bad Request", err.field, err.code, err.message);
+    let mut running_queue_depth = wire_req.queue_depth;
+    let mut running_in_flight_bytes = wire_req.in_flight_bytes;
+    let mut running_in_flight_cpu_millis = wire_req.in_flight_cpu_millis;
+    let mut gating_metrics: Option<WorkerPoolFlowMetrics> = None;
+
+    for env in &domain_envelopes {
+        let metrics = match bridge.evaluate_envelope_admission(
+            env,
+            observed_at,
+            wire_req.active_workers,
+            running_queue_depth,
+            running_in_flight_bytes,
+            running_in_flight_cpu_millis,
+            wire_req.arrival_rate_milli_per_sec,
+            wire_req.context_switch_rate_bps,
+        ) {
+            Ok(m) => m,
+            Err(err) => {
+                return error_response(400, "Bad Request", err.field, err.code, err.message);
+            }
+        };
+        let is_admit = metrics.admission == PoolAdmissionDecision::Admit;
+        gating_metrics = Some(metrics);
+        if !is_admit {
+            break;
         }
-    };
+        running_queue_depth = running_queue_depth.saturating_add(1);
+        running_in_flight_bytes = running_in_flight_bytes.saturating_add(env.limits.memory_bytes);
+        running_in_flight_cpu_millis =
+            running_in_flight_cpu_millis.saturating_add(env.limits.cpu_millis);
+    }
+
+    let flow_metrics = gating_metrics.unwrap_or_else(|| unreachable!());
+    let admitted = flow_metrics.admission == PoolAdmissionDecision::Admit;
+    let admission_decision = flow_metrics.admission;
 
     let bridge_receipt = match bridge.dispatch_batch(
         domain_envelopes,
         observed_at,
         wire_req.arrival_rate_milli_per_sec,
         |task| {
+            let (prefix, duration_ms) = match admission_decision {
+                PoolAdmissionDecision::Admit => ("admitted", 50),
+                PoolAdmissionDecision::HoldBufferFull => ("held_buffer_full", 0),
+                PoolAdmissionDecision::HoldMemoryBound => ("held_memory_bound", 0),
+                PoolAdmissionDecision::HoldCpuCapacity => ("held_cpu_capacity", 0),
+                PoolAdmissionDecision::HoldUtilizationCliff => ("held_utilization_cliff", 0),
+                PoolAdmissionDecision::RejectUnstableQueue => ("rejected_unstable_queue", 0),
+            };
             let summary = format!(
-                "admitted:{}:seq={}:prio={:?}",
+                "{prefix}:{}:seq={}:prio={:?}",
                 task.family_key, task.payload.stream_seq, task.payload.wayfinder_priority
             );
-            (summary, 50)
+            (summary, duration_ms)
         },
     ) {
         Ok(receipt) => receipt,
@@ -554,11 +583,15 @@ fn handle_admission_evaluate(
         }
     };
 
-    let response_digest =
-        compute_admission_response_digest(&flow_metrics, &bridge_receipt.bridge_receipt_digest);
+    let response_digest = compute_admission_response_digest(
+        admitted,
+        &flow_metrics,
+        &bridge_receipt.bridge_receipt_digest,
+    );
 
     let response = EstateAdmissionResponse {
         schema_version: ESTATE_HTTP_ADMISSION_SCHEMA_VERSION,
+        admitted,
         flow_metrics,
         bridge_receipt,
         response_digest,
@@ -746,11 +779,13 @@ fn compute_health_report_digest(
 }
 
 fn compute_admission_response_digest(
+    admitted: bool,
     flow_metrics: &WorkerPoolFlowMetrics,
     bridge_receipt_digest: &Sha256Digest,
 ) -> Sha256Digest {
     let mut hasher = Sha256::new();
     hasher.update(b"glaeda.estate_admission_response.v1:");
+    hasher.update(if admitted { b"1:" } else { b"0:" });
     hasher.update(flow_metrics.utilization_bps.to_le_bytes());
     hasher.update(b":");
     hasher.update(flow_metrics.kingman_queue_wait_ms.to_le_bytes());
@@ -788,6 +823,27 @@ mod tests {
         let solver =
             WorkerPoolKernelSolver::new(WorkerPoolConfig::default_personal_worker(2)).expect("ok");
         CortexRevenantBridge::new(svid, godseat, solver)
+    }
+
+    fn sample_wire_envelope(stream_seq: u64, memory_bytes: u64) -> EstateAdmissionWireEnvelope {
+        EstateAdmissionWireEnvelope {
+            stream_seq,
+            delivery_token: format!("tok-{stream_seq}"),
+            delivery_attempt: 1,
+            lease_ms: 30_000,
+            from_peer: "session-agy-ceres-estate-w3z-p1".to_owned(),
+            from_session: Some("estate".to_owned()),
+            subject: "revenant.wayfinder.dispatch".to_owned(),
+            body: "{\"ticket\":\"EST-426\"}".to_owned(),
+            traceparent: None,
+            correlation: None,
+            family_key: "unsigned-gg/glaeda".to_owned(),
+            wayfinder_priority: "permission".to_owned(),
+            cpu_millis: 1_000,
+            memory_bytes,
+            max_pids: 16,
+            submitted_at_ms: 4_000,
+        }
     }
 
     #[test]
@@ -859,5 +915,128 @@ mod tests {
         );
         assert_eq!(resp.status_code, 400);
         assert!(!resp.body_json.contains("unexpected_secret_field_xyz"));
+    }
+
+    #[test]
+    fn estate_admit_alias_and_admission_gate_enforce_cumulative_dbr_and_memory_bounds() {
+        let bridge = sample_bridge();
+
+        // 1. GET /v1/estate/admit must return 405 Method Not Allowed
+        let get_alias = handle_http_request_bytes(
+            &bridge,
+            b"GET /v1/estate/admit HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            EpochMillis::new(5_000).expect("fresh"),
+            0,
+            0,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(get_alias.status_code, 405);
+        assert!(
+            get_alias
+                .body_json
+                .contains("\"code\":\"method_not_allowed\"")
+        );
+
+        // 2. POST /v1/estate/admit and POST /v1/admission/evaluate produce identical responses
+        let admit_req = EstateAdmissionWireRequest {
+            observed_at_ms: 5_000,
+            active_workers: 0,
+            queue_depth: 0,
+            in_flight_bytes: 0,
+            in_flight_cpu_millis: 0,
+            arrival_rate_milli_per_sec: 500,
+            context_switch_rate_bps: 0,
+            envelopes: vec![sample_wire_envelope(1, 64 * 1024 * 1024)],
+        };
+        let body = serde_json::to_string(&admit_req).expect("serialize");
+        let eval_http = format!(
+            "POST /v1/admission/evaluate HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let alias_http = format!(
+            "POST /v1/estate/admit HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let eval_resp = handle_http_request_bytes(
+            &bridge,
+            eval_http.as_bytes(),
+            EpochMillis::new(5_000).expect("fresh"),
+            0,
+            0,
+            0,
+            0,
+            500,
+            0,
+        );
+        let alias_resp = handle_http_request_bytes(
+            &bridge,
+            alias_http.as_bytes(),
+            EpochMillis::new(5_000).expect("fresh"),
+            0,
+            0,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(eval_resp, alias_resp);
+        assert!(eval_resp.body_json.contains("\"admitted\":true"));
+        assert!(
+            eval_resp
+                .body_json
+                .contains("\"admitted:unsigned-gg/glaeda:seq=1:prio=Permission\"")
+        );
+
+        // 3. Cumulative DBR buffer cap hold across multi-envelope batch:
+        // default_personal_worker(2) has max_wip_cap = 8. With active_workers=2 and queue_depth=5,
+        // envelope 1 sees total_wip=7 (Admit), envelope 2 sees cumulative total_wip=8 (HoldBufferFull).
+        let cumulative_hold_req = EstateAdmissionWireRequest {
+            observed_at_ms: 5_000,
+            active_workers: 2,
+            queue_depth: 5,
+            in_flight_bytes: 0,
+            in_flight_cpu_millis: 0,
+            arrival_rate_milli_per_sec: 500,
+            context_switch_rate_bps: 0,
+            envelopes: vec![
+                sample_wire_envelope(10, 64 * 1024 * 1024),
+                sample_wire_envelope(11, 64 * 1024 * 1024),
+            ],
+        };
+        let hold_body = serde_json::to_string(&cumulative_hold_req).expect("serialize");
+        let hold_http = format!(
+            "POST /v1/estate/admit HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            hold_body.len(),
+            hold_body
+        );
+        let hold_resp = handle_http_request_bytes(
+            &bridge,
+            hold_http.as_bytes(),
+            EpochMillis::new(5_000).expect("fresh"),
+            0,
+            0,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(hold_resp.status_code, 200);
+        assert!(hold_resp.body_json.contains("\"admitted\":false"));
+        assert!(
+            hold_resp
+                .body_json
+                .contains("\"admission\":\"hold_buffer_full\"")
+        );
+        assert!(
+            hold_resp
+                .body_json
+                .contains("\"held_buffer_full:unsigned-gg/glaeda:seq=10:prio=Permission\"")
+        );
+        assert!(hold_resp.body_json.contains("\"total_service_units\":0"));
     }
 }
