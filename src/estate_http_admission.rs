@@ -16,7 +16,14 @@ use crate::cortex_revenant_bridge::{
     CortexRevenantBridge, CortexRevenantBridgeReceipt, MeshPoolDeliveryEnvelope, WayfinderPriority,
 };
 use crate::execution_admission::{EpochMillis, ExecutionResourceLimits};
+use crate::execution_receipt::ExecutionReceipt;
+use crate::execution_receipt_store::{
+    ExecutionReceiptPublication, ExecutionReceiptStoreErrorKind, publish_execution_receipt,
+    read_execution_receipt,
+};
 use crate::personal_worker_queue::PersonalWorkerPriority;
+use crate::state::InstallationId;
+use crate::state_store::StateStore;
 use crate::worker_pool_kernel_solver::{PoolAdmissionDecision, WorkerPoolFlowMetrics};
 
 pub const ESTATE_HTTP_ADMISSION_SCHEMA_VERSION: u8 = 1;
@@ -754,6 +761,50 @@ pub fn serve_bounded_loopback_requests(
     Ok(served)
 }
 
+/// Publish a durable [`ExecutionReceipt`] for an installation into `store` and immediately verify
+/// canonical round-trip readback from the store.
+///
+/// # Errors
+///
+/// Returns an [`EstateHttpAdmissionError`] if publication fails, if readback fails, or if the
+/// stored receipt is missing or diverges from `receipt`.
+pub fn publish_and_verify_estate_execution_receipt<S: StateStore>(
+    store: &mut S,
+    installation_id: &InstallationId,
+    receipt: &ExecutionReceipt,
+) -> Result<(ExecutionReceiptPublication, ExecutionReceipt), EstateHttpAdmissionError> {
+    let publication =
+        publish_execution_receipt(store, installation_id, receipt).map_err(|err| {
+            let code = match err.kind() {
+                ExecutionReceiptStoreErrorKind::InvalidReceipt => "receipt_store_invalid_receipt",
+                ExecutionReceiptStoreErrorKind::Conflict => "receipt_store_conflict",
+                ExecutionReceiptStoreErrorKind::Busy => "receipt_store_busy",
+                ExecutionReceiptStoreErrorKind::Io => "receipt_store_io",
+                ExecutionReceiptStoreErrorKind::UnsafeFilesystem => {
+                    "receipt_store_unsafe_filesystem"
+                }
+                ExecutionReceiptStoreErrorKind::CorruptState => "receipt_store_corrupt_state",
+            };
+            EstateHttpAdmissionError::new("receipt_store", code, err.message())
+        })?;
+    let persisted = read_execution_receipt(store, installation_id, receipt.execution_id())
+        .map_err(|err| {
+            EstateHttpAdmissionError::new(
+                "receipt_store",
+                "receipt_store_readback_failed",
+                err.message(),
+            )
+        })?;
+    match persisted {
+        Some(stored) if stored == *receipt => Ok((publication, stored)),
+        _ => Err(EstateHttpAdmissionError::new(
+            "receipt_store",
+            "receipt_store_readback_mismatch",
+            "durable execution receipt readback did not match published receipt",
+        )),
+    }
+}
+
 fn read_bounded_http_request<R: Read>(reader: &mut R) -> Result<Vec<u8>, EstateHttpAdmissionError> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
@@ -1184,5 +1235,148 @@ mod tests {
             0,
         );
         assert_eq!(post_metrics.status_code, 405);
+    }
+
+    #[derive(Default)]
+    struct TestMemoryStore {
+        entries: std::collections::BTreeMap<Vec<String>, Vec<u8>>,
+    }
+
+    impl StateStore for TestMemoryStore {
+        fn read(
+            &self,
+            path: &crate::state::StatePath,
+        ) -> Result<crate::state_store::StateRead, crate::state_store::StateStoreError> {
+            let key = path
+                .components()
+                .iter()
+                .map(crate::state::StateComponent::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            Ok(self.entries.get(&key).cloned().map_or(
+                crate::state_store::StateRead::Missing,
+                crate::state_store::StateRead::Present,
+            ))
+        }
+
+        fn create_atomic(
+            &mut self,
+            record: &crate::state_store::StateRecord,
+        ) -> Result<crate::state_store::StateWriteReceipt, crate::state_store::StateStoreError>
+        {
+            let key = record
+                .path()
+                .components()
+                .iter()
+                .map(crate::state::StateComponent::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            match self.entries.entry(key) {
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    Err(crate::state_store::StateStoreError::public(
+                        crate::state_store::StateStoreErrorKind::Conflict,
+                        "state destination already exists",
+                    ))
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record.bytes().to_vec());
+                    Ok(crate::state_store::StateWriteReceipt::new(
+                        crate::state_store::StateWriteDisposition::Created,
+                        record.bytes().len(),
+                    ))
+                }
+            }
+        }
+
+        fn write_atomic(
+            &mut self,
+            record: &crate::state_store::StateRecord,
+        ) -> Result<crate::state_store::StateWriteReceipt, crate::state_store::StateStoreError>
+        {
+            let key = record
+                .path()
+                .components()
+                .iter()
+                .map(crate::state::StateComponent::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let disposition = if self.entries.insert(key, record.bytes().to_vec()).is_some() {
+                crate::state_store::StateWriteDisposition::Replaced
+            } else {
+                crate::state_store::StateWriteDisposition::Created
+            };
+            Ok(crate::state_store::StateWriteReceipt::new(
+                disposition,
+                record.bytes().len(),
+            ))
+        }
+    }
+
+    fn sample_execution_receipt(phase_id: &str) -> ExecutionReceipt {
+        use crate::artifact::RepositoryRef;
+        use crate::execution_receipt::{
+            ExecutionReceiptAction, ExecutionReceiptActionOutcome, ExecutionReceiptContinuation,
+            ExecutionReceiptDisposition, ReceiptTimestamp,
+        };
+        use crate::journal::{ExecutionLane, RollbackClass};
+        use crate::state::JournalId;
+
+        ExecutionReceipt::new_host_preparation(
+            JournalId::parse("apply-00000001").expect("valid journal id"),
+            RepositoryRef::parse("unsigned-gg/glaeda").expect("valid repo"),
+            Sha256Digest::parse(&format!("sha256:{}", "cd".repeat(32))).expect("valid digest"),
+            phase_id,
+            ReceiptTimestamp::parse("2026-10-16T00:00:00.000Z").expect("valid start"),
+            ReceiptTimestamp::parse("2026-10-16T00:00:01.000Z").expect("valid end"),
+            ExecutionReceiptDisposition::Completed,
+            vec![
+                ExecutionReceiptAction::new(
+                    "admit.batch",
+                    ExecutionLane::RunnerUser,
+                    RollbackClass::Reversible,
+                    ExecutionReceiptActionOutcome::Completed,
+                    None,
+                )
+                .expect("valid action"),
+            ],
+            ExecutionReceiptContinuation::new(false, Vec::<&str>::new(), Vec::<&str>::new())
+                .expect("valid continuation"),
+        )
+        .expect("valid receipt")
+    }
+
+    #[test]
+    fn estate_execution_receipt_store_publishes_replays_and_rejects_conflicts() {
+        use crate::execution_receipt_store::ExecutionReceiptPublicationDisposition;
+
+        let mut store = TestMemoryStore::default();
+        let installation_id = InstallationId::parse("0123456789abcdef").expect("installation id");
+        let receipt = sample_execution_receipt("admit.phase.1");
+
+        let (first_pub, persisted) =
+            publish_and_verify_estate_execution_receipt(&mut store, &installation_id, &receipt)
+                .expect("first publish succeeds");
+        assert_eq!(
+            first_pub.disposition(),
+            ExecutionReceiptPublicationDisposition::Created
+        );
+        assert!(first_pub.bytes_written() > 0);
+        assert_eq!(persisted, receipt);
+
+        let (replay_pub, replay_persisted) =
+            publish_and_verify_estate_execution_receipt(&mut store, &installation_id, &receipt)
+                .expect("idempotent replay succeeds");
+        assert_eq!(
+            replay_pub.disposition(),
+            ExecutionReceiptPublicationDisposition::Duplicate
+        );
+        assert_eq!(replay_pub.bytes_written(), 0);
+        assert_eq!(replay_persisted, receipt);
+
+        let conflicting = sample_execution_receipt("admit.phase.divergent");
+        let conflict_err =
+            publish_and_verify_estate_execution_receipt(&mut store, &installation_id, &conflicting)
+                .expect_err("divergent receipt under same journal id must fail closed");
+        assert_eq!(conflict_err.code, "receipt_store_conflict");
     }
 }

@@ -36,7 +36,7 @@ being measured.
 ## Totals
 
 - Exported modules: **209**
-- Reach: **101 binary**, **63 library**, **11 tests**, **34 none**
+- Reach: **102 binary**, **63 library**, **10 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -124,8 +124,8 @@ let the gate hold the line.
 | `estate_http_admission` | `all` | binary | 3 |
 | `execution_admission` | `all` | binary | 89 |
 | `execution_capacity` | `all` | binary | 3 |
-| `execution_receipt` | `all` | binary | 9 |
-| `execution_receipt_store` | `all` | tests | 1 |
+| `execution_receipt` | `all` | binary | 10 |
+| `execution_receipt_store` | `all` | binary | 2 |
 | `failure_diagnostic` | `all` | none | 0 |
 | `frontier_inference_workload` | `all` | tests | 2 |
 | `git_index_stat_patch` | `all` | binary | 1 |
@@ -154,7 +154,7 @@ let the gate hold the line.
 | `immutable_git_object_pool_marker` | `all` | library | 4 |
 | `immutable_git_object_pool_observation` | `target_os="linux"` | library | 2 |
 | `installation_id` | `target_os="linux"` | library | 1 |
-| `journal` | `all` | binary | 37 |
+| `journal` | `all` | binary | 38 |
 | `journal_document` | `all` | binary | 3 |
 | `lane_command` | `all` | binary | 33 |
 | `lane_executable` | `target_os="linux"` | binary | 7 |
@@ -266,10 +266,10 @@ let the gate hold the line.
 | `rust_memory_diagnostic` | `all` | none | 0 |
 | `rust_verification_envelope` | `all` | library | 6 |
 | `rust_verification_envelope_digest` | `all` | library | 5 |
-| `state` | `all` | binary | 35 |
+| `state` | `all` | binary | 36 |
 | `state_document` | `all` | binary | 9 |
 | `state_root_generation` | `all` | library | 3 |
-| `state_store` | `all` | binary | 14 |
+| `state_store` | `all` | binary | 15 |
 | `subordinate_id` | `target_os="linux"` | binary | 12 |
 | `task_private_git_clone_plan` | `target_os="linux"` | none | 0 |
 | `trusted_guest_control_binary_generation` | `all` | none | 0 |
