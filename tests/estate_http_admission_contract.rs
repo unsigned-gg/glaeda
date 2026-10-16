@@ -177,7 +177,7 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
         serve_bounded_loopback_requests(
             &listener,
             &bridge,
-            2,
+            3,
             EpochMillis::new(25_000).expect("obs"),
             0,
             0,
@@ -186,7 +186,7 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
             500,
             0,
         )
-        .expect("serve 2 requests")
+        .expect("serve 3 requests")
     });
 
     // Request 1: GET /v1/health
@@ -198,11 +198,12 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
         let mut resp = String::new();
         client.read_to_string(&mut resp).expect("read 1");
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: application/json\r\n"));
         assert!(resp.contains("\"callsign\":\"aegis\""));
         assert!(resp.contains("\"status\":\"healthy\""));
     }
 
-    // Request 2: POST /v1/admission/evaluate
+    // Request 2: POST /v1/estate/admit
     {
         let wire_req = EstateAdmissionWireRequest {
             observed_at_ms: 25_000,
@@ -267,6 +268,21 @@ fn loopback_tcp_listener_serves_health_and_admission_deterministically() {
         assert!(resp.contains("\"bridge_receipt_digest\":\"sha256:"));
     }
 
+    // Request 3: GET /metrics
+    {
+        let mut client = TcpStream::connect(addr).expect("connect 3");
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .expect("write 3");
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).expect("read 3");
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        assert!(
+            resp.contains("glaeda_worker_pool_admitting{service=\"glaeda\",callsign=\"aegis\"} 1")
+        );
+    }
+
     let served = server_handle.join().expect("server thread join");
-    assert_eq!(served, 2);
+    assert_eq!(served, 3);
 }

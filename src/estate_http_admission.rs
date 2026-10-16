@@ -22,6 +22,8 @@ use crate::worker_pool_kernel_solver::{PoolAdmissionDecision, WorkerPoolFlowMetr
 pub const ESTATE_HTTP_ADMISSION_SCHEMA_VERSION: u8 = 1;
 pub const ESTATE_SERVICE_NAME: &str = "glaeda";
 pub const ESTATE_LANE_CALLSIGN: &str = "aegis";
+pub const CONTENT_TYPE_JSON: &str = "application/json";
+pub const CONTENT_TYPE_PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const MAX_ESTATE_HTTP_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_ESTATE_ADMISSION_BATCH_ENVELOPES: usize = 64;
 pub const DEFAULT_HTTP_IO_TIMEOUT_MILLIS: u64 = 5_000;
@@ -277,11 +279,67 @@ pub struct EstateAdmissionResponse {
     pub response_digest: Sha256Digest,
 }
 
+/// Render a deterministic, fixed-cardinality Prometheus text-format (`0.0.4`) exposition payload
+/// from an [`EstateHealthReport`].
+#[must_use]
+pub fn render_estate_prometheus_metrics(report: &EstateHealthReport) -> String {
+    let svid_fresh_val: u8 = u8::from(report.svid_fresh);
+    let healthy_val: u8 = u8::from(report.status == EstateHealthStatus::Healthy);
+    let degraded_val: u8 = u8::from(report.status == EstateHealthStatus::Degraded);
+    let unavailable_val: u8 = u8::from(report.status == EstateHealthStatus::Unavailable);
+    let admitting_val: u8 = u8::from(report.flow_metrics.admission == PoolAdmissionDecision::Admit);
+
+    format!(
+        "# HELP glaeda_estate_svid_fresh Whether the Cortex delegated lane SVID is fresh (1=fresh, 0=expired).\n\
+# TYPE glaeda_estate_svid_fresh gauge\n\
+glaeda_estate_svid_fresh{{service=\"{svc}\",callsign=\"{cs}\"}} {svid_fresh_val}\n\
+# HELP glaeda_estate_svid_expires_at_ms Epoch milliseconds when the Cortex delegated lane SVID expires.\n\
+# TYPE glaeda_estate_svid_expires_at_ms gauge\n\
+glaeda_estate_svid_expires_at_ms{{service=\"{svc}\",callsign=\"{cs}\"}} {expires_at}\n\
+# HELP glaeda_estate_health_status One-hot health classification for the estate runtime lane.\n\
+# TYPE glaeda_estate_health_status gauge\n\
+glaeda_estate_health_status{{service=\"{svc}\",callsign=\"{cs}\",status=\"healthy\"}} {healthy_val}\n\
+glaeda_estate_health_status{{service=\"{svc}\",callsign=\"{cs}\",status=\"degraded\"}} {degraded_val}\n\
+glaeda_estate_health_status{{service=\"{svc}\",callsign=\"{cs}\",status=\"unavailable\"}} {unavailable_val}\n\
+# HELP glaeda_worker_pool_total_wip Total work-in-progress L = active_workers + queue_depth.\n\
+# TYPE glaeda_worker_pool_total_wip gauge\n\
+glaeda_worker_pool_total_wip{{service=\"{svc}\",callsign=\"{cs}\"}} {total_wip}\n\
+# HELP glaeda_worker_pool_utilization_bps Worker-pool utilization rho in basis points.\n\
+# TYPE glaeda_worker_pool_utilization_bps gauge\n\
+glaeda_worker_pool_utilization_bps{{service=\"{svc}\",callsign=\"{cs}\"}} {util_bps}\n\
+# HELP glaeda_worker_pool_effective_service_time_ms Sweller context-switch adjusted service time in milliseconds.\n\
+# TYPE glaeda_worker_pool_effective_service_time_ms gauge\n\
+glaeda_worker_pool_effective_service_time_ms{{service=\"{svc}\",callsign=\"{cs}\"}} {svc_time_ms}\n\
+# HELP glaeda_worker_pool_littles_law_cycle_time_ms Little's Law cycle time W = L / lambda in milliseconds.\n\
+# TYPE glaeda_worker_pool_littles_law_cycle_time_ms gauge\n\
+glaeda_worker_pool_littles_law_cycle_time_ms{{service=\"{svc}\",callsign=\"{cs}\"}} {cycle_time_ms}\n\
+# HELP glaeda_worker_pool_kingman_queue_wait_ms Kingman G/G/m expected queue wait time in milliseconds.\n\
+# TYPE glaeda_worker_pool_kingman_queue_wait_ms gauge\n\
+glaeda_worker_pool_kingman_queue_wait_ms{{service=\"{svc}\",callsign=\"{cs}\"}} {kingman_ms}\n\
+# HELP glaeda_worker_pool_cobham_priority_wait_ms Cobham non-preemptive priority queue wait time in milliseconds.\n\
+# TYPE glaeda_worker_pool_cobham_priority_wait_ms gauge\n\
+glaeda_worker_pool_cobham_priority_wait_ms{{service=\"{svc}\",callsign=\"{cs}\"}} {cobham_ms}\n\
+# HELP glaeda_worker_pool_admitting Whether the DBR and memory-bound gate is currently admitting work (1=admit, 0=hold/reject).\n\
+# TYPE glaeda_worker_pool_admitting gauge\n\
+glaeda_worker_pool_admitting{{service=\"{svc}\",callsign=\"{cs}\"}} {admitting_val}\n",
+        svc = ESTATE_SERVICE_NAME,
+        cs = ESTATE_LANE_CALLSIGN,
+        expires_at = report.svid_expires_at.get(),
+        total_wip = report.flow_metrics.total_wip,
+        util_bps = report.flow_metrics.utilization_bps,
+        svc_time_ms = report.flow_metrics.effective_service_time_ms,
+        cycle_time_ms = report.flow_metrics.littles_law_cycle_time_ms,
+        kingman_ms = report.flow_metrics.kingman_queue_wait_ms,
+        cobham_ms = report.flow_metrics.cobham_priority_wait_ms,
+    )
+}
+
 /// Framed HTTP/1.1 response ready to serialize to a transport stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EstateHttpExchangeResponse {
     pub status_code: u16,
     pub reason_phrase: &'static str,
+    pub content_type: &'static str,
     pub body_json: String,
 }
 
@@ -289,9 +347,10 @@ impl EstateHttpExchangeResponse {
     #[must_use]
     pub fn to_http_bytes(&self) -> Vec<u8> {
         let header = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.status_code,
             self.reason_phrase,
+            self.content_type,
             self.body_json.len()
         );
         let mut out = Vec::with_capacity(header.len() + self.body_json.len());
@@ -433,10 +492,30 @@ pub fn handle_http_request_bytes(
             EstateHttpExchangeResponse {
                 status_code,
                 reason_phrase,
+                content_type: CONTENT_TYPE_JSON,
                 body_json,
             }
         }
-        ("POST", "/v1/health" | "/health" | "/healthz")
+        ("GET", "/metrics" | "/v1/metrics") => {
+            let report = build_estate_health_report(
+                bridge,
+                default_observed_at,
+                active_workers,
+                queue_depth,
+                in_flight_bytes,
+                in_flight_cpu_millis,
+                arrival_rate_milli_per_sec,
+                context_switch_rate_bps,
+            );
+            let body_text = render_estate_prometheus_metrics(&report);
+            EstateHttpExchangeResponse {
+                status_code: 200,
+                reason_phrase: "OK",
+                content_type: CONTENT_TYPE_PROMETHEUS_TEXT,
+                body_json: body_text,
+            }
+        }
+        ("POST", "/v1/health" | "/health" | "/healthz" | "/metrics" | "/v1/metrics")
         | ("GET", "/v1/admission/evaluate" | "/v1/estate/admit") => error_response(
             405,
             "Method Not Allowed",
@@ -601,6 +680,7 @@ fn handle_admission_evaluate(
     EstateHttpExchangeResponse {
         status_code: 200,
         reason_phrase: "OK",
+        content_type: CONTENT_TYPE_JSON,
         body_json,
     }
 }
@@ -742,6 +822,7 @@ fn error_response(
     EstateHttpExchangeResponse {
         status_code,
         reason_phrase,
+        content_type: CONTENT_TYPE_JSON,
         body_json,
     }
 }
@@ -1038,5 +1119,70 @@ mod tests {
                 .contains("\"held_buffer_full:unsigned-gg/glaeda:seq=10:prio=Permission\"")
         );
         assert!(hold_resp.body_json.contains("\"total_service_units\":0"));
+    }
+
+    #[test]
+    fn metrics_endpoint_renders_prometheus_text_format_and_rejects_post() {
+        let bridge = sample_bridge();
+
+        let get_metrics = handle_http_request_bytes(
+            &bridge,
+            b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            EpochMillis::new(5_000).expect("fresh"),
+            1,
+            2,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(get_metrics.status_code, 200);
+        assert_eq!(get_metrics.content_type, CONTENT_TYPE_PROMETHEUS_TEXT);
+        assert!(
+            get_metrics
+                .body_json
+                .contains("glaeda_estate_svid_fresh{service=\"glaeda\",callsign=\"aegis\"} 1")
+        );
+        assert!(
+            get_metrics
+                .body_json
+                .contains("glaeda_estate_health_status{service=\"glaeda\",callsign=\"aegis\",status=\"healthy\"} 1")
+        );
+        assert!(
+            get_metrics
+                .body_json
+                .contains("glaeda_worker_pool_total_wip{service=\"glaeda\",callsign=\"aegis\"} 3")
+        );
+        assert!(
+            get_metrics
+                .body_json
+                .contains("glaeda_worker_pool_admitting{service=\"glaeda\",callsign=\"aegis\"} 1")
+        );
+
+        let get_v1_metrics = handle_http_request_bytes(
+            &bridge,
+            b"GET /v1/metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            EpochMillis::new(5_000).expect("fresh"),
+            1,
+            2,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(get_metrics, get_v1_metrics);
+
+        let post_metrics = handle_http_request_bytes(
+            &bridge,
+            b"POST /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            EpochMillis::new(5_000).expect("fresh"),
+            0,
+            0,
+            0,
+            0,
+            500,
+            0,
+        );
+        assert_eq!(post_metrics.status_code, 405);
     }
 }
