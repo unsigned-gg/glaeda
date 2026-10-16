@@ -1,0 +1,13 @@
+[build]
+# Mandatory host throttling on ceres: cap parallel rustc jobs to 2.
+jobs = 2
+
+[alias]
+xtask = "run -q -p xtask -j 2 --"
+xwork = "run -q -p xtask -j 2 -- xwork"
+
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
