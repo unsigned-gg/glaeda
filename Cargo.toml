@@ -1,3 +1,9 @@
+[workspace]
+resolver = "2"
+members = [".", "xtask"]
+default-members = ["."]
+exclude = ["tools/fleet-cas-prototype"]
+
 [package]
 name = "glaeda"
 version = "0.1.0"
