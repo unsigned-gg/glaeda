@@ -21,7 +21,14 @@ use crate::execution_receipt_store::{
     ExecutionReceiptPublication, ExecutionReceiptStoreErrorKind, publish_execution_receipt,
     read_execution_receipt,
 };
+use crate::hot_fleet_latency_summary::{
+    HotFleetLatencyComparisonReportV1, compare_hot_fleet_abba_with_latency,
+};
+use crate::hot_fleet_window::HotFleetWindowReceiptV1;
 use crate::personal_worker_queue::PersonalWorkerPriority;
+use crate::rust_memory_diagnostic::{
+    RustMemoryDiagnosticInput, RustMemoryDiagnosticReport, classify_rust_memory,
+};
 use crate::state::InstallationId;
 use crate::state_store::StateStore;
 use crate::worker_pool_kernel_solver::{PoolAdmissionDecision, WorkerPoolFlowMetrics};
@@ -805,6 +812,43 @@ pub fn publish_and_verify_estate_execution_receipt<S: StateStore>(
     }
 }
 
+/// Evaluate a bounded [`RustMemoryDiagnosticInput`] through the canonical
+/// [`classify_rust_memory`] diagnostic kernel without side effects.
+///
+/// # Errors
+///
+/// Returns an [`EstateHttpAdmissionError`] if the diagnostic input violates identity, timing,
+/// or cgroup invariants.
+pub fn evaluate_estate_rust_memory_diagnostic(
+    input: RustMemoryDiagnosticInput,
+) -> Result<RustMemoryDiagnosticReport, EstateHttpAdmissionError> {
+    classify_rust_memory(input).map_err(|_| {
+        EstateHttpAdmissionError::new(
+            "rust_memory_diagnostic",
+            "rust_memory_diagnostic_invalid",
+            "rust memory diagnostic input failed validation or classification",
+        )
+    })
+}
+
+/// Evaluate four hot-fleet contention windows through the canonical
+/// [`compare_hot_fleet_abba_with_latency`] A-B-B-A latency comparator without side effects.
+///
+/// # Errors
+///
+/// Returns an [`EstateHttpAdmissionError`] if the four windows are not comparable.
+pub fn evaluate_estate_hot_fleet_latency(
+    windows: [&HotFleetWindowReceiptV1; 4],
+) -> Result<HotFleetLatencyComparisonReportV1, EstateHttpAdmissionError> {
+    compare_hot_fleet_abba_with_latency(windows).map_err(|_| {
+        EstateHttpAdmissionError::new(
+            "hot_fleet_latency",
+            "hot_fleet_comparison_refused",
+            "hot-fleet A-B-B-A windows are not comparable",
+        )
+    })
+}
+
 fn read_bounded_http_request<R: Read>(reader: &mut R) -> Result<Vec<u8>, EstateHttpAdmissionError> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
@@ -1378,5 +1422,270 @@ mod tests {
             publish_and_verify_estate_execution_receipt(&mut store, &installation_id, &conflicting)
                 .expect_err("divergent receipt under same journal id must fail closed");
         assert_eq!(conflict_err.code, "receipt_store_conflict");
+    }
+
+    #[test]
+    fn estate_diagnostic_kernels_classify_memory_and_summarize_hot_fleet_latency() {
+        use crate::artifact::{CommitId, GitTreeId, RepositoryRef};
+        use crate::compute_workload::ComputeTrustClass;
+        use crate::execution_admission::ExecutionRequestId;
+        use crate::hot_execution_performance::{
+            HotBuildState, HotDependencyState, HotExecutionHeat, HotExecutionMilestones,
+            HotExecutionMode, HotExecutionPerformanceIdentity, HotExecutionPerformanceReceipt,
+            HotExecutionResultClass, HotIndexServiceState, HotRepositoryState, HotSandboxState,
+        };
+        use crate::hot_fleet_window::{
+            HotFleetArm, HotFleetAttemptEvidence, HotFleetConcurrencyBasis,
+            HotFleetConcurrencyObservation, HotFleetConcurrencyObservationSource,
+            HotFleetDecisionKind, HotFleetSemanticValidation, HotFleetWindowCloseReason,
+            HotFleetWindowIdentity, HotFleetWindowTiming, HotFleetWorkItem,
+        };
+        use crate::lima_lifecycle::LimaResourceProfile;
+        use crate::rust_memory_diagnostic::{
+            RustCgroupMemoryEvidence, RustDiagnosticTiming, RustExecutionPhase,
+            RustMemoryDiagnosticClassification, RustMemoryDiagnosticEnvelopeBinding,
+            RustPreflightMemoryObservation, RustProcessGroupGeneration, RustProcessGroupId,
+            RustProcessGroupIdentity, RustProcessTermination, RustTerminalObservation,
+            RustVerificationAttemptId,
+        };
+        use crate::rust_verification_envelope::{
+            CargoTargetDirectoryIdentity, RustBuildScriptInclusion, RustCacheContract,
+            RustCacheIdentityClass, RustCargoProfileKind, RustCompilationContract,
+            RustConcurrencyPlan, RustFeatureSelection, RustResourceEnvelope, RustRetryPolicy,
+            RustRetryPolicyId, RustRuntimeConcurrency, RustTargetDirectoryId, RustTargetTriple,
+            RustToolchainId, RustToolchainIdentity, RustVerificationEnvelope,
+            RustVerificationEnvelopeDefinition, RustVerificationScope,
+            RustVerificationSourceIdentity,
+        };
+        use crate::verification_profile::{
+            CacheId, CapabilityId, PackageId, RepositoryCommandId, RepositoryCommandIdentity,
+            VerificationProfileId,
+        };
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let char_digest = |ch: char| {
+            Sha256Digest::parse(&format!("sha256:{}", ch.to_string().repeat(64)))
+                .expect("valid digest")
+        };
+
+        // 1. Rust memory diagnostic classification via evaluate_estate_rust_memory_diagnostic
+        let repo = RepositoryRef::parse("unsigned-gg/glaeda").expect("repo");
+        let concurrency = RustConcurrencyPlan::new(
+            2,
+            RustRuntimeConcurrency::Libtest {
+                test_threads: 1,
+                filter: None,
+            },
+            vec![],
+        )
+        .expect("concurrency");
+        let resources = RustResourceEnvelope::new(
+            LimaResourceProfile::Work,
+            ExecutionResourceLimits::new(4_000, 6 * GIB, 2_048).expect("limits"),
+            concurrency,
+            5 * GIB,
+            GIB,
+            12_000,
+        )
+        .expect("resources");
+        let toolchain = RustToolchainIdentity::new(
+            RustToolchainId::parse("rust-1.88.0").expect("toolchain"),
+            char_digest('d'),
+            RustTargetTriple::parse("x86_64-unknown-linux-gnu").expect("host"),
+            RustTargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
+        );
+        let compilation = RustCompilationContract::new(
+            toolchain,
+            RustCargoProfileKind::Test,
+            RustFeatureSelection::NoDefault,
+            RustBuildScriptInclusion::Included,
+        );
+        let cache = RustCacheContract::new(
+            RustCacheIdentityClass::RepositoryScoped,
+            CargoTargetDirectoryIdentity::new(
+                RustTargetDirectoryId::parse("glaeda-target").expect("target dir"),
+                CacheId::parse("glaeda-cache").expect("cache"),
+                char_digest('e'),
+            ),
+        );
+        let envelope = RustVerificationEnvelope::new(RustVerificationEnvelopeDefinition {
+            profile_id: VerificationProfileId::parse("glaeda-focused").expect("profile"),
+            source: RustVerificationSourceIdentity::new(
+                repo.clone(),
+                CommitId::parse(&"a".repeat(40)).expect("commit"),
+                GitTreeId::parse(&"b".repeat(40)).expect("tree"),
+            ),
+            command: RepositoryCommandIdentity::new(
+                repo,
+                RepositoryCommandId::parse("glaeda-lib").expect("command"),
+                char_digest('c'),
+            ),
+            scope: RustVerificationScope::LibraryTests {
+                package: PackageId::parse("glaeda").expect("package"),
+            },
+            compilation,
+            resources,
+            cache,
+            required_capabilities: vec![CapabilityId::parse("cargo").expect("capability")],
+            retry: RustRetryPolicy::no_retry(RustRetryPolicyId::parse("no-retry").expect("retry")),
+        })
+        .expect("envelope");
+
+        let binding = RustMemoryDiagnosticEnvelopeBinding::from_envelope(
+            &envelope,
+            RustVerificationAttemptId::parse("attempt-1").expect("attempt"),
+            RustProcessGroupIdentity::new(
+                RustProcessGroupId::parse("rust-attempt-group").expect("group"),
+                RustProcessGroupGeneration::new(1).expect("generation"),
+            ),
+        )
+        .expect("binding");
+        let obs_binding = binding.observation_binding();
+        let mem_input = RustMemoryDiagnosticInput::new(
+            binding,
+            RustDiagnosticTiming::new(EpochMillis::new(1_200).expect("t"), None, 500, 500)
+                .expect("timing"),
+            RustPreflightMemoryObservation::new(
+                obs_binding.clone(),
+                EpochMillis::new(1_000).expect("t0"),
+                4 * GIB,
+                GIB,
+            )
+            .expect("preflight"),
+            RustTerminalObservation::new(
+                obs_binding,
+                EpochMillis::new(1_200).expect("t1"),
+                RustExecutionPhase::NotStarted,
+                RustProcessTermination::NotStarted,
+            ),
+            RustCgroupMemoryEvidence::NotCreated,
+        );
+
+        let mem_report = evaluate_estate_rust_memory_diagnostic(mem_input)
+            .expect("valid refused memory diagnostic input must classify cleanly");
+        assert_eq!(
+            mem_report.classification,
+            RustMemoryDiagnosticClassification::MemoryPressureRefused
+        );
+
+        // 2. Hot-fleet A-B-B-A latency comparison via evaluate_estate_hot_fleet_latency
+        let build_window = |arm: HotFleetArm, block: &str, decision: &str, latency_base: u64| {
+            let members = (0..4)
+                .map(|idx| {
+                    let work_id = format!("work-{idx}");
+                    let final_millis = latency_base + idx as u64 * 10;
+                    let perf = HotExecutionPerformanceReceipt::new(
+                        HotExecutionPerformanceIdentity::new(
+                            &work_id,
+                            "glaeda",
+                            "source",
+                            "candidate",
+                            "lima-vz",
+                            "apple-silicon",
+                            "profile",
+                        )
+                        .expect("perf id"),
+                        HotExecutionMode::ResidentTaskLoop,
+                        final_millis,
+                        HotExecutionMilestones::new(
+                            Some(10),
+                            Some(10),
+                            Some(10),
+                            Some(20),
+                            Some(final_millis - 10),
+                            Some(final_millis),
+                            None,
+                        )
+                        .expect("milestones"),
+                        HotExecutionHeat::new(
+                            HotSandboxState::ResidentHit,
+                            HotRepositoryState::ResidentHit,
+                            HotDependencyState::ResidentHit,
+                            HotBuildState::IncrementalHit,
+                            HotIndexServiceState::ResidentHit,
+                        ),
+                        None,
+                        None,
+                        HotExecutionResultClass::Succeeded,
+                    )
+                    .expect("perf receipt");
+                    let attempt = HotFleetAttemptEvidence::new(
+                        ExecutionRequestId::parse(&format!("req-{idx}")).expect("req id"),
+                        Some(perf),
+                        HotFleetSemanticValidation::Accepted,
+                        false,
+                    )
+                    .expect("attempt");
+                    HotFleetWorkItem::new(
+                        &work_id,
+                        char_digest(char::from(b'a' + idx as u8)),
+                        Some(attempt),
+                    )
+                    .expect("work item")
+                })
+                .collect::<Vec<_>>();
+
+            HotFleetWindowReceiptV1::new(
+                HotFleetWindowIdentity::new(
+                    "exp-1",
+                    block,
+                    arm,
+                    HotFleetDecisionKind::HeavySlotPolicy,
+                    decision,
+                    "validator-v1",
+                    "same-source-class",
+                    "lima-vz",
+                    "apple-silicon",
+                    char_digest('f'),
+                    "blocked-arrivals",
+                    ComputeTrustClass::UltraTrusted,
+                    "non-treatment-v1",
+                )
+                .expect("window id"),
+                HotFleetWindowTiming::new(
+                    EpochMillis::new(1_000).expect("start"),
+                    EpochMillis::new(2_000).expect("end"),
+                    1_000,
+                    1_000,
+                    HotFleetWindowCloseReason::Deadline,
+                )
+                .expect("timing"),
+                HotFleetConcurrencyObservation::new(
+                    HotFleetConcurrencyBasis::HeavyExecution,
+                    4,
+                    HotFleetConcurrencyObservationSource::HarnessOwned,
+                )
+                .expect("concurrency"),
+                members,
+                &[],
+            )
+            .expect("window receipt")
+        };
+
+        let a1 = build_window(HotFleetArm::Baseline, "a1", "linked", 700);
+        let b1 = build_window(HotFleetArm::Candidate, "b1", "overlay", 400);
+        let b2 = build_window(HotFleetArm::Candidate, "b2", "overlay", 500);
+        let a2 = build_window(HotFleetArm::Baseline, "a2", "linked", 800);
+
+        let latency_report = evaluate_estate_hot_fleet_latency([&a1, &b1, &b2, &a2])
+            .expect("comparable A-B-B-A windows must summarize cleanly");
+        assert_eq!(
+            latency_report
+                .baseline_latency
+                .final_result_p50
+                .lower_millis,
+            Some(710)
+        );
+        assert_eq!(
+            latency_report
+                .candidate_latency
+                .final_result_p50
+                .lower_millis,
+            Some(410)
+        );
+
+        let invalid_abba = evaluate_estate_hot_fleet_latency([&a1, &a2, &b1, &b2])
+            .expect_err("non-ABBA arm order must fail closed");
+        assert_eq!(invalid_abba.code, "hot_fleet_comparison_refused");
     }
 }

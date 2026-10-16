@@ -36,8 +36,8 @@ being measured.
 ## Totals
 
 - Exported modules: **209**
-- Reach: **102 binary**, **63 library**, **10 tests**, **34 none**
-- Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
+- Reach: **107 binary**, **60 library**, **10 tests**, **32 none**
+- Gate: at most 32 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
 
@@ -54,7 +54,6 @@ let the gate hold the line.
 | `debian_package_recovery` | `target_os="linux"` | 1 |  |
 | `failure_diagnostic` | `all` | 1 |  |
 | `github_workflow_job_reconciliation` | `all` | 1 |  |
-| `hot_fleet_latency_summary` | `all` | 1 |  |
 | `immutable_artifact_distribution` | `all` | 1 |  |
 | `immutable_git_object_pool_generation_audit` | `target_os="linux"` | 1 |  |
 | `linux_installation_enrollment` | `target_os="linux"` | 1 |  |
@@ -75,7 +74,6 @@ let the gate hold the line.
 | `renderprove_artifact_binding` | `all` | 1 |  |
 | `renderprove_protected_mount` | `target_os="linux"` | 1 |  |
 | `resident_backend_comparison` | `all` | 1 |  |
-| `rust_memory_diagnostic` | `all` | 5 |  |
 | `task_private_git_clone_plan` | `target_os="linux"` | 1 |  |
 | `trusted_guest_control_binary_generation` | `all` | 1 |  |
 | `trusted_overlay_mount_execution` | `target_os="linux"` | 1 |  |
@@ -99,7 +97,7 @@ let the gate hold the line.
 | `cmux_product_transport_adapter` | `all` | none | 0 |
 | `cmux_workload_verification_adapter` | `all` | library | 1 |
 | `compute_execution_request` | `all` | binary | 2 |
-| `compute_workload` | `all` | binary | 6 |
+| `compute_workload` | `all` | binary | 7 |
 | `cortex_revenant_bridge` | `all` | binary | 5 |
 | `debian_package_plan` | `target_os="linux"` | binary | 16 |
 | `debian_package_probe` | `target_os="linux"` | binary | 2 |
@@ -142,9 +140,9 @@ let the gate hold the line.
 | `host_readiness` | `target_os="linux"` | binary | 13 |
 | `host_readiness_verdict` | `target_os="linux"` | binary | 1 |
 | `host_rootless_podman` | `target_os="linux"` | binary | 8 |
-| `hot_execution_performance` | `all` | binary | 4 |
-| `hot_fleet_latency_summary` | `all` | none | 0 |
-| `hot_fleet_window` | `all` | library | 1 |
+| `hot_execution_performance` | `all` | binary | 5 |
+| `hot_fleet_latency_summary` | `all` | binary | 1 |
+| `hot_fleet_window` | `all` | binary | 2 |
 | `hot_run_cache_observation` | `target_os="linux"` | binary | 1 |
 | `hot_state_path_policy` | `all` | library | 3 |
 | `immutable_artifact_distribution` | `all` | none | 0 |
@@ -163,7 +161,7 @@ let the gate hold the line.
 | `lease_catalog` | `all` | library | 1 |
 | `lease_document` | `all` | library | 1 |
 | `lima_host_identity` | `unix` | binary | 8 |
-| `lima_lifecycle` | `all` | binary | 18 |
+| `lima_lifecycle` | `all` | binary | 19 |
 | `lima_lifecycle_executor` | `all` | library | 2 |
 | `lima_observation` | `all` | binary | 41 |
 | `linked_worktree_reclaim` | `unix` | binary | 1 |
@@ -263,9 +261,9 @@ let the gate hold the line.
 | `runner_account_plan` | `target_os="linux"` | binary | 17 |
 | `runner_user` | `target_os="linux"` | binary | 9 |
 | `runner_user_observation` | `target_os="linux"` | binary | 2 |
-| `rust_memory_diagnostic` | `all` | none | 0 |
-| `rust_verification_envelope` | `all` | library | 6 |
-| `rust_verification_envelope_digest` | `all` | library | 5 |
+| `rust_memory_diagnostic` | `all` | binary | 1 |
+| `rust_verification_envelope` | `all` | binary | 7 |
+| `rust_verification_envelope_digest` | `all` | binary | 5 |
 | `state` | `all` | binary | 36 |
 | `state_document` | `all` | binary | 9 |
 | `state_root_generation` | `all` | library | 3 |
@@ -293,7 +291,7 @@ let the gate hold the line.
 | `verification_cache_generation` | `all` | library | 2 |
 | `verification_command_semantics` | `all` | library | 1 |
 | `verification_isolation_referee` | `all` | none | 0 |
-| `verification_profile` | `all` | binary | 50 |
+| `verification_profile` | `all` | binary | 51 |
 | `verification_profile_preflight_adapter` | `all` | library | 1 |
 | `verification_profile_registry` | `all` | library | 8 |
 | `worker_pool_kernel_solver` | `all` | binary | 7 |
