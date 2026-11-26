@@ -139,7 +139,7 @@ fn consume_with_bridge_capacity_inner<B: DeliveryBridge>(
     available_capacity: u16,
     expected_catalog_revision: Option<DisposableAttemptCatalogRevision>,
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
-    if available_capacity > 1 {
+    if available_capacity > policy.host_budget().max_workers() {
         return Err(controller_error("scale_set_capacity_invalid"));
     }
     let mut recovery_store =
@@ -248,13 +248,16 @@ fn resume_delivery<B: DeliveryBridge>(
 ) -> Result<ScaleSetDeliveryControllerDisposition, ScaleSetDeliveryControllerError> {
     match current.phase() {
         ScaleSetDeliveryRecoveryPhase::Reconciled => {
-            let recovery_capacity = u16::from(
-                !current
+            // The replay must admit exactly as many Available events as the retained delivery
+            // holds: zero or one on a one-worker host, up to the host ceiling otherwise.
+            let recovery_capacity = u16::try_from(
+                current
                     .delivery()
                     .available_request_ids()
                     .map_err(|_| controller_error("scale_set_delivery_invalid"))?
-                    .is_empty(),
-            );
+                    .len(),
+            )
+            .map_err(|_| controller_error("scale_set_delivery_invalid"))?;
             let poll = bridge.poll(recovery_capacity).map_err(map_bridge_error)?;
             let observed = match ScaleSetDelivery::from_bridge_poll(&poll) {
                 Ok(Some(delivery)) => delivery,

@@ -34,21 +34,92 @@ jobs:
           fetch-depth: 0  # the hygiene archive's ancestry.txt lists the source's ancestors
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      # Rust binaries are built once per Rust inputs, not once per push: most pushes change only scripts and docs,
+      # and rebuilding glaeda, glaeda-worktree-reclaim and fleet-cas from scratch was ~3.5 of this job's 4-5
+      # minutes (Leo, 2026-11-21: "we should be able to speed these thigns up"). The key hashes each set's
+      # tracked input blobs and rustc; a hit is used only when its cargo dep-info names no checkout file the key
+      # missed (scripts/release_build_cache.py). Only main writes these entries.
+      - name: Rust input keys
+        id: keys
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          echo "glaeda=$(python3 scripts/release_build_cache.py key --set glaeda --target "$TARGET")" >> "$GITHUB_OUTPUT"
+          echo "cas=$(python3 scripts/release_build_cache.py key --set fleet-cas --target "$TARGET")" >> "$GITHUB_OUTPUT"
+      - name: Restore glaeda binaries built from these inputs
+        id: glaeda-bins
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/glaeda
+          key: release-bins-glaeda-${{ matrix.target }}-${{ steps.keys.outputs.glaeda }}
+      - name: Restore fleet-cas binary built from these inputs
+        id: cas-bins
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/fleet-cas
+          key: release-bins-cas-${{ matrix.target }}-${{ steps.keys.outputs.cas }}
+      - name: Use the cached binaries only when their dep-info is covered
+        id: reuse
+        run: |
+          for set in glaeda fleet-cas; do
+            if [ -d "target/release-bins/$set" ] && python3 scripts/release_build_cache.py covered --set "$set" --dir "target/release-bins/$set"; then
+              echo "$set: reusing binaries built from the same Rust inputs" >> "$GITHUB_STEP_SUMMARY"
+            else
+              rm -rf "target/release-bins/$set"
+              echo "build-$set=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+      # A changed set still builds; its dependencies come from a cache keyed on the lock files.
+      - name: Restore cargo dependency cache
+        if: steps.reuse.outputs.build-glaeda == 'true' || steps.reuse.outputs.build-fleet-cas == 'true'
+        id: deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release-build
+          key: release-deps-${{ matrix.target }}-rust-1.97.1-${{ hashFiles('Cargo.lock', 'tools/fleet-cas-prototype/Cargo.lock') }}
+          restore-keys: |
+            release-deps-${{ matrix.target }}-rust-1.97.1-
+      - name: Build glaeda and glaeda-worktree-reclaim
+        if: steps.reuse.outputs.build-glaeda == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --bin glaeda --bin glaeda-worktree-reclaim --target "$TARGET" --target-dir target/release-build
+          python3 scripts/release_build_cache.py stash --set glaeda --from "target/release-build/$TARGET/release" --out target/release-bins/glaeda
+      - name: Build fleet-cas
+        if: steps.reuse.outputs.build-fleet-cas == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --manifest-path tools/fleet-cas-prototype/Cargo.toml --target "$TARGET" --target-dir target/release-build
+          python3 scripts/release_build_cache.py stash --set fleet-cas --from "target/release-build/$TARGET/release" --out target/release-bins/fleet-cas
       - name: Fleet candidate bundle
         env:
           TARGET: ${{ matrix.target }}
-        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-candidates"
+        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-candidates" --binary target/release-bins/glaeda/glaeda
       - name: Fleet-CAS prebuilt candidate
         env:
           TARGET: ${{ matrix.target }}
-        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-fleet-cas"
+        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-fleet-cas" --binary target/release-bins/fleet-cas/fleet-cas
       - name: Hygiene tools archive
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          cargo build --locked --release --bin glaeda-worktree-reclaim --target "$TARGET"
           python3 scripts/glaeda_release.py hygiene --source "$GITHUB_SHA" --target "$TARGET" \
-            --reclaim "target/$TARGET/release/glaeda-worktree-reclaim" --output release-assets
+            --reclaim target/release-bins/glaeda/glaeda-worktree-reclaim --output release-assets
+      - name: Smoke the hygiene archive (promotion's evidence when no canary host can report)
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # the tools run under the host's python: macOS minis use /usr/bin/python3 (3.9)
+          smoke_python=python3
+          if [ "$RUNNER_OS" = macOS ] && [ -x /usr/bin/python3 ]; then smoke_python=/usr/bin/python3; fi
+          python3 scripts/glaeda_release.py smoke --source "$GITHUB_SHA" --target "$TARGET" \
+            --python "$smoke_python" --output release-assets
       - name: Assemble release assets
         run: |
           mkdir -p release-assets
@@ -59,15 +130,38 @@ jobs:
           path: release-assets/
           if-no-files-found: error
           retention-days: 7
+      - name: Save glaeda binaries
+        if: steps.reuse.outputs.build-glaeda == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/glaeda
+          key: release-bins-glaeda-${{ matrix.target }}-${{ steps.keys.outputs.glaeda }}
+      - name: Save fleet-cas binary
+        if: steps.reuse.outputs.build-fleet-cas == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/release-bins/fleet-cas
+          key: release-bins-cas-${{ matrix.target }}-${{ steps.keys.outputs.cas }}
+      - name: Save cargo dependency cache
+        if: (steps.reuse.outputs.build-glaeda == 'true' || steps.reuse.outputs.build-fleet-cas == 'true') && steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release-build
+          key: release-deps-${{ matrix.target }}-rust-1.97.1-${{ hashFiles('Cargo.lock', 'tools/fleet-cas-prototype/Cargo.lock') }}
 
   publish:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
-    # canary.json has this one writer; a newer push waiting here supersedes an older pending one
+    # One group per commit: every push gets its durable release, and a newer push never replaces an
+    # older pending publish (a shared group did). canary.json moves in the canary job below.
     concurrency:
-      group: ota-canary
+      group: ota-release-${{ github.sha }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -108,31 +202,96 @@ jobs:
             gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "$TAG" --notes "glaeda $GITHUB_SHA. Installed by glaeda-update on the canary ring first (docs/GLAEDA_OTA.md)."
           fi
-      - name: Move canary to it
+
+  # canary.json has this one writer, one run at a time. A waiting run that GitHub replaces loses nothing:
+  # each run moves canary to the newest published release on main that descends from the current
+  # canary, read when it starts, and the run that replaced it started after that release existed.
+  # scripts/test-delivery-concurrency.py holds the group.
+  canary:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: ota-canary
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+          fetch-depth: 0  # canary only moves forward: the ancestry checks need history
+      - name: Move canary to the newest release
         run: |
+          set -euo pipefail
+          # Releases of later pushes may be newer than this run's commit.
+          git fetch --quiet origin main
+          main=$(git rev-parse FETCH_HEAD)
           mkdir -p channels
           if ! gh release view ota-channels >/dev/null 2>&1; then
             python3 scripts/glaeda_release.py control --paused false > channels/control.json
             gh release create ota-channels channels/control.json --target "$GITHUB_SHA" --prerelease --latest=false \
               --title "OTA channels" --notes "canary.json, stable.json, control.json: what each glaeda-update ring installs (docs/GLAEDA_OTA.md)."
           fi
+          previous=""
           if gh release download ota-channels --pattern canary.json --dir channels 2>channels/err; then
             previous=$(python3 -c 'import json;print(json.load(open("channels/canary.json"))["source"])')
-            set +e
-            git merge-base --is-ancestor "$previous" "$GITHUB_SHA"
-            descends=$?
-            set -e
-            if [ "$descends" = 1 ]; then
-              echo "canary stays at $previous: $GITHUB_SHA does not descend from it" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            elif [ "$descends" != 0 ]; then
+            if ! git merge-base --is-ancestor "$previous" "$main" 2>/dev/null; then
               echo "canary commit $previous is not in main's history (rewritten?); fix canary.json by hand" >&2
               exit 1
             fi
           elif ! grep -q "no assets match" channels/err; then
             cat channels/err; exit 1
           fi
-          python3 scripts/glaeda_release.py canary --release release-assets/release.json > channels/next.json
+          # Every release, not just the ones listed after the current canary: a newer commit's release can be
+          # created before an older one's and finish later. The tag names its commit (r-DATE-<12 hex>), so
+          # ancestry is decided locally and only the chosen release's manifest is downloaded.
+          gh release list --limit 1000 --json tagName \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | .tagName' > channels/all-tags.txt
+          # Only commits on main and not behind canary can pass the checks below: one rev-list instead of three git
+          # processes for each of ~900 tags (~14 s of this step). The loop still checks each survivor exactly.
+          git rev-list "$main" ${previous:+"^$previous"} > channels/fresh.txt
+          if [ -n "$previous" ]; then echo "$previous" >> channels/fresh.txt; fi
+          awk 'NR==FNR { fresh[substr($1, 1, 12)] = 1; next } { h = $0; sub(/.*-/, "", h); if (h in fresh) print }' \
+            channels/fresh.txt channels/all-tags.txt > channels/tags.txt
+          : > channels/candidates.txt
+          while read -r tag; do
+            source=$(git rev-parse --verify --quiet "${tag##*-}^{commit}" 2>/dev/null) || continue
+            git merge-base --is-ancestor "$source" "$main" 2>/dev/null || continue
+            if [ -n "$previous" ] && ! git merge-base --is-ancestor "$previous" "$source"; then continue; fi
+            echo "$(git rev-list --count "$source") $tag $source" >> channels/candidates.txt
+          done < channels/tags.txt
+          best="" best_tag=""
+          # Deepest first; a release whose manifest is not uploaded yet (or names another commit) is passed over,
+          # and its own canary run moves canary when it is.
+          while read -r _ tag source; do
+            gh release download "$tag" --pattern release.json --output "channels/$tag.json" --clobber 2>/dev/null || continue
+            named=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["source"])' "channels/$tag.json") || continue
+            [ "$named" = "$source" ] || continue
+            best="$source" best_tag="$tag"
+            break
+          done < <(sort -rn channels/candidates.txt)
+          if [ -z "$best" ]; then
+            echo "canary stays at ${previous:-none}: no release on main descends from it" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 scripts/glaeda_release.py canary --release "channels/$best_tag.json" > channels/next.json
+          # The same commit rebuilt (a re-run replaces its release's assets and release.json): canary.json is
+          # rewritten when its tag or release digest differ, so clients never check a stale digest.
+          if [ "$best" = "$previous" ] && python3 - channels/canary.json channels/next.json <<'PY'
+          import json, sys
+          old, new = (json.load(open(p)) for p in sys.argv[1:])
+          sys.exit(0 if (old.get("tag"), old.get("releaseSha256")) == (new["tag"], new["releaseSha256"]) else 1)
+          PY
+          then
+            echo "canary stays at $previous: it names the newest descending release" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           mv channels/next.json channels/canary.json
           gh release upload ota-channels channels/canary.json --clobber
           cat channels/canary.json >> "$GITHUB_STEP_SUMMARY"

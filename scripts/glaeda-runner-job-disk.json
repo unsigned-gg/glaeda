@@ -1,0 +1,11 @@
+{
+ "disk_gib_p95": 5.3,
+ "disk_n": 11438,
+ "generated_at": "2026-11-15T23:59:42Z",
+ "note": "job-needs.json all.disk_gib_p95, written by data/job_needs.py; the controller reserves it per PR job in flight on a lent host (runner_disk.go)",
+ "schema": "glaeda-runner-job-disk/v1",
+ "window": {
+  "from": "2026-11-02",
+  "to": "2026-11-15"
+ }
+}

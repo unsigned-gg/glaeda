@@ -3,6 +3,7 @@ Description=Reclaim linked Git worktrees whose removal loses nothing (glaeda-wor
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1h
 Nice=10
 IOSchedulingClass=idle
 ExecStart=/bin/bash %h/.local/bin/glaeda-worktree-reclaim-all --apply --output json

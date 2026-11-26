@@ -67,7 +67,7 @@ class ControllerTests(unittest.TestCase):
     def test_pressure_stops_only_after_idle_barrier(self):
         fake = FakeRunner(state="running", workers=True)
         observed = vm.observe(policy(), home="/tmp/home", gui_queue_depth=0, run=fake)
-        observed = dataclasses.replace(observed, host_cpu_busy_pct=90)
+        observed = dataclasses.replace(observed, host_cpu_busy_pct=96)  # over the 95% pause mark
         decision = vm.plan(policy(), observed)
         self.assertEqual(decision["disposition"], "blocked")
         self.assertEqual(decision["actions"], [])

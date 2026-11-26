@@ -1,9 +1,13 @@
-# Fleet compilation-cache prototype
+# Fleet compilation cache (fleet-cas)
 
-Throwaway measurement tool for the fleet-shared compilation cache experiment
-([`docs/experiments/fleet-compilation-cache-2026-09-23.md`](../../docs/experiments/fleet-compilation-cache-2026-09-23.md)).
-It is not part of the `glaeda` crate, is not built by `scripts/verify`, and is
-not a supported service.
+The production fleet compilation cache for the cmux runner minis. It began as the
+measurement tool for the fleet-shared compilation cache experiment
+([`docs/experiments/fleet-compilation-cache-2026-09-23.md`](../../docs/experiments/fleet-compilation-cache-2026-09-23.md)),
+which is why the directory keeps the name `fleet-cas-prototype`. It is its own crate,
+not part of `glaeda`: the Verify workflow tests it, every release publishes its prebuilt
+bundle (`scripts/fleet_cas_bundle.py`), and `scripts/glaeda-fleet-cas` installs it on a mini as
+the node, writer, store and relay services (design:
+[`docs/CMUX_BUILD_SLOT_MODES.md`](../../docs/CMUX_BUILD_SLOT_MODES.md)).
 
 It serves the two gRPC services Xcode's `COMPILATION_CACHE_REMOTE_SERVICE_PATH`
 talks to, from swiftlang/llvm-project
@@ -23,6 +27,29 @@ Storage is one file per object under the store directory. Counters go to
 semantics used by the trusted writer marker gate; `write_expected_refused`
 separately identifies the deliberate KV write response from a
 `--read-only-kv` reader node.
+
+`GET /stats` on the same port (HTTP/1.1 beside gRPC: `curl -fsS
+http://<addr>/stats`, or `curl --unix-socket <socket> http://x/stats` on a
+node) serves JSON (`schema: fleet-cas-stats/v1`): `role`, `uptime_s`,
+`starts`, `writers` (a store's `--writers`, null on a node), `windows` (`5m`,
+`1h`, `6h`, `24h`: `kv_hits`, `kv_misses`, `cas_hits`, `cas_misses`, `puts`,
+`errors`, `write_refused`, bytes, `requests`, `hit_rate`, `kv_hit_rate`;
+rates are null with no lookups), `lifetime` and the raw `counters` of
+`stats.json`. The windows come from per-minute buckets kept for 24 h in
+`<store>/stats-history.txt` (written every minute and at shutdown), so a
+restart keeps them; the raw counters restart at 0 (`instance` changes). On
+2026-11-20/21 the store was down ~21 h and nothing on the network could say
+so: no answer from `/stats` is a down store, and a low 1 h `kv_hit_rate`
+over enough `requests` is a cold or broken one (the fleet status scraper reads
+it and pushes an alarm).
+
+`clients` has the same windows (and `lifetime`, `last_seen_ms`) per TCP peer
+address, so a low hit rate names the node that misses; requests without a
+peer address (a unix socket) count under `"unknown"`. They are kept in memory
+only and start at `clients_since_ms` (the process start); at most
+`clients_max` (256) are kept, a new one past that drops the least recently
+seen (`clients_dropped` counts them). A store's clients behind the nc relay
+show as the minis' LAN addresses.
 
 One binary plays two roles:
 
@@ -142,7 +169,7 @@ DerivedData; see the 2026-09-24 experiment. On a cmux build fleet mini,
 `scripts/with-fleet-lock.pl` keeps the fleet worker from starting a job
 during a measurement.
 
-Known prototype gaps: the node daemon must run on the same host as the build
+Known gaps: the node daemon must run on the same host as the build
 (the client sends large blobs as local file paths, and the node reads whatever
 path it is given, so run it only for your own user; the TCP fleet store
 refuses file-path uploads); object uploads are gated only by the peer address

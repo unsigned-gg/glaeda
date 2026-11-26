@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Discovery regressions for the hourly worktree and local-branch sweep."""
+
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).resolve().with_name("glaeda-worktree-reclaim-all")
+
+
+class ReclaimDiscoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.projects = self.root / "Projects with spaces"
+        self.projects.mkdir()
+        self.capture = self.root / "argv"
+        self.reclaim = self.root / "reclaim"
+        self.reclaim.write_text(
+            '#!/bin/bash\n[ "$1" = --help ] && { echo "  --skip-unlisted"; exit 0; }\n'
+            'printf "%s\\0" "$@" > "$CAPTURE"\n')
+        self.reclaim.chmod(0o755)
+        self.env = {
+            "HOME": str(self.root), "PATH": "/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GLAEDA_PROJECTS_ROOT": str(self.projects),
+            "GLAEDA_WORKTREE_RECLAIM": str(self.reclaim),
+            "CAPTURE": str(self.capture),
+            # The real disk's fullness must not change the argv the tests compare.
+            "GLAEDA_RECLAIM_PRESSURE_PERCENT": "101",
+        }
+
+    def git(self, repo, *args):
+        return subprocess.run(
+            ["/usr/bin/git", "-C", str(repo), *args], env=self.env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            check=True, timeout=10,
+        ).stdout
+
+    def repository(self, name="demo", branch="main"):
+        repo = self.projects / name
+        repo.mkdir()
+        self.git(repo, "init", "-q", "-b", branch)
+        self.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "initial", "--allow-empty")
+        return repo
+
+    def sweep(self, *args):
+        subprocess.run(
+            ["/bin/bash", str(SCRIPT), *args], env=self.env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            check=True, timeout=20,
+        )
+        return self.capture.read_bytes().decode().rstrip("\0").split("\0") if self.capture.exists() else []
+
+    def test_last_worktree_removal_still_discovers_leftover_branch(self):
+        repo = self.repository()
+        checkout = self.root / "linked"
+        self.git(repo, "worktree", "add", "-qb", "finished", str(checkout))
+        self.git(repo, "worktree", "remove", str(checkout))
+        before = self.git(repo, "show-ref")
+        self.assertEqual(self.sweep("--output", "json"),
+                         ["--branches", "--skip-unlisted", "--output", "json", "--repository", str(repo)])
+        self.assertEqual(self.git(repo, "show-ref"), before)
+        self.assertFalse(checkout.exists())
+
+    def test_dirty_repository_is_only_discovered_never_cleaned_by_wrapper(self):
+        repo = self.repository("dirty")
+        self.git(repo, "branch", "unfinished")
+        dirty = repo / "keep.txt"
+        dirty.write_text("uncommitted work\n")
+        self.assertIn(str(repo), self.sweep())
+        self.assertEqual(dirty.read_text(), "uncommitted work\n")
+        self.assertEqual(self.git(repo, "status", "--porcelain"), "?? keep.txt\n")
+
+    def test_linked_worktree_still_selects_repository(self):
+        repo = self.repository()
+        self.git(repo, "worktree", "add", "--detach", str(self.root / "linked"))
+        self.assertEqual(self.sweep(), ["--branches", "--skip-unlisted", "--repository", str(repo)])
+
+    def test_main_and_master_only_do_not_consume_repository_budget(self):
+        repo = self.repository()
+        self.git(repo, "branch", "master")
+        self.assertEqual(self.sweep(), [])
+
+    def test_third_sorted_branch_is_discovered_after_main_and_master(self):
+        repo = self.repository()
+        self.git(repo, "branch", "master")
+        self.git(repo, "branch", "zzz-finished")
+        self.assertIn(str(repo), self.sweep("--apply"))
+
+
+    def test_a_checkout_one_folder_down_is_discovered(self):
+        nested = self.projects / "personal-build"
+        nested.mkdir()
+        repo = nested / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-q", "-b", "main")
+        self.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "initial", "--allow-empty")
+        self.git(repo, "worktree", "add", "-qb", "lane", str(nested / "lane"))
+        (self.projects / "alias").symlink_to(nested)
+        argv = self.sweep()
+        self.assertEqual(argv.count(str(repo)), 1)
+        self.assertNotIn(str(nested / "lane"), argv)
+
+    def test_disk_pressure_shortens_the_unfinished_window(self):
+        repo = self.repository()
+        self.git(repo, "worktree", "add", "-qb", "lane", str(self.root / "lane"))
+        self.env["GLAEDA_RECLAIM_PRESSURE_PERCENT"] = "0"
+        argv = self.sweep()
+        self.assertEqual(argv[argv.index("--minimum-idle-seconds") + 1], "43200")
+        # A window the caller passed wins; no pressure, no change.
+        argv = self.sweep("--minimum-idle-seconds", "7200")
+        self.assertEqual(argv.count("--minimum-idle-seconds"), 1)
+        self.env["GLAEDA_RECLAIM_PRESSURE_PERCENT"] = "101"
+        self.assertNotIn("--minimum-idle-seconds", self.sweep())
+
+
+    def test_git_workers_setting_passes_through_only_when_valid(self):
+        repo = self.repository()
+        self.git(repo, "worktree", "add", "-qb", "lane", str(self.root / "lane"))
+        # Unset: the command's own default (two) applies, and the argv stays as it was.
+        self.assertNotIn("--git-workers", self.sweep())
+        self.env["GLAEDA_RECLAIM_GIT_WORKERS"] = "1"
+        argv = self.sweep()
+        self.assertEqual(argv[argv.index("--git-workers") + 1], "1")
+        # A caller's own flag wins over the setting.
+        argv = self.sweep("--git-workers", "3")
+        self.assertEqual(argv.count("--git-workers"), 1)
+        self.assertEqual(argv[argv.index("--git-workers") + 1], "3")
+        # Garbage or out of range is ignored rather than stopping every sweep.
+        for bad in ("0", "9", "two", "-1"):
+            self.env["GLAEDA_RECLAIM_GIT_WORKERS"] = bad
+            self.assertNotIn("--git-workers", self.sweep(), bad)
+
+    def test_an_older_command_without_the_flag_gets_the_old_argv(self):
+        repo = self.repository()
+        self.git(repo, "branch", "lane")
+        self.reclaim.write_text('#!/bin/bash\n[ "$1" = --help ] && exit 0\nprintf "%s\\0" "$@" > "$CAPTURE"\n')
+        self.assertEqual(self.sweep(), ["--branches", "--repository", str(repo)])
+
+    def test_an_unreadable_checkout_is_skipped_and_named(self):
+        # One broken checkout must not stop the sweep of the others (cosmic-gray, 2026-10-22).
+        good = self.repository("good")
+        self.git(good, "branch", "lane")
+        broken = self.repository("broken")
+        self.git(broken, "branch", "lane")
+        (broken / ".git" / "HEAD").write_text("garbage\n")
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT)], env=self.env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.capture.read_bytes().decode().rstrip("\0").split("\0")
+        self.assertIn(str(good), argv)
+        self.assertNotIn(str(broken), argv)
+        self.assertIn(f"skipped {broken}: ", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

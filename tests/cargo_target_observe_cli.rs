@@ -4,7 +4,13 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Two tests in one process can read the clock in the same nanosecond (a coarse clock, parallel test
+// threads): the counter keeps each temp path its own. glaeda#2244's CI, 2026-11-20: two
+// rolling_tip_ledger_store tests shared one journal and each read the other's partial line.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 const BINARY: &str = env!("CARGO_BIN_EXE_glaeda-cargo-target-observe");
 const GIT: &str = "/usr/bin/git";
@@ -20,6 +26,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .expect("current time")
             .as_nanos();
+        let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
         let root = std::env::temp_dir().join(format!(
             "glaeda-cargo-target-observe-cli-{}-{nonce}",
             std::process::id()

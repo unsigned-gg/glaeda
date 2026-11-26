@@ -3,22 +3,33 @@
 
     glaeda-update               plan: which release this host's ring points at, and what would change
     glaeda-update --apply       download, verify, install, health-check; roll back on failure
-    glaeda-update --status      this host's config and state
+    glaeda-update --status      this host's config, state, and installed source
 
 A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
-runs `--apply` hourly; glaeda-mini-setup installs it. Configuration is ~/.config/glaeda/update.json,
+runs `--apply` every minute (PROBE_EVERY_S); glaeda-mini-setup installs it. A run does the full
+update every ten minutes (APPLY_EVERY_S) and, between those, only when a probe finds the channel
+files changed since the last full run (or, on a reporting canary, when the release's soak ends, to ask
+promote.yml at once): two anonymous HEADs of github.com/<repo>/releases/download,
+whose redirect names the uploaded asset (a new upload, a new asset). An unchanged probe prints
+nothing. A full run whose host already holds its ring's release costs two anonymous downloads of
+small channel files, never the GitHub API, so neither spends the shared quota. Configuration is ~/.config/glaeda/update.json,
 written once by setup and never overwritten:
 
     {"ring": "canary" | "stable", "setupArgs": ["--hygiene-only"], "host": "air-blue",
      "reportStatus": true, "source": "teamleaderleo/glaeda"}
 
 For a GUI-less macOS host, setupArgs also contains `--headless`; this keeps OTA reinstalls in
-the system launchd domain instead of silently returning to a GUI-only agent.
+the system launchd domain instead of silently returning to a GUI-only agent. A lane host with no glaeda
+hygiene has `["--gh-only"]`: setup installs only glaeda-gh, this updater and glaeda-disk's pressure pass, and the
+health check runs only those three.
 
 `source` is where releases and channel files are downloaded from: this repository, or its read-only
 mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
 holds byte-identical copies, so every check below still names this repository: release.json must say
-teamleaderleo/glaeda and the attestation must come from its release.yml.
+teamleaderleo/glaeda and the attestation must come from its release.yml. A mirror host reads the channel
+files from this repository first (their one writer; the mirror when it cannot be read) and downloads a
+release from the mirror first (this repository when the mirror has not copied it yet), so a promotion
+reaches it without waiting for the mirror's 15-minute copy (channel_sources, asset_sources).
 
 What one run does, and what it refuses:
 
@@ -40,43 +51,86 @@ What one run does, and what it refuses:
 4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
    glaeda-update must plan against the live channel. On failure the previous release's setup runs
    again, or on a first update the snapshot of the tools taken before it is restored, and the failed
-   tag is quarantined on this host, so it is never retried; a newer release is.
+   tag is quarantined on this host, so it is never retried; a newer release is. A check that times
+   out (a host too busy to start Python) rolls back the same way but quarantines nothing and posts
+   pending; the run backs off and tries again, and the HEALTH_TIMEOUTS-th timeout in a row for one
+   tag counts as a failure.
 5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
-   status `glaeda-ota/<host>` on the release's source commit. Promotion to stable waits for those.
+   status `glaeda-ota/<host>` on the release's source commit. Promotion to stable needs one canary's
+   success and no canary's failure. gh calls survive a spent REST quota: a reset within five minutes
+   is waited for (a failure's up to an hour), a rate limit or transient error is retried with backoff
+   (GH_BACKOFF), and a success or failure is recorded in state.json before it is posted, so one that
+   is not delivered is posted again by the next run.
 
 6. A mini that runs GitHub runners keeps the copy of glaeda-cmux-runner it is re-registered from in
    ~/glaeda-runner/scripts (glaeda-cmux-runner-fleet stages it). After an update, and on every run that
-   finds the release current, that copy is brought to the installed release's four runner files when
+   finds the release current, that copy is brought to the installed release's runner files (RUNNER_FILES) when
    it is older, so a relabel never runs from a stale copy. A copy an operator staged (its
    .glaeda-source.json stamp not written here) dated the release's day or later is kept, unless its
    commit is one the release descends from (the release's ancestry.txt). Only that directory, and only
    when it already exists.
+   6b. On the same hosts, ~/.local/bin/glaeda-promotion-admit (HQ's nightly promotion lease runs it over ssh) is
+   brought to the release's bytes: installed when missing, replaced when it is a version the release descends from
+   (hook-history.json), kept when newer. Under the helper's admit.lock and never while a lease's supervisor runs (a
+   later run swaps it); the copy and the installed file are each checked against the release's SHA-256.
 
 7. Then the runners' installed hook files: the release's own glaeda-cmux-runner --refresh-hooks --apply
    brings each owned runner's glaeda-hooks/glaeda-cmux-runner-hook and glaeda_reservation.py to the
    release's bytes, atomically, and nothing else (registration, labels, wrappers, LaunchAgents and
    receipts stay). Only a hook whose bytes are a version the release descends from (its
    hook-history.json) is replaced, so a hook an operator installed from a newer main is never
-   downgraded. A runner with a job is done on a later run. Each listener gate sees its hook change and
+   downgraded. A runner with a job is watched up to 4 minutes for a gap between jobs; after that the new hook
+   is staged for that job's job-completed to install. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
+   7b. The same refresh runs as every other account this member's runners run as (RUNNER_ACCOUNTS): the staged
+   member manifest's runner.poolUser (an AWS Mac's PR runners, in the non-admin cmux-pr-runner account since
+   glaeda#2460) and each runner.dedicated entry's user. Their receipts and runner directories are in that account's
+   home, which step 7 never reads, so before this their hooks stayed at whatever the last fleet --apply installed
+   (2026-11-25: aws-m4pro-7-glaeda-15 refused cmux-next-ios-kit.yml link-ffi-fleet a day after #2732 went
+   stable, and converge.json said converged). It runs through `sudo -n -u ACCOUNT` from a copy of the release's
+   runner files that account can read; a refusal is a blocked hook in step 8, never silence.
 
-It never runs two at a time (a lock under the state directory), never touches anything but what
+8. Convergence (converge.json beside state.json, glaeda-ota-converge/v1): after every --apply run
+   the host records what it actually runs, not just the tag in state.json: the SHA-256 of each
+   installed tool against the installed release's bytes, and of each owned runner's installed
+   glaeda-cmux-runner-hook and glaeda_reservation.py against the release's, beside the tag the ring
+   wants and why the two differ. A tool whose bytes drifted from the installed release (a partial
+   or hand install) is repaired by running that release's setup again. A run that ends unconverged
+   on the same wanted release backs off (APPLY_EVERY_S doubling to BACKOFF_MAX_S); a new release on
+   the ring is tried at once. Its `live` says how long the installed release took from merge to here:
+   `merged` (the release's commit time on main), `installedAt`, `hooksLiveAt` (when the last runner's hook took
+   the release's bytes) and the spans in seconds. glaeda-mini-health reads converge.json and reports `ota_not_converging`
+   (running X, wants Y, because Z) only when a host stays unconverged past its grace, as an error
+   when the reason is one this updater cannot clear by retrying (`blocking`), and `ota_stale` when
+   no run has finished for hours.
+
+    Read-only stable plans also include the canary's public tag/source/publication metadata and a
+    bounded source-drift classification. A transient canary fetch failure never blocks the stable
+    plan. Status reports the installed generation's source from local state without contacting the
+    channel.
+
+    It never runs two at a time (a lock under the state directory), never touches anything but what
 setup installs (and the runner copy and hooks in steps 6 and 7), and keeps the current and previous
 release under ~/.local/state/glaeda/update.
 """
 from __future__ import annotations
 
 import argparse
+import calendar
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import platform
+import plistlib
+import pwd
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -93,8 +147,11 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
-TOOLS = ("glaeda-disk", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
-         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
+TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
+         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh",
+         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
+# what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "cmux-gh", "cmux-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -106,18 +163,85 @@ HOME = Path.home()
 CONFIG = HOME / ".config/glaeda/update.json"
 STATE_DIR = HOME / ".local/state/glaeda/update"
 BIN = HOME / ".local/bin"
+GH_POLICY = "config/gh-daemon.json"  # in the release tree; setup installs it beside BIN, in ../share/glaeda
 # The runner copy glaeda-cmux-runner-fleet stages (its STAGED and REMOTE_DIR), refreshed in step 6.
 RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
-RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+# glaeda-nightly-only-admit: the admit command of the nightly-only and trusted runner.dedicated entries (run from this
+# copy, fresh per job), so a merged fix to it reaches the minis by OTA with the runner files, never a fleet --apply.
+RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
+                "glaeda-nightly-only-admit", "glaeda-promotion-admit", "glaeda-capture-admit",
+                "glaeda-job-needs.json",  # the hook reads its measured job needs from this copy (CAPACITY_ARITHMETIC)
+                "glaeda-runner-job-disk.json")  # and one runner job's measured disk (RUNNER_JOBS_DISK)
 SOURCE_STAMP = ".glaeda-source.json"
 STAMP_BY = "glaeda-update"
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors
 HOOKS_TIMEOUT = 1800  # the refresh checks the new hook against each runner's wrappers, a few seconds each
 CHILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# Step 8. converge.json is what this host actually runs against what its ring wants; glaeda-mini-health
+# reads it (2026-10-20: a mini's runners showed an 80/70 CPU gate a day after the 85/80 hook shipped,
+# and nothing on the host could say which hook bytes it ran without an ssh).
+CONVERGE = STATE_DIR / "converge.json"
+CONVERGE_SCHEMA = "glaeda-ota-converge/v1"
+APPLY_EVERY_S = 600  # a full run at least this often, and the first retry's wait
+# The agent's StartInterval (glaeda-mini-setup) and the systemd timer's period. A run within APPLY_EVERY_S of the last
+# full run only probes the channel (channel_fingerprint: two anonymous HEADs) and does the full run when it changed, so
+# a host sees a new release (or a pause) within about a minute instead of 10-13 (Leo, 2026-11-17).
+PROBE_EVERY_S = 60
+PROBE_TIMEOUT = 15
+PROBE = STATE_DIR / "probe.json"
+BACKOFF_MAX_S = 3600  # an unconverged host still retries at least hourly, as the agent used to run
+LABEL = "com.teamleaderleo.glaeda.update"  # this agent (glaeda-mini-setup LABEL_PREFIX + "update")
+LAUNCHCTL = "/bin/launchctl"
+# converge.json carries the times glaeda-mini-health alerts at, so the reader holds no thresholds of its own:
+# unconverged past two backed-off retries, or no finished run for three.
+ALERT_AFTER_S = 2 * BACKOFF_MAX_S
+STALE_AFTER_S = 3 * BACKOFF_MAX_S
+HOOK_RELEASE_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")  # what --refresh-hooks installs
+# Step 7b. The member manifest glaeda-cmux-runner-fleet stages beside RUNNER_SCRIPTS (trimmed to this member) names the
+# other accounts runners run as here (glaeda_fleet_labels POOL_USER, DEDICATED_USER); this updater refreshes theirs too.
+RUNNER_MANIFEST = "glaeda-runner/mini-fleet.json"  # under home
+ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")  # glaeda_fleet_labels DEDICATED_USER_RE
+SUDO = "/usr/bin/sudo"
+ACCOUNT_TMP = "/tmp"
+# Step 6b. HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh. glaeda-cmux-runner-fleet
+# --apply installs it on every member it stages (PROMOTION_ADMIT); OTA brings it to the release's bytes on the same
+# hosts (those with RUNNER_SCRIPTS), so a merged fix reaches the minis without a fleet --apply (2026-11-01: #1780 and
+# #1794 were merged, and all 12 promotion-eligible minis had no helper at all).
+PROMOTION_ADMIT = "glaeda-promotion-admit"
+PROMOTION_ROOT = ".local/state/glaeda/promotion"  # under home: the helper's promotion_root()
+# Results that retrying the same release cannot change: the host needs a new release or an operator.
+BLOCKING_RESULTS = ("quarantined", "refused", "rolled-back")
+# Hook refresh states that wait for an operator (--apply), not for a job to finish.
+BLOCKING_HOOK_STATES = ("blocked", "kept", "skipped")
+
+
+# gh retries (2026-10-19): the fleet's shared REST quota ran out, air-blue's canary check and status POST
+# failed with it, the next try was an hour away, and stable sat on one build for 15 hours.
+GH_BACKOFF = (20, 60, 180)  # seconds slept before each retry of a rate-limited or transient gh call
+RATE_WAIT_MAX = 5 * 60  # a spent quota that resets this soon is waited for; a later reset gives up
+# A failure is waited out to the reset (at most an hour): unposted, another canary's success would
+# promote the release after the 15-minute soak, before the next run could post it.
+FAILURE_WAIT_MAX = 60 * 60
+# Our own gh is the broker chain (the gh-quota shim, the local-build guard, glaeda's broker), and the shim refuses a
+# call in its own words when a shared pool is under its low-water floor. That refusal is a spent quota, not a verdict:
+# read as one, `gh attestation verify`'s non-zero exit looked like a failed verification, so a canary quarantined a
+# good release for good and posted a canary failure that holds stable for the whole fleet (a canary host, 2026-11-07,
+# r-20261107-ac67c27f2d27: "refused: build-provenance attestation did not verify: gh-quota: refused").
+RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit", "http 429",
+                "gh-quota: refused")
+BROKER_MARKER = "gh-quota: "  # any word from the shim, whatever it adds later: it answered, GitHub did not
+TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
+                     "network", "temporarily unavailable", "eof")
+MAX_UNREPORTED = 5
+HEALTH_TIMEOUTS = 5  # consecutive timed-out health checks of one tag that fail it: t0, +10, +30, +70, +130 min with backoff
 
 
 class UpdateError(RuntimeError):
     pass
+
+
+class UpdateInconclusive(UpdateError):
+    """A transient or host-observability condition that must not quarantine a release."""
 
 
 def local_target() -> str:
@@ -175,6 +299,20 @@ def load_state(state_dir: Path = STATE_DIR) -> dict:
                   for k in ("current", "previous")))
     if not ok:
         raise UpdateError("state.json has the wrong shape; fix or remove it")
+    owed = doc.get("unreported")
+    if owed is not None and not (isinstance(owed, list) and all(
+            isinstance(o, dict) and isinstance(o.get("tag"), str) and TAG_RE.fullmatch(o["tag"])
+            and isinstance(o.get("source"), str) and SHA_RE.fullmatch(o["source"])
+            and isinstance(o.get("ok"), bool) and isinstance(o.get("detail"), str) for o in owed)):
+        doc.pop("unreported")  # only a report owed to GitHub: never worth refusing to update over
+    timeouts = doc.get("healthTimeouts")
+    if timeouts is not None and not (isinstance(timeouts, dict) and isinstance(timeouts.get("tag"), str)
+                                     and type(timeouts.get("n")) is int):
+        doc.pop("healthTimeouts")  # only a count of slow checks: restart it rather than refuse to update
+    installed = doc.get("installed")
+    if installed is not None and not (isinstance(installed, dict) and isinstance(installed.get("tag"), str)
+                                      and isinstance(installed.get("at"), str)):
+        doc.pop("installed")  # only when the current release went in: never worth refusing to update over
     return doc
 
 
@@ -204,15 +342,115 @@ def resolve(control_raw: bytes, ring_raw: bytes | None, ring: str) -> dict | Non
     return entry
 
 
+def channel_sources(source: str) -> tuple[str, ...]:
+    """Where the channel files are read, in order. This repository first: it is their one writer, so a mirror host
+    sees a promotion (or a pause) at once instead of after the mirror's next 15-minute copy; the mirror when this
+    repository cannot be read, so the fleet still does not depend on it."""
+    return (REPOSITORY,) if source == REPOSITORY else (REPOSITORY, source)
+
+
+def asset_sources(source: str) -> tuple[str, ...]:
+    """Where a release's files are downloaded, in order: the host's source, then this repository for a release the
+    mirror has not copied yet. Both serve the same bytes, and each is checked against the channel's digest."""
+    return (source,) if source == REPOSITORY else (source, REPOSITORY)
+
+
 def fetch_channel(ring: str, source: str = REPOSITORY) -> tuple[bytes, bytes | None]:
-    control = fetch(release_url("ota-channels", "control.json", source), MAX_META)
+    error: Exception | None = None
+    for repo in channel_sources(source):
+        try:
+            control = fetch(release_url("ota-channels", "control.json", repo), MAX_META)
+            try:
+                ring_raw = fetch(release_url("ota-channels", f"{ring}.json", repo), MAX_META)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                ring_raw = None  # stable before the first promotion
+            return control, ring_raw
+        except (urllib.error.URLError, TimeoutError) as e:
+            error = e
+    assert error is not None
+    raise error
+
+
+def fetch_release_file(tag: str, name: str, limit: int, source: str = REPOSITORY) -> bytes:
+    error: Exception | None = None
+    for repo in asset_sources(source):
+        try:
+            return fetch(release_url(tag, name, repo), limit)
+        except (urllib.error.URLError, TimeoutError) as e:
+            error = e
+    assert error is not None
+    raise error
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return None  # the probe reads the redirect itself
+
+
+def channel_fingerprint(ring: str, source: str = REPOSITORY) -> dict | None:
+    """What control.json and <ring>.json are now, without downloading them: one anonymous HEAD each at the first
+    channel source, never the GitHub API. github.com answers a release download with a redirect to the asset's
+    storage path, and every upload (`gh release upload --clobber`) is a new asset with a new path; an ETag stands
+    in where there is no redirect. None when it cannot tell (offline, an unexpected answer): the caller then waits
+    for its next full run."""
+    repo = channel_sources(source)[0]
+    opener = urllib.request.build_opener(_NoRedirect)
+    out: dict = {"repo": repo}
+    for name in ("control.json", f"{ring}.json"):
+        request = urllib.request.Request(release_url("ota-channels", name, repo), method="HEAD",
+                                         headers={"User-Agent": "glaeda-update"})
+        try:
+            with opener.open(request, timeout=PROBE_TIMEOUT) as response:
+                code, headers = response.status, response.headers
+        except urllib.error.HTTPError as e:
+            code, headers = e.code, e.headers
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+        location = headers.get("Location") if headers is not None else None
+        if code in (301, 302, 303, 307, 308) and location:
+            out[name] = location.split("?", 1)[0]
+        elif code == 200 and headers is not None and headers.get("ETag"):
+            out[name] = headers["ETag"]
+        elif code == 404:
+            out[name] = "absent"
+        else:
+            return None
+    return out
+
+
+def load_probe(state_dir: Path = STATE_DIR) -> dict:
     try:
-        ring_raw = fetch(release_url("ota-channels", f"{ring}.json", source), MAX_META)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        ring_raw = None  # stable before the first promotion
-    return control, ring_raw
+        doc = json.loads((state_dir / PROBE.name).read_text())
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def save_probe(doc: dict, state_dir: Path = STATE_DIR) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    tmp = state_dir / f"{PROBE.name}.{os.getpid()}"
+    tmp.write_text(json.dumps(doc, sort_keys=True) + "\n")
+    os.replace(tmp, state_dir / PROBE.name)
+
+
+def probe_gate(config: dict, now: float, state_dir: Path = STATE_DIR) -> tuple[bool, dict | None, str]:
+    """(do a full run now, the fingerprint seen, why). A full run is due APPLY_EVERY_S after the last one, as the
+    agent used to run; between them, only when the channel files changed since the last full run. A probe that
+    cannot tell starts nothing, so an outage never turns the minute probe into a full run every minute, and the
+    backoff and quarantine of a full run apply as before."""
+    doc = load_probe(state_dir)
+    seen = channel_fingerprint(config["ring"], config.get("source", REPOSITORY))
+    last = doc.get("fullRunAt")
+    if not isinstance(last, (int, float)) or not 0 <= now - last < APPLY_EVERY_S:
+        return True, seen, "due"
+    if seen is not None and seen != doc.get("channel"):
+        return True, seen, "channel changed"
+    soak = doc.get("soakEndsAt")
+    if isinstance(soak, (int, float)) and not isinstance(soak, bool) and now >= soak:
+        return True, seen, "soak ended"  # this canary's post-soak promote nudge (nudge_pending_at)
+    return False, seen, "unchanged"
 
 
 def check_release(raw: bytes, entry: dict) -> dict:
@@ -266,19 +504,123 @@ def find_gh() -> str | None:
     return None
 
 
-def attestation_ok(path: Path) -> bool | None:
-    """True/False from `gh attestation verify` pinned to release.yml on main; None when it cannot be
-    asked (no gh, or gh not signed in)."""
+def rate_limit_reset(gh: str) -> float | None:
+    """When the core REST quota refills (epoch seconds) if it is spent now, else None. GET /rate_limit
+    costs no quota, so asking first spends nothing on a call that would only fail."""
+    try:
+        result = subprocess.run([gh, "api", "rate_limit", "--jq", ".resources.core | [.remaining, .reset] | @tsv"],
+                                capture_output=True, text=True, timeout=30)
+        remaining, reset = result.stdout.split()
+        return float(reset) if result.returncode == 0 and int(remaining) == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def gh_kind(text: str) -> str | None:
+    """"rate-limited" or "transient" for an error worth retrying, else None."""
+    low = text.lower()
+    if any(marker in low for marker in RATE_MARKERS):
+        return "rate-limited"
+    if any(marker in low for marker in TRANSIENT_MARKERS):
+        return "transient"
+    return None
+
+
+# GitHub quotes the token's numeric account id in its own quota refusal ("API rate limit already exceeded for user
+# ID NNNN") and gh passes that sentence on. The id is personal data, and this updater's status lines are pasted into
+# PR bodies, ledger rows and handoff issues by the agents that read them, so it must not carry one -- the same defect
+# glaeda-gh's gh_said fixed (glaeda#2582). This file runs with no sibling imports on purpose: it replaces glaeda-gh
+# and must keep working while that file is half-written, so it cannot import gh_said and says the substitution again
+# here. test-glaeda-update pins this function's answer to glaeda-gh's own for the measured refusal, so the two cannot
+# drift apart. No login is readable here without an API call, so the holder is named the way glaeda-gh names it when
+# its host has no login to read. What the refusal says -- which limit, and any reset it names -- is kept word for word.
+GH_USER_ID = re.compile(r"\b(users?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_INSTALL_ID = re.compile(r"\b(installations?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_CALLER_IP = re.compile(r"\bfor (?:IP\s+)?(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]*::[0-9a-f:]*[0-9a-f])\b", re.I)
+GH_NO_HOLDER = "(this host's gh login)"  # glaeda-gh's own phrase for a host with no login to name
+
+
+def gh_said(text: str) -> str:
+    """TEXT with GitHub's personal identifiers replaced by the holder they stand for (GH_USER_ID's comment).
+
+    Idempotent, so text with no identifier in it comes back byte for byte and gh's words stay gh's own."""
+    out = GH_USER_ID.sub(rf"\1 {GH_NO_HOLDER}", str(text or ""))
+    out = GH_INSTALL_ID.sub(r"\1 (an App of this repository's owner)", out)
+    return GH_CALLER_IP.sub("for an unauthenticated caller", out)
+
+
+def gh_output(result: "subprocess.CompletedProcess[str]") -> str:
+    """Both of gh's streams, with GitHub's account id out of them (gh_said). gh writes its own errors to stderr,
+    but the quota shim in front of it may answer on either, and one stream holding a warning must not hide the
+    other's refusal."""
+    return gh_said("\n".join(part for part in (result.stderr, result.stdout) if part).strip())
+
+
+def gh_call(gh: str, args: list[str], timeout: int,
+            max_wait: float = RATE_WAIT_MAX) -> tuple[subprocess.CompletedProcess | None, str]:
+    """Run gh, riding out a spent quota or a transient error: (result, "") when it ran to a verdict,
+    else (None, why), where why starts with "rate-limited" or "transient". A real error (exit 1 with
+    any other message) is returned as is, never retried."""
+    why = ""
+    for attempt in range(len(GH_BACKOFF) + 1):
+        if attempt:
+            time.sleep(GH_BACKOFF[attempt - 1])
+        reset = rate_limit_reset(gh)
+        if reset is not None:
+            wait = reset - time.time()
+            if wait > max_wait:
+                return None, "rate-limited until " + time.strftime("%H:%MZ", time.gmtime(reset))
+            if wait > 0:
+                time.sleep(wait + 5)
+        try:
+            result = subprocess.run([gh, *args], capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            why = f"transient: {type(e).__name__}"
+            continue
+        except OSError as e:
+            return None, f"transient: {type(e).__name__}: {e}"
+        message = gh_output(result)
+        kind = gh_kind(message) if result.returncode != 0 else None
+        if kind is None:
+            return result, ""
+        why = f"{kind}: {message}"[:200]
+    return None, why
+
+
+def attestation(path: Path) -> tuple[bool | None, str]:
+    """(True/False, why) from `gh attestation verify` pinned to release.yml on main; (None, why) when
+    it cannot be asked: no gh, gh not signed in, or GitHub unreachable or out of quota."""
     gh = find_gh()
     if not gh:
-        return None
-    signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
-    if signed_in.returncode != 0:
-        return None
-    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
-                             "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
-                            capture_output=True, text=True, timeout=120)
-    return result.returncode == 0
+        return None, "no gh on this host"
+    # a local check: `gh auth status` calls the API, so a spent quota made it say "not signed in"
+    try:
+        # gh-auth-token-lint: allow presence-only: never read the credential or use it for API calls.
+        token = subprocess.run([gh, "auth", "token"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"gh not signed in ({type(e).__name__})"
+    if token.returncode != 0:
+        return None, f"gh not signed in: {gh_said(token.stderr.strip())}"[:200]
+    result, why = gh_call(gh, ["attestation", "verify", str(path), "--repo", REPOSITORY,
+                               "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"], 120)
+    if result is None:
+        return None, why
+    full = gh_output(result).lower()  # classify the whole output; only the diagnostic below is truncated
+    message = gh_output(result)[:200]
+    if result.returncode == 0:
+        return True, "verified"  # gh ran and verified it: only its own zero exit says that
+    if BROKER_MARKER in full:
+        # our own shim refused or answered instead of GitHub (a spent pool, a guard): nothing was verified either
+        # way, and a refusal must never read as a failed verification
+        return None, f"gh did not reach GitHub: {message}"
+    if any(marker in full for marker in ("http 401", "http 403", "permission denied")):
+        return None, f"gh cannot read attestations: {message}"
+    if 'unknown command "attestation"' in full or full.startswith("unknown flag"):
+        # an older gh (Ubuntu 24.04's apt gh is 2.45, before `gh attestation`; or one before a flag above): it
+        # cannot ask, which is not a failed verification. gh says so while parsing argv, before reading the archive.
+        return None, f"gh is too old to verify attestations: {message.splitlines()[0]}"
+    return False, message
 
 
 def generation(state_dir: Path, tag: str) -> Path:
@@ -290,22 +632,151 @@ def setup_command(gen: Path, args: list[str]) -> list[str]:
             "--reclaim-binary", str(gen / "bin/glaeda-worktree-reclaim")]
 
 
-def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
+def run_setup(gen: Path, args: list[str], bin_dir: Path | None = None) -> tuple[bool, str]:
+    """GEN's setup. With BIN_DIR, a tool fast-patch put live from a main commit GEN does not include (fast_patched)
+    keeps those bytes: setup installs every tool, so a repair for any other tool's drift, or a release cut before
+    that commit, put the older glaeda-gh back and the daemon re-exec'd onto it (a lane VM, 2026-11-25: three
+    flips to the ring's release in 11 min, each undone by fast-patch a second later, every one a restart of the
+    daemon's land work). The newest bytes win; once a release includes the commit, setup's are as new."""
+    kept = fast_patch_kept(gen, bin_dir) if bin_dir is not None else {}
     try:
         result = subprocess.run(setup_command(gen, args), capture_output=True, text=True,
                                 timeout=SETUP_TIMEOUT, stdin=subprocess.DEVNULL,
                                 env={**os.environ, "GLAEDA_UPDATE_RUNNING": "1"})
     except (OSError, subprocess.TimeoutExpired) as e:
+        put_back(kept)
         return False, str(e)
-    return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
+    put_back(kept)
+    return result.returncode == 0, gh_said((result.stdout + result.stderr)[-2000:])
 
 
-def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
+def fast_patch_kept(gen: Path, bin_dir: Path) -> dict[Path, bytes]:
+    """{path: bytes} of each tool in BIN_DIR that is fast-patch's install of a commit GEN does not include."""
+    try:
+        doc = json.loads(FAST_PATCH_LIVE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    kept: dict[Path, bytes] = {}
+    for name in tools if isinstance(tools, dict) else {}:
+        path = bin_dir / str(name)
+        if "/" in str(name) or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if fast_patched(gen, str(name), sha256(data)):
+            kept[path] = data
+    return kept
+
+
+def put_back(kept: dict[Path, bytes]) -> None:
+    """Each kept tool's bytes, where setup replaced them: one atomic rename, executable as setup leaves it."""
+    for path, data in kept.items():
+        if file_sha256(path) == sha256(data):
+            continue
+        tmp = path.with_name(f".{path.name}.fast-patch")
+        try:
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
+def gh_only(config: dict) -> bool:
+    """This host runs setup's --gh-only profile."""
+    return "--gh-only" in config["setupArgs"]
+
+
+# The runner gate (glaeda-cmux-runner-hook, glaeda#2018) holds a mini whose performance cores run nothing until a
+# drained reboot, through PCORE_STALL_FILE in its state dir (FLEET_DIR/ci), kept for one boot. A host that cannot
+# start Python's --help in 120 s is the same stall seen from here, and the gate it runs may be too old to see it:
+# cmux8s-mac-mini, 2026-11-15 22:25Z on, refused every update on `glaeda-disk --help` at load 180-250 (CPU 71% idle,
+# the P-cores running nothing), so the hold that would have drained it never installed; nothing said so for 6 h.
+# Only on a runner mini (FLEET_DIR exists). The gate keeps this hold until the boot changes or 12 h pass; this
+# updater drops it once its own checks run in time again.
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+PCORE_STALL_FILE = "pcore-stall.json"
+PCORE_STALL_MAX_HOLD_S = 12 * 3600  # as the gate's
+STALL_SOURCE = "glaeda-update"
+
+
+def boot_epoch() -> int | None:
+    """The host's boot time (kern.boottime's seconds), or None when unreadable."""
+    try:
+        out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r"sec = (\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def stall_hold() -> Path:
+    return FLEET_DIR / "ci" / PCORE_STALL_FILE
+
+
+def note_stall(what: str) -> bool:
+    """Write the runner gate's stall hold for a check (what) that took over 120 s; True when written. A hold already
+    in force for this boot (the gate's or an earlier run's) is kept, with its start. Never raises."""
+    if not FLEET_DIR.is_dir():
+        return False
+    boot = boot_epoch()
+    if boot is None:
+        return False
+    path = stall_hold()
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if (isinstance(doc, dict) and doc.get("boot") == boot
+                and time.time() - float(doc.get("since") or 0) < PCORE_STALL_MAX_HOLD_S):
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    host = platform.node().split(".")[0]
+    held = {"boot": boot, "since": time.time(), "source": STALL_SOURCE,
+            "why": f"glaeda-update: {what} took over 120 s, so this mini cannot start Python in time (stalled like idle "
+                   f"performance cores): it needs a drained reboot (leo-workspace tools/mini_reboot.py --apply "
+                   f"--min-held-gib 0 {host})"}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(held), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def clear_stall() -> None:
+    """Drop the hold this updater wrote (its checks ran in time again); the gate's own hold is the gate's."""
+    path = stall_hold()
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and doc.get("source") == STALL_SOURCE:
+            path.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
-    run already fetched, so a network blip cannot fail (and quarantine) a good release."""
-    checks = [
-        [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
+    run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
+    host installs only glaeda-gh, glaeda-update and glaeda-disk, so only those are checked there. (None, why) when a
+    check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
+    at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
+    # cmux-disk is glaeda-disk's primary name (Leo, 2026-11-25): checking it runs both the shim and the program, and
+    # keeps this check off glaeda-disk's old-name use counter. A setup that installed no cmux-disk checks the old name.
+    disk = bin_dir / "cmux-disk" if (bin_dir / "cmux-disk").is_file() else bin_dir / "glaeda-disk"
+    hygiene = [[sys.executable, str(disk), "--help"]] if gh_only else [
+        [sys.executable, str(disk), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+    ]
+    checks = hygiene + [
         [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
@@ -313,7 +784,10 @@ def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
         name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
         try:
             result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except subprocess.TimeoutExpired as e:
+            note_stall(f"{name} --help" if "--help" in argv else name)
+            return None, f"{name}: {e}"
+        except OSError as e:
             return False, f"{name}: {e}"
         if result.returncode != 0:
             return False, f"{name} exited {result.returncode}"
@@ -324,6 +798,7 @@ def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
                 return False, "glaeda-update printed no plan"
             if planned not in ("plan", "current", "idle", "quarantined"):
                 return False, f"glaeda-update planned {planned}"
+    clear_stall()
     return True, "tools run"
 
 
@@ -344,6 +819,12 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     root = state_dir / "pre-ota"
     if not root.is_dir():
         return False
+    saved = {path.name for path in root.iterdir() if path.is_file()}
+    for name in TOOLS:
+        if name not in saved:
+            current = bin_dir / name
+            if current.exists() or current.is_symlink():
+                current.unlink()
     for path in root.iterdir():
         tmp = bin_dir / f".{path.name}.restore"
         tmp.write_bytes(path.read_bytes())
@@ -352,18 +833,92 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     return True
 
 
-def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
+def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     if config["ring"] != "canary" or not config["reportStatus"]:
         return "not reported (not a reporting canary)"
     gh = find_gh()
     if not gh:
         return "not reported (no gh)"
-    result = subprocess.run(
-        [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
-         "-f", f"state={'success' if ok else 'failure'}", "-f", f"context={STATUS_PREFIX}{config['host']}",
-         "-f", f"description={entry['tag']}: {detail}"[:140]],
-        capture_output=True, text=True, timeout=60)
-    return "reported" if result.returncode == 0 else f"not reported (gh exited {result.returncode})"
+    state = "success" if ok is True else "failure" if ok is False else "pending"
+    # Commit statuses have no GraphQL mutation, so a spent REST quota is ridden out, not routed around.
+    result, why = gh_call(gh, ["api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
+                               "-f", f"state={state}", "-f", f"context={STATUS_PREFIX}{config['host']}",
+                               "-f", f"description={entry['tag']}: {detail}"[:140]], 60,
+                         FAILURE_WAIT_MAX if ok is False else RATE_WAIT_MAX)
+    if result is None:
+        return f"not reported ({why})"
+    if result.returncode != 0:
+        return f"not reported (gh exited {result.returncode}: {gh_said((result.stderr or result.stdout).strip())[:160]})"
+    return "reported"
+
+
+def owe_report(state: dict, config: dict, entry: dict, ok: bool | None, detail: str) -> bool:
+    """Record a success or failure as owed to GitHub before posting it, so a run killed during the
+    retries still leaves it for the next run (redeliver). False when nothing is owed."""
+    if ok is None or config["ring"] != "canary" or not config["reportStatus"]:
+        return False
+    owed = [o for o in state.get("unreported", []) if o["tag"] != entry["tag"]]
+    owed.append({"tag": entry["tag"], "source": entry["source"], "ok": ok, "detail": detail})
+    state["unreported"] = owed[-MAX_UNREPORTED:]
+    return True
+
+
+def paid(state: dict, tag: str) -> None:
+    owed = [o for o in state.get("unreported", []) if o["tag"] != tag]
+    if owed:
+        state["unreported"] = owed
+    else:
+        state.pop("unreported", None)
+
+
+def redeliver(state: dict, config: dict) -> dict[str, str]:
+    """Post the reports earlier runs could not, oldest first. The first that still fails stops it,
+    keeping it and the rest: GitHub is still out, and each try can take minutes of backoff."""
+    statuses = {}
+    for item in list(state.get("unreported") or []):
+        status = report(config, item, item["ok"], item["detail"])
+        statuses[item["tag"]] = status
+        if status == "reported" or config["ring"] != "canary" or not config["reportStatus"]:
+            paid(state, item["tag"])
+        else:
+            break
+    return statuses
+
+
+def nudge_due(result: dict, entry: dict | None, nudged: str | None, now: float) -> bool:
+    """Dispatch promote.yml after an install, and once more per release when its soak has passed (`nudged`
+    names the release that post-soak nudge was sent for; the install's nudge, mid-soak, never sets it). Runs every
+    ten minutes would otherwise spend one call of the shared API quota each just to say "still current"."""
+    if result.get("result") == "updated":
+        return True
+    if result.get("result") != "current" or entry is None or nudged == entry.get("tag"):
+        return False
+    end = soak_ends_at(entry)
+    return end is not None and now >= end
+
+
+def soak_ends_at(entry: dict) -> float | None:
+    """When the release's signed soak floor passes (its publication plus policy soakHours), or None if unreadable."""
+    try:
+        soak = float((entry.get("policy") or {}).get("soakHours") or 0)
+        return parse_utc(str(entry.get("published"))) + soak * 3600
+    except (TypeError, ValueError):
+        return None
+
+
+def nudge_pending_at(config: dict, result: dict, entry: dict | None, nudged: str | None, now: float) -> float | None:
+    """When this reporting canary's post-soak nudge falls due, if that is still ahead. main keeps it in probe.json and
+    the minute probe starts a full run then (probe_gate "soak ended"), so promote.yml is asked within a minute of the
+    soak's end. Waiting for the next APPLY_EVERY_S run instead held stable up to ten more minutes on every release
+    the second canary reported late on. air-blue and cosmic-gray are the only canaries, so the quorum of two needs
+    both; cosmic-gray reported 16-34 min after publication or stayed pending on 5 of 8 releases (2026-11-24), and
+    each of those waited the 900 s soak plus up to 600 s for a canary's next full run (docs/GLAEDA_OTA.md step 5)."""
+    if config.get("ring") != "canary" or not config.get("reportStatus"):
+        return None
+    if result.get("result") not in ("updated", "current") or entry is None or nudged == entry.get("tag"):
+        return None
+    end = soak_ends_at(entry)
+    return end if end is not None and end > now else None
 
 
 def nudge_promotion(config: dict) -> str:
@@ -396,22 +951,24 @@ def download(state_dir: Path, entry: dict, target: str, ring: str, source: str =
     gen = generation(state_dir, entry["tag"])
     if (gen / ".complete").is_file():
         return gen
-    release_raw = fetch(release_url(entry["tag"], "release.json", source), MAX_META)
+    release_raw = fetch_release_file(entry["tag"], "release.json", MAX_META, source)
     release = check_release(release_raw, entry)
     name = f"glaeda-hygiene-{target}.tar.gz"
     meta = release.get("assets", {}).get(name)
-    raw = fetch(release_url(entry["tag"], name, source), MAX_ASSET)
+    raw = fetch_release_file(entry["tag"], name, MAX_ASSET, source)
     check_asset(raw, meta)
     partial = gen.with_name(gen.name + ".partial")
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(parents=True, mode=0o700)
     archive = partial / name
     archive.write_bytes(raw)
-    attested = attestation_ok(archive)
-    if attested is False or (attested is None and ring == "canary"):
+    attested, why = attestation(archive)
+    if attested is False:
         shutil.rmtree(partial, ignore_errors=True)
-        raise UpdateError("build-provenance attestation did not verify" if attested is False else
-                          "a canary must verify the attestation: install gh and sign in")
+        raise UpdateError(f"build-provenance attestation did not verify: {why}")
+    if attested is None and ring == "canary":
+        shutil.rmtree(partial, ignore_errors=True)
+        raise UpdateInconclusive(f"a canary must verify the attestation: {why}")
     safe_extract(archive, partial)
     archive.unlink()
     (partial / "release.json").write_bytes(release_raw)
@@ -446,6 +1003,51 @@ def release_source(gen: Path) -> str:
     if not isinstance(value, str) or not SHA_RE.fullmatch(value):
         raise UpdateError(f"{gen.name} has an invalid release source")
     return value
+
+
+def installed_source(state_dir: Path, tag: str | None) -> str | None:
+    """Return the installed generation's source for read-only diagnostics.
+
+    A status or plan must remain useful while an older/partial generation is being
+    repaired.  Treat a missing or malformed generation as unknown instead of
+    turning an informational drift check into an update failure.
+    """
+    if tag is None:
+        return None
+    try:
+        return release_source(generation(state_dir, tag))
+    except (OSError, UpdateError):
+        return None
+
+
+def channel_summary(entry: dict | None) -> dict | None:
+    """Keep channel drift evidence bounded to public release metadata."""
+    if entry is None:
+        return None
+    return {key: entry[key] for key in ("tag", "source", "published", "promoted") if key in entry}
+
+
+def source_drift(current: str | None, target: dict | None, candidate: dict | None) -> str:
+    """Classify source drift without claiming ancestry that was not observed.
+
+    Channel entries carry release publication times but not the target's ancestry.
+    We therefore report a difference (and its observed age ordering) rather than
+    pretending that a different commit is necessarily an ancestor/descendant.
+    """
+    if current is None:
+        return "unknown"
+    if candidate is not None and candidate.get("source") != current:
+        candidate_published = str(candidate.get("published") or "")
+        target_published = str((target or {}).get("published") or "")
+        if candidate_published and target_published:
+            if candidate_published > target_published:
+                return "candidate_newer"
+            if candidate_published < target_published:
+                return "candidate_older"
+        return "candidate_differs"
+    if target is not None and target.get("source") != current:
+        return "target_differs"
+    return "current"
 
 
 def release_order(state_dir: Path, current: str | None, target: Path) -> str:
@@ -483,6 +1085,8 @@ def setup_args_supported(gen: Path, args: list[str]) -> tuple[bool, str]:
         result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True,
                                 timeout=120, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
+        if isinstance(e, subprocess.TimeoutExpired):
+            note_stall("glaeda-mini-setup --help")
         return False, f"setup compatibility probe failed: {e}"
     if result.returncode != 0:
         return False, f"setup compatibility probe exited {result.returncode}"
@@ -528,8 +1132,9 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     return f"refreshed to {tag}"
 
 
-def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
-    """Step 7: the runners' installed hook files, from the installed release by its own glaeda-cmux-runner."""
+def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail: list | None = None) -> str:
+    """Step 7: the runners' installed hook files, from the installed release by its own glaeda-cmux-runner.
+    With `detail`, each runner's {runnerDir, state, note} is appended to it (step 8 names the blocked ones)."""
     tag = load_state(state_dir)["current"]
     if tag is None:
         return "no installed release"
@@ -550,38 +1155,565 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
     counts: dict[str, int] = {}
     for runner in runners:
         counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+        if detail is not None and isinstance(runner, dict):
+            detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
+                           "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200]})
+    # the runner's sign hold (glaeda-cmux-runner SIGN_HOLD): a deferral, or an install at its cap
+    held = [str(line)[:400] for line in doc.get("signHold") or [] if isinstance(line, str)][:8] \
+        if isinstance(doc.get("signHold"), list) else []
+    if detail is not None:
+        detail.extend({"signHold": line} for line in held)
     if doc.get("error"):
         return f"not refreshed ({str(doc['error'])[:300]})"
     if not counts:
         return "no runners"
     notes = sorted({str(r.get("note"))[:160] for r in runners if r.get("state") in ("blocked", "kept", "skipped") and r.get("note")})
     return f"{tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
-        ("" if not notes else " (" + "; ".join(notes)[:400] + ")")
+        ("" if not notes else " (" + "; ".join(notes)[:400] + ")") + \
+        ("" if not held else "; sign hold: " + " | ".join(held)[:800])
 
 
-def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME) -> dict:
-    """Steps 6 and 7, after a run that installed a release or found it current. Neither fails the update."""
+def runner_accounts(home: Path = HOME) -> list[str]:
+    """Step 7b: the other macOS accounts this member's runners run as, from the staged member manifest: each host's
+    runner.poolUser and the user of each runner.dedicated entry (overrides, then defaults). Never root, never this
+    user; an unreadable manifest names none."""
+    try:
+        manifest = json.loads((home / RUNNER_MANIFEST).read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(manifest, dict):
+        return []
+    runners = []
+    defaults = manifest.get("defaults")
+    if isinstance(defaults, dict) and isinstance(defaults.get("runner"), dict):
+        runners.append(defaults["runner"])
+    for host in (manifest.get("hosts") or {}).values() if isinstance(manifest.get("hosts"), dict) else []:
+        overrides = host.get("overrides") if isinstance(host, dict) else None
+        if isinstance(overrides, dict) and isinstance(overrides.get("runner"), dict):
+            runners.append(overrides["runner"])
+    names = []
+    for runner in runners:
+        names.append(runner.get("poolUser"))
+        dedicated = runner.get("dedicated")
+        names += [entry.get("user") for entry in dedicated if isinstance(entry, dict)] if isinstance(dedicated, list) else []
+    try:
+        me = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        me = None
+    out = []
+    for name in names:
+        if isinstance(name, str) and ACCOUNT_RE.fullmatch(name) and name not in ("root", me) and name not in out:
+            out.append(name)
+    return out
+
+
+def refresh_account_hooks(user: str, state_dir: Path = STATE_DIR, detail: list | None = None) -> str:
+    """Step 7b for one account: the installed release's glaeda-cmux-runner --refresh-hooks --apply, run as `user`
+    (sudo -n) from a copy of the release's runner files and hook-history.json that account can read. Rows go to
+    `detail` with "account", so step 8 counts that account's runners; one that cannot be reached is a blocked row."""
+    tag = load_state(state_dir)["current"]
+    if tag is None:
+        return "no installed release"
+    gen = generation(state_dir, tag)
+    src = gen / "glaeda/scripts"
+    if not (src / "glaeda-cmux-runner").is_file():
+        return f"{tag} has no runner script"
+    where = f"~{user}"
+
+    def blocked(note: str) -> str:
+        if detail is not None:
+            detail.append({"runnerDir": where, "account": user, "state": "blocked", "note": note[:200]})
+        return f"not refreshed ({note})"[:300]
+
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return blocked(f"no account {user} on this host")
+    # /tmp, never $TMPDIR: a macOS user's /var/folders/.../T is 0700, so the account could not reach the copy
+    with tempfile.TemporaryDirectory(prefix="glaeda-update-hooks-", dir=ACCOUNT_TMP) as tmp:
+        # the release lives under this user's home, which the account cannot read: a world-readable copy keeps the
+        # layout glaeda-cmux-runner reads its HOOK_HISTORY by (two levels above its scripts)
+        root = Path(tmp)
+        scripts = root / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        for name in RUNNER_FILES:
+            if (src / name).is_file():
+                shutil.copyfile(src / name, scripts / name)
+                (scripts / name).chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        if (gen / "hook-history.json").is_file():
+            shutil.copyfile(gen / "hook-history.json", root / "hook-history.json")
+            (root / "hook-history.json").chmod(0o644)
+        for d in (root, root / "glaeda", scripts):
+            d.chmod(0o755)
+        argv = [SUDO, "-n", "-u", user, "--", "/usr/bin/env", f"HOME={home}", f"PATH={CHILD_PATH}",
+                sys.executable, os.fspath(scripts / "glaeda-cmux-runner"), "--refresh-hooks", "--apply", "--output", "json"]
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=HOOKS_TIMEOUT, stdin=subprocess.DEVNULL,
+                                    cwd="/")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return blocked(f"as {user}: {type(e).__name__}")
+    try:
+        doc = json.loads(result.stdout.strip().splitlines()[-1])
+        runners = doc["runners"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        why = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+        return blocked(f"as {user}: no refresh report ({why[0][:160]})")
+    counts: dict[str, int] = {}
+    for runner in runners:
+        counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+        if detail is not None and isinstance(runner, dict):
+            detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
+                           "account": user, "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200],
+                           "hookSha256": str(doc.get("hookSha256") or "").removeprefix("sha256:") or None})
+    held = [str(line)[:400] for line in doc.get("signHold") or [] if isinstance(line, str)][:8] \
+        if isinstance(doc.get("signHold"), list) else []
+    if detail is not None:
+        detail.extend({"signHold": line} for line in held)
+    if doc.get("error"):
+        return blocked(f"as {user}: {str(doc['error'])[:200]}")
+    if not counts:
+        return f"{user}: no runners"
+    return f"{user} {tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
+        ("" if not held else "; sign hold: " + " | ".join(held)[:800])
+
+
+def release_history(gen: Path, name: str) -> set[str] | None:
+    """SHA-256s of every version of `name` the release descends from (its hook-history.json), or None."""
+    try:
+        doc = json.loads((gen / "hook-history.json").read_text())
+        return {str(digest) for digest in doc[name]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def promotion_busy(root: Path) -> str | None:
+    """Why the promotion helper must not change now (a lease's supervisor is alive), or None. Holds no lock."""
+    try:
+        leases = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    except FileNotFoundError:
+        return None
+    for lease in leases:
+        try:
+            pid = json.loads((lease / "supervisor.json").read_text()).get("pid")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, AttributeError):
+            return f"lease {lease.name}: unreadable supervisor record"
+        if not isinstance(pid, int) or pid <= 1:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        return f"lease {lease.name}'s supervisor (pid {pid}) is running"
+    return None
+
+
+def refresh_promotion_admit(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, bin_dir: Path = BIN,
+                            home: Path = HOME) -> str:
+    """Step 6b: ~/.local/bin/glaeda-promotion-admit at the installed release's bytes, on a runner mini only (where
+    glaeda-cmux-runner-fleet --apply installs it). Missing: installed. A version the release descends from:
+    replaced. Any other bytes (a newer copy a fleet --apply put there): kept. Never while a promotion request or
+    lease runs: the helper's admit.lock is held across the check and the swap, and a lease with a live supervisor
+    defers it to a later run, so one lease never mixes two versions. The temp copy and the installed file are
+    each checked against the release's SHA-256; a mismatch installs nothing (or reports the installed file)."""
+    if not target.is_dir():
+        return "absent"
+    tag = load_state(state_dir)["current"]
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return "no installed release"
+    src = gen / "glaeda/scripts" / PROMOTION_ADMIT
+    if not src.is_file():
+        return f"{tag} has no {PROMOTION_ADMIT}"
+    data = src.read_bytes()
+    want = sha256(data)
+    dest = bin_dir / PROMOTION_ADMIT
+    have = file_sha256(dest)
+    if have == want:
+        return "current"
+    if have is not None and have not in (release_history(gen, PROMOTION_ADMIT) or set()):
+        return (f"kept (the installed {PROMOTION_ADMIT} {have[:12]} is not a version {tag} descends from; "
+                "glaeda-cmux-runner-fleet --apply owns it)")
+    root = home / PROMOTION_ROOT
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)  # as the helper makes it
+    fd = os.open(root / "admit.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "deferred (a promotion request holds admit.lock)"
+        busy = promotion_busy(root)
+        if busy:
+            return f"deferred ({busy})"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        tmp = bin_dir / f".{PROMOTION_ADMIT}.glaeda-update"
+        tmp.write_bytes(data)
+        tmp.chmod(0o755)
+        got = file_sha256(tmp)
+        if got != want:
+            tmp.unlink(missing_ok=True)
+            return f"failed (the copy's sha256 {str(got)[:12]} is not {tag}'s {want[:12]}; nothing installed)"
+        os.replace(tmp, dest)
+        got = file_sha256(dest)
+        if got != want:
+            return f"failed (the installed sha256 {str(got)[:12]} is not {tag}'s {want[:12]})"
+    finally:
+        os.close(fd)
+    return f"{'replaced' if have else 'installed'} {tag}'s {want[:12]}"
+
+
+def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME,
+                 detail: list | None = None, bin_dir: Path = BIN) -> dict:
+    """Steps 6, 6b and 7, after a run that installed a release or found it current. None fails the update."""
     out = {}
     for key, step in (("runnerScripts", lambda: refresh_runner_scripts(state_dir, target)),
-                      ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home))):
+                      ("promotionAdmit", lambda: refresh_promotion_admit(state_dir, target, bin_dir, home)),
+                      ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home, detail))):
         try:
             out[key] = step()
         except (OSError, ValueError, UpdateError) as e:
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+    accounts = []
+    for user in runner_accounts(home):  # step 7b
+        try:
+            accounts.append(refresh_account_hooks(user, state_dir, detail))
+        except (OSError, ValueError, UpdateError) as e:
+            accounts.append(f"{user}: not refreshed ({type(e).__name__}: {e})"[:300])
+    if accounts:
+        out["accountHooks"] = "; ".join(accounts)[:1200]
     return out
 
 
+def file_sha256(path: Path) -> str | None:
+    try:
+        return sha256(path.read_bytes()) if path.is_file() else None
+    except OSError:
+        return None
+
+
+# leo-workspace tools/fast-patch puts a commit already on main live ahead of the ring (glaeda-gh re-execs onto it in
+# seconds) and names what it installed here: {"commit": SHA, "tools": {NAME: SHA256}}. Without this, the next full run
+# saw that install as drift and put the ring's older bytes back (a lane VM, 2026-11-23: fast-patch put
+# 4bcb452c live at 03:22:02Z, this updater reinstalled a02f5478 at 03:23:22Z). A tool whose installed bytes are the
+# ones named there is not drift until the installed release includes that commit (its ancestry.txt); then the
+# release is as new or newer and is put back as before.
+FAST_PATCH_LIVE = Path(os.environ.get("GLAEDA_FAST_PATCH_LIVE") or HOME / ".local/state/fast-patch/glaeda/live.json")
+
+
+def fast_patched(gen: Path, name: str, have_sha: str, path: Path | None = None) -> bool:
+    """NAME's installed bytes (HAVE_SHA) are fast-patch's install of a main commit the release GEN does not include."""
+    try:
+        doc = json.loads((path or FAST_PATCH_LIVE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    return (isinstance(tools, dict) and tools.get(name) == have_sha
+            and SHA_RE.fullmatch(str(doc.get("commit"))) is not None and not release_descends_from(gen, doc["commit"]))
+
+
+def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
+    """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
+    in the release is compared: a host profile need not install every tool, and setup owns which. A
+    --gh-only host compares only its own: hygiene tools left from an earlier profile are no longer setup's,
+    and a "repair" that reran setup for them would fail on every run."""
+    checked, drift = 0, []
+    for name in GH_ONLY_TOOLS if gh_only else TOOLS:
+        want = gen / "bin" / name if name == "glaeda-worktree-reclaim" else gen / "glaeda/scripts" / name
+        have = bin_dir / name
+        want_sha, have_sha = file_sha256(want), file_sha256(have)
+        if want_sha is None or have_sha is None:
+            continue
+        checked += 1
+        if want_sha != have_sha and not fast_patched(gen, name, have_sha):
+            drift.append(name)
+    # The fleet's glaeda-gh pacing (every profile installs it). Missing counts as drift too: without it the
+    # daemon falls back to its own default REST share, which the fleet's shares are split to stay under.
+    want_sha = file_sha256(gen / "glaeda" / GH_POLICY)
+    if want_sha is not None:
+        checked += 1
+        if file_sha256(bin_dir.parent / "share/glaeda" / Path(GH_POLICY).name) != want_sha:
+            drift.append(Path(GH_POLICY).name)
+    return checked, drift
+
+
+def runner_hook_dirs(home: Path) -> list[tuple[str, Path | None]]:
+    """(receipt, runner directory or None when the receipt is unreadable) for every glaeda-cmux-runner install:
+    the receipts --refresh-hooks reads, the first install's and each --instance K's."""
+    state = home / ".local/state/glaeda/cmux-runner"
+    out = []
+    for path in [state / "receipt.json", *sorted(state.glob("instance-*/receipt.json"))]:
+        try:
+            receipt = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            out.append((os.fspath(path), None))
+            continue
+        if not isinstance(receipt, dict) or not receipt.get("runnerDirOwned"):
+            continue  # a runner directory glaeda-cmux-runner does not own: --refresh-hooks never touches it
+        runner = receipt.get("runnerDir")
+        out.append((os.fspath(path), Path(runner) if isinstance(runner, str) and runner else None))
+    return out
+
+
+def hook_installed_at(hook_dir: Path) -> str | None:
+    """When this runner's hook files took their bytes: the later status change of the two. Every install renames a
+    new file into place (--refresh-hooks, or job-completed moving a staged .next), and a rename sets ctime."""
+    stamps = []
+    for name in HOOK_RELEASE_FILES:
+        try:
+            st = (hook_dir / name).stat()
+        except OSError:
+            continue
+        stamps.append(max(st.st_ctime, st.st_mtime))
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(stamps))) if stamps else None
+
+
+def live_summary(running: dict) -> dict:
+    """Merge-to-live for converge.json: the release's commit, when it landed on main, when this host installed it,
+    when the last of its runners' hooks took the release's bytes (None until every one has), and the spans."""
+    merged, installed = running.get("merged"), running.get("installedAt")
+    hooks = [h for h in running.get("hooks") or [] if "runnerDir" in h]
+    hooks_live = None
+    if hooks and installed and all(h.get("current") and h.get("installedAt") for h in hooks):
+        # a hook this release did not change kept an older install: it was live when the release was
+        hooks_live = max([installed, *(h["installedAt"] for h in hooks)])
+
+    def span(start: str | None, end: str | None) -> int | None:
+        try:
+            return int(parse_utc(str(end)) - parse_utc(str(start))) if start and end else None
+        except ValueError:
+            return None
+    return {"tag": running.get("tag"), "source": running.get("source"), "merged": merged, "installedAt": installed,
+            "hooksLiveAt": hooks_live, "mergeToInstallS": span(merged, installed),
+            "mergeToHooksLiveS": span(merged, hooks_live)}
+
+
+def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
+            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False, hook_states: list | None = None) -> dict:
+    """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
+    installed hook files, each compared with the release's bytes. Reads local files only; another account's runners
+    (step 7b) are this run's refresh rows from `hook_states`, which read them as that account."""
+    state = load_state(state_dir)
+    tag = state["current"]
+    out: dict = {"tag": tag, "source": installed_source(state_dir, tag), "tools": {"checked": 0, "drift": []},
+                 "hooks": [], "runnerScripts": "absent" if not staged.is_dir() else "unknown"}
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return out
+    checked, drift = tool_drift(gen, bin_dir, gh_only)
+    out["tools"] = {"checked": checked, "drift": drift}
+    # merge-to-live: when the release's commit landed on main (release.json `committed`, glaeda_release.py) and when
+    # this host installed it
+    try:
+        committed = json.loads((gen / "release.json").read_text()).get("committed")
+    except (OSError, ValueError, AttributeError):
+        committed = None
+    out["merged"] = committed if isinstance(committed, str) else None
+    installed = state.get("installed") or {}
+    out["installedAt"] = installed.get("at") if installed.get("tag") == tag else None
+    scripts = gen / "glaeda/scripts"
+    want = {name: file_sha256(scripts / name) for name in HOOK_RELEASE_FILES}
+    out["releaseHookSha256"] = want["glaeda-cmux-runner-hook"]
+    for receipt, runner in runner_hook_dirs(home):
+        if runner is None:
+            out["hooks"].append({"receipt": receipt, "current": False, "note": "unreadable receipt"})
+            continue
+        hook_dir = runner / "glaeda-hooks"
+        if not hook_dir.is_dir():
+            continue  # no hooks installed: no job runs them (--apply installs them)
+        row: dict = {"runnerDir": os.fspath(runner)}
+        for name in HOOK_RELEASE_FILES:
+            row[name] = file_sha256(hook_dir / name)
+        row["current"] = all(want[name] is None or row[name] == want[name] for name in HOOK_RELEASE_FILES)
+        if row["current"]:
+            row["installedAt"] = hook_installed_at(hook_dir)
+        out["hooks"].append(row)
+    for state in hook_states or []:
+        if isinstance(state, dict) and state.get("account") and "runnerDir" in state:
+            # unchanged or updated: the account's hook files are the release's bytes now (the refresh compared them)
+            current = state.get("state") in ("unchanged", "updated") and state.get("hookSha256") == want["glaeda-cmux-runner-hook"]
+            row = {"runnerDir": state["runnerDir"], "account": state["account"], "current": current,
+                   "glaeda-cmux-runner-hook": state.get("hookSha256") if current else None}
+            if current:  # this run put it in, or it already was (then no later than the release's install: a bound)
+                row["installedAt"] = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                      if state.get("state") == "updated" else out.get("installedAt"))
+            out["hooks"].append(row)
+    if staged.is_dir():
+        out["runnerScripts"] = "current" if all(
+            file_sha256(staged / name) == file_sha256(scripts / name) for name in RUNNER_FILES) else "differs"
+        release = file_sha256(scripts / PROMOTION_ADMIT)
+        if release is not None:  # a runner mini (step 6b): the helper HQ's promotion lease runs
+            installed = file_sha256(bin_dir / PROMOTION_ADMIT)
+            out["promotionAdmit"] = {"installedSha256": installed, "releaseSha256": release,
+                                     "current": installed == release}
+    return out
+
+
+def convergence(result: dict, running: dict, wants: dict | None, hook_states: list[dict]) -> tuple[bool, list[str], bool]:
+    """(converged, why not, blocking): blocking when retrying the same release cannot clear it."""
+    why: list[str] = []
+    blocking = False
+    if wants is None:
+        if result.get("result") == "idle":  # paused, or nothing on the ring: nothing is wanted
+            return True, ([str(result.get("why"))] if result.get("why") else []), False
+        # the channel was never read (a first run that cannot fetch): unknown is not converged
+        return False, [f"{result.get('result')}: {result.get('why') or result.get('detail') or 'no channel read yet'}"[:300]], False
+    if running.get("tag") != wants.get("tag"):
+        kind = str(result.get("result"))
+        detail = str(result.get("detail") or result.get("why") or "")
+        why.append(f"{kind}: {detail}"[:300] if detail else kind)
+        blocking = kind in BLOCKING_RESULTS
+    tools = running.get("tools") or {}
+    if tools.get("drift"):
+        why.append(f"installed tools differ from {running.get('tag')}: {', '.join(tools['drift'])}"
+                   + (f" ({result['repair']})" if result.get("repair") else ""))
+        blocking = blocking or str(result.get("repair", "")).startswith("failed")
+    states = {h.get("runnerDir"): h for h in hook_states if "runnerDir" in h}
+    for hook in running.get("hooks") or []:
+        if hook.get("current"):
+            continue
+        where = hook.get("runnerDir") or hook.get("receipt")
+        refresh = states.get(where) or {}
+        installed = str(hook.get("glaeda-cmux-runner-hook") or hook.get("note") or "none")[:12]
+        why.append(f"runner {Path(str(where)).name}: hook {installed} is not {running.get('tag')}'s "
+                   f"{str(running.get('releaseHookSha256') or '?')[:12]}"
+                   + (f" ({refresh.get('state')}: {refresh.get('note')})" if refresh.get("state") else ""))
+        blocking = blocking or refresh.get("state") in BLOCKING_HOOK_STATES or "note" in hook
+    helper = running.get("promotionAdmit") or {}
+    if helper and not helper.get("current"):
+        step = str(result.get("promotionAdmit") or "")
+        why.append(f"{PROMOTION_ADMIT} {str(helper.get('installedSha256') or 'missing')[:12]} is not "
+                   f"{running.get('tag')}'s {str(helper.get('releaseSha256') or '?')[:12]}"
+                   + (f" ({step[:200]})" if step else ""))
+        blocking = blocking or step.startswith(("kept", "failed"))
+    return not why, why, blocking
+
+
+def load_converge(path: Path = CONVERGE) -> dict:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) and doc.get("schema") == CONVERGE_SCHEMA else {}
+
+
+def backoff_s(attempts: int) -> int:
+    return min(APPLY_EVERY_S * 2 ** max(attempts - 1, 0), BACKOFF_MAX_S)
+
+
+def record_convergence(config: dict, result: dict, wants: dict | None, previous: dict, now: float,
+                       running: dict, hook_states: list[dict], path: Path = CONVERGE) -> dict:
+    """Write converge.json for this run and return it."""
+    converged, why, blocking = convergence(result, running, wants, hook_states)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    doc = {"schema": CONVERGE_SCHEMA, "host": config["host"], "ring": config["ring"], "at": stamp,
+           "result": str(result.get("result")), "running": running,
+           "wants": wants, "converged": converged, "why": why, "blocking": blocking and not converged,
+           "live": live_summary(running)}
+    for key in ("nudged",):
+        if key in previous:
+            doc[key] = previous[key]
+    # what the runners' sign hold did this run. Kept beside `why`, not in it: an install at the cap leaves the host
+    # converged, and a line in `why` would mark it unconverged and back it off; a deferral is already in `why`.
+    held = [h["signHold"] for h in hook_states if isinstance(h, dict) and isinstance(h.get("signHold"), str)]
+    if held:
+        doc["signHold"] = held
+    doc["staleAfter"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + STALE_AFTER_S))
+    if converged:
+        doc.update(since=None, attempts=0, nextAttempt=None, alertAfter=None)
+    else:
+        same = (not previous.get("converged") and previous.get("since")
+                and (previous.get("wants") or {}).get("tag") == (wants or {}).get("tag"))
+        attempts = int(previous.get("attempts") or 0) + 1 if same else 1
+        since = previous["since"] if same else stamp
+        doc.update(since=since, attempts=attempts,
+                   nextAttempt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + backoff_s(attempts))),
+                   alertAfter=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(parse_utc(since) + ALERT_AFTER_S)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+    return doc
+
+
+def parse_utc(stamp: str) -> float:
+    return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+
+
+def backing_off(previous: dict, wants: dict | None, now: float) -> bool:
+    """An unconverged host waits out its backoff while the ring still wants the same release."""
+    if not previous or previous.get("converged") or not previous.get("nextAttempt"):
+        return False
+    if (previous.get("wants") or {}).get("tag") != (wants or {}).get("tag"):
+        return False  # a new release (or a pause) is acted on at once
+    if (previous.get("running") or {}).get("tag") == (wants or {}).get("tag"):
+        return False  # the release is installed: refreshing tools and hooks between jobs is local and cheap
+    try:
+        return now < parse_utc(previous["nextAttempt"])
+    except (TypeError, ValueError):
+        return False
+
+
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
-           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
+           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN,
+           candidate_channel: tuple[bytes, bytes | None] | None = None) -> dict:
     state = load_state(state_dir)
     source = config.get("source", REPOSITORY)
     control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"], source)
     entry = resolve(control_raw, ring_raw, config["ring"])
-    out = {"ring": config["ring"], "source": source, "current": state["current"]}
+    current_source = installed_source(state_dir, state["current"])
+    out = {"ring": config["ring"], "source": source, "current": state["current"],
+           "currentSource": current_source}
+
+    def post(ok: bool | None, detail: str) -> str:
+        if owe_report(state, config, entry, ok, detail):
+            save_state(state, state_dir)
+        status = report(config, entry, ok, detail)
+        if status == "reported" and any(o["tag"] == entry["tag"] for o in state.get("unreported", [])):
+            paid(state, entry["tag"])
+            save_state(state, state_dir)
+        return status
+
+    if apply and state.get("unreported"):
+        out["redelivered"] = redeliver(state, config)
+        save_state(state, state_dir)
     if entry is None:
         return {**out, "result": "idle", "why": "paused or nothing on this ring"}
     out["target"] = entry["tag"]
+    target_summary = channel_summary(entry)
+    if target_summary is not None:
+        out["targetSource"] = target_summary.get("source")
+        out["targetPublished"] = target_summary.get("published")
+        if "promoted" in target_summary:
+            out["targetPromoted"] = target_summary["promoted"]
+    candidate_entry = None
+    if candidate_channel is not None:
+        try:
+            candidate_entry = resolve(*candidate_channel, "canary")
+        except UpdateError as error:
+            # A candidate channel is advisory for stable hosts.  Preserve the
+            # stable plan while making an invalid candidate visible to callers.
+            out["candidateError"] = str(error)
+    candidate_summary = channel_summary(candidate_entry)
+    if candidate_summary is not None:
+        out["candidate"] = candidate_summary
+    if config["ring"] == "stable" or candidate_summary is not None:
+        out["sourceDrift"] = source_drift(current_source, target_summary, candidate_summary)
     if entry["tag"] == state["current"]:
+        gen = generation(state_dir, entry["tag"])
+        if apply and (gen / ".complete").is_file():
+            _, drift = tool_drift(gen, bin_dir, gh_only(config))
+            if drift:
+                # Step 8: the installed tools are not this release's bytes (a partial or hand install):
+                # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
+                ok, log = run_setup(gen, config["setupArgs"], bin_dir)
+                _, left = tool_drift(gen, bin_dir, gh_only(config))
+                out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
+                                 else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
         return {**out, "result": "current"}
     if entry["tag"] in state["quarantined"]:
         return {**out, "result": "quarantined", "why": "this release failed here before"}
@@ -589,78 +1721,263 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
     try:
         gen = download(state_dir, entry, local_target(), config["ring"], source)
+    except UpdateInconclusive as e:
+        return {**out, "result": "inconclusive", "detail": str(e), "status": post(None, str(e))}
+    except (urllib.error.URLError, TimeoutError) as e:
+        detail = f"transient update fetch: {e}"
+        return {**out, "result": "inconclusive", "detail": detail, "status": post(None, detail)}
     except UpdateError as e:
         # The release failed verification (digest, attestation, archive): that is the release's fault
         # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError
         # and stay inconclusive: no status, try again next hour.
         state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
         save_state(state, state_dir)
-        return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
+        return {**out, "result": "refused", "detail": str(e), "status": post(False, str(e))}
     try:
         order = release_order(state_dir, state["current"], gen)
     except UpdateError as e:
         state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
         save_state(state, state_dir)
-        return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
+        return {**out, "result": "refused", "detail": str(e), "status": post(False, str(e))}
     if order != "new":
         detail = (f"target {entry['tag']} is {order} than installed {state['current']}; refusing to replace it")
         # This is a channel or host-configuration mismatch, not a failed artifact.
         # Re-evaluate it after the channel advances or setup flags change.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": post(None, detail)}
     supported, detail = setup_args_supported(gen, config["setupArgs"])
     if not supported:
         # An older release can be valid for another host profile. Do not turn a
         # persisted setup flag mismatch into an operator-cleared release gate.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": post(None, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
-    ok, log = run_setup(gen, config["setupArgs"])
+    ok, log = run_setup(gen, config["setupArgs"], bin_dir)
     detail = "installed" if ok else "setup failed"
     if ok:
         channel_dir = state_dir / "health-channel"
         channel_dir.mkdir(parents=True, exist_ok=True)
         (channel_dir / "control.json").write_bytes(control_raw)
         (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
-        ok, detail = health(bin_dir, channel_dir)
+        ok, detail = health(bin_dir, channel_dir, gh_only=gh_only(config))
+    timeouts = state.pop("healthTimeouts", None)
+    if ok is None:
+        n = (timeouts or {}).get("n", 0) + 1 if (timeouts or {}).get("tag") == entry["tag"] else 1
+        if n >= HEALTH_TIMEOUTS:
+            ok, detail = False, f"{detail} ({n} timed-out health checks in a row)"
+        else:
+            state["healthTimeouts"] = {"tag": entry["tag"], "n": n}
     if ok:
-        state.update(previous=state["current"], current=entry["tag"])
+        state.update(previous=state["current"], current=entry["tag"],
+                     installed={"tag": entry["tag"], "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         save_state(state, state_dir)
         shutil.rmtree(state_dir / "pre-ota", ignore_errors=True)
         prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
-        return {**out, "result": "updated", "detail": detail, "status": report(config, entry, True, detail)}
-    state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        return {**out, "result": "updated", "detail": detail, "status": post(True, detail)}
+    if ok is False:
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
-        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
+        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"], bin_dir)
         rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
     elif restore(state_dir, bin_dir):
-        rolled = "restored the tools installed before the first update"
+        back, rolled = True, "restored the tools installed before the first update"
     else:
-        rolled = "nothing to restore"
+        back, rolled = True, "nothing to restore"
     save_state(state, state_dir)
+    if ok is None and back:
+        # Unproven, not failed: back to what ran, no quarantine and no failure posted; the next run tries again.
+        return {**out, "result": "inconclusive", "detail": f"health check timed out: {detail}", "rollback": rolled,
+                "log": log[-600:], "status": post(None, detail)}
+    if ok is None:  # the tools on disk are neither release: blocking, but still not the release's fault
+        return {**out, "result": "rolled-back", "detail": f"health check timed out: {detail}", "rollback": rolled,
+                "log": log[-600:], "status": post(None, detail)}
     return {**out, "result": "rolled-back", "detail": detail, "rollback": rolled, "log": log[-600:],
-            "status": report(config, entry, False, detail)}
+            "status": post(False, detail)}
+
+
+def launchd_job(config: dict, home: Path = HOME) -> tuple[Path, str, list[str]]:
+    """This updater's plist, its launchd service target, and the prefix launchctl runs under (sudo -n for the
+    system domain of a headless Mac, whose daemon runs as this user)."""
+    if "--headless" in (config.get("setupArgs") or []):
+        return Path("/Library/LaunchDaemons") / f"{LABEL}.plist", f"system/{LABEL}", ["/usr/bin/sudo", "-n"]
+    return home / "Library/LaunchAgents" / f"{LABEL}.plist", f"gui/{os.getuid()}/{LABEL}", []
+
+
+# The detached reload (schedule_reload). It runs with only the argv it is given, so a release installed or rolled back
+# by this run cannot change what it does halfway. It waits for the run to exit, takes the updater's lock (a new run
+# that starts meanwhile finds it busy and is not booted out under itself), refuses a plist that does not lint, boots
+# the job out, waits until launchd has let go of it, bootstraps it again with backoff until `print` shows the new
+# interval, and appends one JSON line saying how it went to reload.log beside state.json.
+RELOAD_HELPER = r"""
+import fcntl, json, os, re, subprocess, sys, time
+pid, lock_path, log_path, prefix, launchctl, target, domain, plist, want = json.loads(sys.argv[1])
+def ctl(*args):
+    try:
+        done = subprocess.run([*prefix, launchctl, *args], capture_output=True, text=True, timeout=60)
+        return done.returncode, (done.stdout + done.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, str(e)
+def interval(shown):
+    have = re.search(r"^\s*run interval = (\d+) seconds", shown, re.M)
+    return int(have.group(1)) if have else None
+def finish(result, **detail):
+    with open(log_path, "a") as log:
+        log.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "result": result,
+                              "target": target, "want": want, **detail}, sort_keys=True) + "\n")
+    sys.exit(0 if result == "reloaded" else 1)
+deadline = time.time() + 3600
+while time.time() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    except PermissionError:
+        pass
+    time.sleep(1)
+else:
+    finish("gave-up", why="the run that scheduled this did not exit within an hour")
+with open(lock_path, "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if interval(ctl("print", target)[1]) == want:
+        finish("reloaded", why="already at the plist's interval (an earlier reload did it)")
+    if subprocess.run(["/usr/bin/plutil", "-lint", plist], capture_output=True).returncode != 0:
+        finish("refused", why="plist does not lint; the loaded job is left running")
+    ctl("bootout", target)
+    for _ in range(40):
+        if ctl("print", target)[0] != 0:
+            break
+        time.sleep(0.25)
+    tries = []
+    for wait in (0, 1, 2, 4, 8, 15, 30):
+        time.sleep(wait)
+        code, out = ctl("bootstrap", domain, plist)
+        tries.append(code)
+        if interval(ctl("print", target)[1]) == want:
+            finish("reloaded", bootstrap=tries)
+    finish("failed", bootstrap=tries, out=out[-300:])
+"""
+
+
+def schedule_reload(config: dict, home: Path = HOME, pid: int | None = None, state_dir: Path = STATE_DIR) -> str | None:
+    """Reload this agent when launchd runs it on an older schedule than its plist says.
+
+    glaeda-mini-setup cannot reload the agent of the glaeda-update that runs it (unloading would kill this run),
+    so it writes the plist and defers the reload "to the next login". Minis and Macs that never log out kept the
+    old StartInterval: APPLY_EVERY_S went from 3600 to 600, and cosmic-gray, air-blue and cmux16 still ran hourly
+    (launchctl print: run interval = 3600 seconds) on 2026-10-21. Here a detached helper (RELOAD_HELPER), outside
+    this job's process group so launchd does not end it with this run, reloads it once this process exits.
+    Returns what it did, or None when nothing differs. The outcome of the last reload is in reload.log; a failed
+    one is tried again by the next run that launchd starts (at login, if the job is gone)."""
+    if sys.platform != "darwin":
+        return None
+    plist, target, prefix = launchd_job(config, home)
+    try:
+        want = plistlib.loads(plist.read_bytes()).get("StartInterval")
+        shown = subprocess.run([*prefix, LAUNCHCTL, "print", target], capture_output=True, text=True,
+                               timeout=TIMEOUT, env={"PATH": CHILD_PATH}).stdout
+    except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
+        return None
+    have = re.search(r"^\s*run interval = (\d+) seconds", shown, re.M)
+    if not isinstance(want, int) or not have or int(have.group(1)) == want:
+        return None
+    args = [pid or os.getpid(), os.fspath(state_dir / "lock"), os.fspath(state_dir / "reload.log"), prefix, LAUNCHCTL,
+            target, target.rsplit("/", 1)[0], os.fspath(plist), want]
+    try:
+        subprocess.Popen([sys.executable, "-I", "-c", RELOAD_HELPER, json.dumps(args)], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={"PATH": CHILD_PATH}, cwd="/")
+    except OSError as e:
+        return f"reload not started ({e}): launchd runs every {have.group(1)}s, the plist says {want}s"
+    return f"reload scheduled: launchd runs every {have.group(1)}s, the plist says {want}s"
+
+
+def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
+               staged: Path = RUNNER_SCRIPTS, now: float | None = None,
+               channel: tuple[bytes, bytes | None] | None = None) -> dict:
+    """One --apply run under the lock: steps 1-7, then step 8's record. Whatever fails, converge.json says so."""
+    now = time.time() if now is None else now
+    converge_path = state_dir / CONVERGE.name
+    previous = load_converge(converge_path)
+    wants = previous.get("wants")
+    hook_states: list[dict] = []
+    entry = None
+    try:
+        if channel is None:
+            channel = fetch_channel(config["ring"], config.get("source", REPOSITORY))
+        entry = resolve(*channel, config["ring"])
+        wants = {k: entry[k] for k in ("tag", "source")} if entry else None
+        if backing_off(previous, wants, now):
+            result = {"result": "backoff", "target": (wants or {}).get("tag"),
+                      "why": f"unconverged since {previous.get('since')}; next try {previous.get('nextAttempt')}"}
+            result["converge"] = {k: previous.get(k) for k in ("converged", "why", "blocking", "since", "attempts")}
+            return result
+        result = update(True, config, state_dir, channel, bin_dir)
+        if nudge_due(result, entry, previous.get("nudged"), now):
+            result["promotion"] = nudge_promotion(config)
+            if entry is not None and result.get("result") == "current":
+                previous["nudged"] = entry["tag"]  # the post-soak nudge; the install's own does not count
+        pending = nudge_pending_at(config, result, entry, previous.get("nudged"), now)
+        if pending is not None:
+            result["soakEndsAt"] = pending
+        if result["result"] in ("updated", "current"):
+            result.update(runner_steps(state_dir, staged, home, hook_states, bin_dir))
+    except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
+        result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
+                           hook_states, converge_path)
+        raise
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
+                             hook_states, converge_path)
+    result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="install the ring's release if it is new")
+    ap.add_argument("--now", action="store_true",
+                    help="with --apply: the full update now, not only when due or the channel changed (one host, by hand)")
     ap.add_argument("--status", action="store_true", help="print config and state, contact nothing")
     ap.add_argument("--channel-dir", type=Path, help=argparse.SUPPRESS)  # health check: plan offline
     a = ap.parse_args(argv)
     try:
         config = load_config()
         if a.status:
-            print(json.dumps({"config": config, "state": load_state()}, indent=1, sort_keys=True))
+            state = load_state()
+            print(json.dumps(
+                {"config": config, "state": state,
+                 "release": {"tag": state["current"],
+                             "source": installed_source(STATE_DIR, state["current"])},
+                 # what the last run recorded (wants, why), and what the host runs now, by content
+                 "converge": load_converge(), "running": observe(gh_only=gh_only(config))},
+                indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
             channel = None
+            candidate_channel = None
             if a.channel_dir:
                 ring_file = a.channel_dir / f"{config['ring']}.json"
                 ring_raw = ring_file.read_bytes() or None
                 channel = ((a.channel_dir / "control.json").read_bytes(), ring_raw)
-            result = update(False, config, channel=channel)
+            else:
+                channel = fetch_channel(config["ring"], config.get("source", REPOSITORY))
+                if config["ring"] == "stable":
+                    # The canary is an informational comparison for a stable
+                    # host.  A transient candidate fetch failure must not hide
+                    # the stable plan itself.
+                    try:
+                        candidate_channel = fetch_channel("canary", config.get("source", REPOSITORY))
+                    except (OSError, urllib.error.URLError):
+                        candidate_channel = None
+            result = update(False, config, channel=channel, candidate_channel=candidate_channel)
         else:
+            now = time.time()
+            if a.now:  # an operator applying on this one host: no wait for the minute probe or APPLY_EVERY_S
+                full, seen, why = True, channel_fingerprint(config["ring"], config.get("source", REPOSITORY)), "asked"
+            else:
+                full, seen, why = probe_gate(config, now, STATE_DIR)
+            if not full:
+                return 0  # the channel is as the last full run read it: nothing to log, every minute
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             with open(STATE_DIR / "lock", "w") as lock:
                 try:
@@ -668,11 +1985,19 @@ def main(argv: list[str] | None = None) -> int:
                 except BlockingIOError:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
-                result = update(True, config)
-                if result["result"] in ("updated", "current", "idle"):
-                    result["promotion"] = nudge_promotion(config)
-                if result["result"] in ("updated", "current"):
-                    result.update(runner_steps())
+                result = None
+                try:
+                    result = apply_once(config)
+                finally:
+                    # recorded whatever the run did: a failing run waits for the next change or APPLY_EVERY_S
+                    probe = {"channel": seen, "fullRunAt": now}
+                    if isinstance(result, dict) and isinstance(result.get("soakEndsAt"), (int, float)):
+                        probe["soakEndsAt"] = result["soakEndsAt"]
+                    save_probe(probe, STATE_DIR)
+                result["trigger"] = why
+                schedule = schedule_reload(config)
+                if schedule:
+                    result["schedule"] = schedule
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] in ("rolled-back", "refused") else 0

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::disposable_attempt_catalog::DisposableAttemptCatalog;
 use crate::disposable_clone_runtime::CloneRuntimeClock;
+use crate::disposable_host_yield::MacHostYield;
 #[cfg(test)]
 use crate::disposable_service_failure_receipt::{
     DisposableServiceFailureCode, DisposableServiceFailureKind, DisposableServiceFailureReceipt,
@@ -259,11 +260,13 @@ fn build_driver(
     DisposableWorkerServiceDriver {
         _service_lock: service_lock,
         bridge_config: parts.bridge_config,
+        // The Lima backend runs on a fleet Mac: its own runner jobs come first.
         coordinator: DisposableWorkerCoordinator::new(
             parts.state_root,
             parts.consumer_policy,
             Box::new(parts.host_storage),
-        ),
+        )
+        .with_host_yield(Box::new(MacHostYield::from_environment(ProcessExecutor))),
         clone_runtime: parts.clone_runtime,
         runner_runtime: parts.runner_runtime,
         executor: ProcessExecutor,
@@ -306,7 +309,7 @@ impl DisposableWorkerSupervisorDriver for DisposableWorkerServiceDriver {
     fn connect(&mut self) -> Result<Self::Session, DisposableWorkerSupervisorError> {
         #[cfg(target_os = "macos")]
         {
-            ScaleSetBridgeClient::connect_from_keychain(self.bridge_config.clone())
+            ScaleSetBridgeClient::connect_enrolled(self.bridge_config.clone())
                 .map_err(|error| DisposableWorkerSupervisorError::new(error.code()))
         }
         #[cfg(not(target_os = "macos"))]

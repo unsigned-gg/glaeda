@@ -21,12 +21,25 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 
 pub(crate) trait DisposableHostStorageSource {
     fn admits_new_worker(&self) -> Result<bool, DisposableHostStorageError>;
+
+    /// How many more workers fit beside `occupied` workers already on the host.
+    ///
+    /// The default is the single-worker rule: one new worker on an empty host when
+    /// `admits_new_worker` says so, and none beside any occupied worker. A source that can
+    /// count per-clone disk headroom overrides this.
+    fn new_worker_room(&self, occupied: u16) -> Result<u16, DisposableHostStorageError> {
+        if occupied != 0 {
+            return Ok(0);
+        }
+        self.admits_new_worker().map(u16::from)
+    }
 }
 
 /// Read-only admission against the exact filesystem backing one enrolled Lima home.
 pub(crate) struct DisposableHostStorage {
     lima_home: PathBuf,
     required_available_bytes: u64,
+    worker_disk_ceiling_bytes: u64,
 }
 
 impl DisposableHostStorage {
@@ -40,6 +53,7 @@ impl DisposableHostStorage {
         Ok(Self {
             lima_home,
             required_available_bytes,
+            worker_disk_ceiling_bytes,
         })
     }
 
@@ -54,8 +68,8 @@ impl DisposableHostStorage {
     }
 }
 
-impl DisposableHostStorageSource for DisposableHostStorage {
-    fn admits_new_worker(&self) -> Result<bool, DisposableHostStorageError> {
+impl DisposableHostStorage {
+    fn available_bytes(&self) -> Result<u64, DisposableHostStorageError> {
         let directory = fs::open(&self.lima_home, DIRECTORY_FLAGS, Mode::empty())
             .map_err(|_| storage_error())?;
         let stat = fs::fstat(&directory).map_err(|_| storage_error())?;
@@ -66,12 +80,42 @@ impl DisposableHostStorageSource for DisposableHostStorage {
             return Err(storage_error());
         }
         let filesystem = fs::fstatvfs(&directory).map_err(|_| storage_error())?;
-        let available_bytes = checked_available_bytes(filesystem.f_bavail, filesystem.f_frsize)?;
+        checked_available_bytes(filesystem.f_bavail, filesystem.f_frsize)
+    }
+}
+
+impl DisposableHostStorageSource for DisposableHostStorage {
+    fn admits_new_worker(&self) -> Result<bool, DisposableHostStorageError> {
         Ok(has_required_available_bytes(
-            available_bytes,
+            self.available_bytes()?,
             self.required_available_bytes,
         ))
     }
+
+    fn new_worker_room(&self, occupied: u16) -> Result<u16, DisposableHostStorageError> {
+        Ok(worker_room(
+            self.available_bytes()?,
+            self.worker_disk_ceiling_bytes,
+            occupied,
+        ))
+    }
+}
+
+/// New workers that fit in `available_bytes` after the host reserve when each of the `occupied`
+/// clones may still grow to its full disk ceiling (copy-on-write clones start small). With nothing
+/// occupied this is at least one exactly when `has_required_available_bytes` holds.
+fn worker_room(available_bytes: u64, worker_disk_ceiling_bytes: u64, occupied: u16) -> u16 {
+    if worker_disk_ceiling_bytes == 0 {
+        return 0;
+    }
+    let Some(held) = worker_disk_ceiling_bytes
+        .checked_mul(u64::from(occupied))
+        .and_then(|held| held.checked_add(HOST_FREE_SPACE_RESERVE_BYTES))
+    else {
+        return 0;
+    };
+    let room = available_bytes.saturating_sub(held) / worker_disk_ceiling_bytes;
+    u16::try_from(room).unwrap_or(u16::MAX)
 }
 
 const fn has_required_available_bytes(available_bytes: u64, required_bytes: u64) -> bool {
@@ -171,8 +215,25 @@ mod tests {
         let storage = DisposableHostStorage {
             lima_home: root.0.clone(),
             required_available_bytes: 0,
+            worker_disk_ceiling_bytes: 1,
         };
         assert!(storage.admits_new_worker().unwrap());
+    }
+
+    #[test]
+    fn worker_room_holds_every_occupied_clone_at_its_ceiling() {
+        // One worker exactly at the single-worker threshold, none below it.
+        assert_eq!(worker_room(30 * GIB, 20 * GIB, 0), 1);
+        assert_eq!(worker_room(30 * GIB - 1, 20 * GIB, 0), 0);
+        // 70 GiB free, 20 GiB clones, 10 GiB reserve: three beside nothing, two beside one,
+        // one beside two, none beside three.
+        assert_eq!(worker_room(70 * GIB, 20 * GIB, 0), 3);
+        assert_eq!(worker_room(70 * GIB, 20 * GIB, 1), 2);
+        assert_eq!(worker_room(70 * GIB, 20 * GIB, 2), 1);
+        assert_eq!(worker_room(70 * GIB, 20 * GIB, 3), 0);
+        assert_eq!(worker_room(u64::MAX, u64::MAX, 2), 0);
+        assert_eq!(worker_room(u64::MAX, 1, 0), u16::MAX);
+        assert_eq!(worker_room(u64::MAX, 0, 0), 0);
     }
 
     #[test]

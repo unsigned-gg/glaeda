@@ -4,6 +4,8 @@
 
 Accepted for the local preview prototype.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 ADR 0007 produces reviewed Podman command vectors and marks start, stop, and remove as requiring exact ownership evidence. A container name remains a locator and can be reused after deletion. The executor therefore needs a fresh, bounded observation before it can authorize a mutation against an existing container.

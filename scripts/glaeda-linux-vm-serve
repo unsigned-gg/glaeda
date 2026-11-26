@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+"""glaeda-linux-vm-serve: stage the installed disposable-worker service for glaeda-linux-arm64 on one mini.
+
+    glaeda-linux-vm-serve                       plan: builds, installs and enrollment state (no side effects)
+    glaeda-linux-vm-serve --apply               as the operator: pinned Go, build glaeda + Scale Set bridge +
+                                                scaleset-enroll from this checkout, stage them, state root,
+                                                enrollment template
+    glaeda-linux-vm-serve install-root --from DIR --glaeda-sha256 X --bridge-sha256 Y [--apply]
+                                                as root (fleet-sudo): copy exactly those staged digests to
+                                                /opt/smolrunner/bin/{glaeda,scaleset-bridge}, root:wheel 0555
+    glaeda-linux-vm-serve finish --scale-set FILE
+                                                plan: the canonical enrollment from scaleset-enroll's output
+                                                and the exact `service plan` identity
+    glaeda-linux-vm-serve finish --scale-set FILE --apply --approve-plan ID
+                                                write the enrollment (0600), re-plan, `service apply`, `service status`
+
+The installed service (docs/DISPOSABLE_INSTALLED_SERVICE_ACCEPTANCE.md) runs `glaeda worker serve` from a
+per-user LaunchAgent. Its inputs have exact contracts in the code, used here unchanged:
+    /opt/smolrunner/bin/scaleset-bridge   fixed bridge path: root:wheel 0555, one link, every parent root-owned
+    /opt/smolrunner/bin/glaeda            the program: root-owned, not group/world writable, parents root-owned
+    enrollment                            operator-owned 0600 canonical JSON (src/disposable_worker_enrollment.rs)
+    state root                            operator-owned directory, mode 0750
+
+Operator files live under ~/.glaeda/linux-vm next to glaeda-linux-vm-base's Lima:
+    go-1.26.3/              the official Go release (size and SHA-256 checked), never upgraded
+    serve/stage/            built glaeda, scaleset-bridge, scaleset-enroll and stage.json (digests, commit)
+    serve/enrollment.json   the canonical enrollment `finish --apply` writes
+    worker-state/           the worker's state root
+
+Nothing is deleted. A file this command did not create (no receipt names it) is reported and left alone.
+Output is one bounded JSON document; exit 0 ok, 2 refused, 1 failed.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as _dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from typing import Any, Callable, Sequence
+
+SCHEMA = "glaeda-linux-vm-serve/v1"
+GO_VERSION = "1.26.3"
+GO_URL = f"https://go.dev/dl/go{GO_VERSION}.darwin-arm64.tar.gz"
+GO_BYTES = 64724939
+GO_SHA256 = "875cf54a15311eee2c99b9dd67c68c4a49351d489ab622bf2cfd28c8f2078d3c"
+RUST_TOOLCHAIN = "1.97.1"
+INSTALL_DIRS = ("/", "/opt", "/opt/smolrunner", "/opt/smolrunner/bin")
+INSTALL_BIN = "/opt/smolrunner/bin"
+PROGRAM = f"{INSTALL_BIN}/glaeda"
+BRIDGE = f"{INSTALL_BIN}/scaleset-bridge"
+ROOT_RECEIPT = "/opt/smolrunner/glaeda-linux-vm-serve.json"
+BASE_INSTANCE = "glaeda-linux-arm64-base"
+APP_ID = 5067688
+CONFIG_URL = "https://github.com/manaflow-ai"
+SCALE_SET_DEFAULTS = {"name": "glaeda-linux-arm64", "owner": "manaflow-ai", "repository": "cmux",
+                      "labels": ["glaeda-linux-arm64"]}
+RESOURCES = {"cpu_millis": 4_000, "memory_bytes": 8 << 30, "disk_bytes": 20 << 30}
+ENROLLMENT_SCHEMA_VERSION = 2
+MAX_PROGRAM_BYTES = 256 << 20
+MAX_BRIDGE_BYTES = 64 << 20
+MAX_JSON_BYTES = 64 << 10
+BUILD_TIMEOUT = 60 * 60
+TAIL = 400
+REPO = pathlib.Path(__file__).resolve().parents[1]
+ARTIFACTS = ("glaeda", "scaleset-bridge", "scaleset-enroll")
+
+
+class Refused(Exception):
+    """A state this command must report and not change."""
+
+
+class Failed(Exception):
+    """A step that ran and did not succeed."""
+
+
+def tail(text: str | bytes | None) -> str:
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    text = text.strip()
+    return text if len(text) <= TAIL else "..." + text[-TAIL:]
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canonical_json(document: Any) -> bytes:
+    """serde_json::to_vec_pretty plus a newline, for ASCII documents: the enrollment's canonical bytes."""
+    text = json.dumps(document, indent=2, ensure_ascii=True)
+    if not text.isascii():
+        raise Refused("the enrollment must be ASCII")
+    return (text + "\n").encode()
+
+
+def enrollment_document(*, state_root: str, limactl: str, lima_home: str, bridge_sha256: str,
+                        token_file: str, scale_set: dict[str, Any]) -> dict[str, Any]:
+    """The schema-2 enrollment, keys in the Rust wire structs' field order (canonical encoding depends on it)."""
+    return {
+        "schema_version": ENROLLMENT_SCHEMA_VERSION,
+        "state_root": state_root,
+        "lima": {"program": limactl, "home": lima_home, "source_instance": BASE_INSTANCE},
+        "bridge": {"program_digest": f"sha256:{bridge_sha256}"},
+        "github": {"config_url": CONFIG_URL,
+                   "credential": {"kind": "installation_token_file", "app_id": APP_ID, "path": token_file}},
+        "scale_set": {"id": scale_set["id"], "name": scale_set["name"], "runner_group_id": scale_set["runner_group_id"],
+                      "owner": scale_set["owner"], "repository": scale_set["repository"],
+                      "labels": list(scale_set["labels"])},
+        "resources": dict(RESOURCES),
+    }
+
+
+def scale_set_from_enroll_output(data: bytes) -> dict[str, Any]:
+    """The `enrollment` object of `scaleset-enroll --apply` output, checked the way the Rust decoder will."""
+    if len(data) > MAX_JSON_BYTES:
+        raise Refused("scaleset-enroll output is too large")
+    try:
+        document = json.loads(data)
+    except ValueError:
+        raise Refused("scaleset-enroll output is not JSON") from None
+    if not isinstance(document, dict) or document.get("error"):
+        raise Refused(f"scaleset-enroll reported {tail(str(document.get('error') if isinstance(document, dict) else document))}")
+    item = document.get("enrollment")
+    if not isinstance(item, dict):
+        raise Refused("scaleset-enroll output has no enrollment object; run it with --apply")
+    scale_set = {"id": item.get("scale_set_id"), "name": item.get("scale_set_name"),
+                 "runner_group_id": item.get("runner_group_id"), "owner": item.get("owner"),
+                 "repository": item.get("repository"), "labels": item.get("labels")}
+    for key in ("id", "runner_group_id"):
+        value = scale_set[key]
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 < value < 1 << 32:
+            raise Refused(f"scaleset-enroll {key} {value!r} is not a positive u32")
+    for key in ("name", "owner", "repository"):
+        if not isinstance(scale_set[key], str) or not scale_set[key] or not scale_set[key].isascii():
+            raise Refused(f"scaleset-enroll {key} is missing")
+    labels = scale_set["labels"]
+    if not isinstance(labels, list) or not labels or not all(isinstance(x, str) and x and x.isascii() for x in labels):
+        raise Refused("scaleset-enroll labels are missing")
+    if any(a >= b for a, b in zip(labels, labels[1:])):
+        raise Refused("scaleset-enroll labels are not strictly sorted; the enrollment decoder refuses them")
+    return scale_set
+
+
+Runner = Callable[..., subprocess.CompletedProcess]
+
+
+def default_runner(argv: Sequence[str], *, env: dict[str, str], timeout: float,
+                   cwd: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(list(argv), env=env, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        return subprocess.CompletedProcess(list(argv), 124, tail(error.stdout), f"timed out after {timeout:.0f}s")
+
+
+def default_download(url: str, dest: pathlib.Path, timeout: float) -> None:
+    argv = ["/usr/bin/curl", "--proto", "=https", "--tlsv1.2", "--fail", "--location", "--silent", "--show-error",
+            "--retry", "4", "--connect-timeout", "30", "--max-time", str(int(timeout)), "--output", str(dest), url]
+    result = default_runner(argv, env={"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/")}, timeout=timeout + 30)
+    if result.returncode != 0:
+        raise Failed(f"download of {url} failed: {tail(result.stderr)}")
+
+
+def file_facts(path: pathlib.Path, *, limit: int) -> dict[str, Any]:
+    """Owner, mode, links and digest of one leaf, without following a link."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {"state": "absent"}
+    facts: dict[str, Any] = {"uid": st.st_uid, "gid": st.st_gid, "mode": f"{stat.S_IMODE(st.st_mode):04o}",
+                             "nlink": st.st_nlink, "bytes": st.st_size}
+    if not stat.S_ISREG(st.st_mode):
+        facts["state"] = "not_a_file"
+        return facts
+    if st.st_size == 0 or st.st_size > limit:
+        facts["state"] = "bad_size"
+        return facts
+    facts["sha256"] = sha256_file(path)
+    facts["state"] = "present"
+    return facts
+
+
+def dir_facts(path: str) -> dict[str, Any]:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {"path": path, "state": "absent"}
+    return {"path": path, "state": "dir" if stat.S_ISDIR(st.st_mode) else "not_a_dir", "uid": st.st_uid,
+            "gid": st.st_gid, "mode": f"{stat.S_IMODE(st.st_mode):04o}"}
+
+
+class Serve:
+    def __init__(self, *, root: pathlib.Path, home: pathlib.Path, repo: pathlib.Path = REPO,
+                 runner: Runner = default_runner,
+                 download: Callable[[str, pathlib.Path, float], None] = default_download,
+                 install_bin: str = INSTALL_BIN, install_dirs: Sequence[str] = INSTALL_DIRS,
+                 root_receipt: str = ROOT_RECEIPT, root_ids: tuple[int, int] = (0, 0),
+                 chown: Callable[[int, int, int], None] = os.fchown,
+                 rustup_candidates: Sequence[pathlib.Path] | None = None,
+                 host: dict[str, Any] | None = None):
+        self.root = root
+        self.home = home
+        self.repo = repo
+        self.runner = runner
+        self.download = download
+        self.go_prefix = root / f"go-{GO_VERSION}"
+        self.go = self.go_prefix / "bin" / "go"
+        self.serve = root / "serve"
+        self.stage = self.serve / "stage"
+        self.stage_receipt = self.stage / "stage.json"
+        self.enrollment = self.serve / "enrollment.json"
+        self.template_path = self.serve / "enrollment.template.json"
+        self.state_root = root / "worker-state"
+        self.lima_home = root / "lima-home"
+        self.limactl = root / "lima-2.2.0" / "bin" / "limactl"
+        self.base_receipt = root / "base.json"
+        self.token_file = home / ".config" / "glaeda" / "scaleset-token.json"
+        self.install_bin = install_bin
+        self.install_dirs = tuple(install_dirs)
+        self.program = pathlib.Path(install_bin) / "glaeda"
+        self.bridge = pathlib.Path(install_bin) / "scaleset-bridge"
+        self.root_receipt = pathlib.Path(root_receipt)
+        self.root_ids = root_ids
+        self.chown = chown
+        self.rustup_candidates = list(rustup_candidates) if rustup_candidates is not None else [
+            home / ".cargo" / "bin" / "rustup", pathlib.Path("/opt/homebrew/bin/rustup")]
+        self.host = host
+        self.actions: list[dict[str, Any]] = []
+
+    # ---- environment ---------------------------------------------------------------------------
+    def base_env(self) -> dict[str, str]:
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
+        for key in ("USER", "LOGNAME", "TMPDIR"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
+        return env
+
+    def go_env(self) -> dict[str, str]:
+        env = self.base_env()
+        env.update({"PATH": f"{self.go_prefix / 'bin'}:/usr/bin:/bin", "GOTOOLCHAIN": "local",
+                    "GOPATH": str(self.serve / "gopath"), "GOMODCACHE": str(self.serve / "gopath" / "pkg" / "mod"),
+                    "GOCACHE": str(self.serve / "go-build"), "GOFLAGS": "-mod=readonly", "CGO_ENABLED": "0"})
+        return env
+
+    def run(self, argv: Sequence[str], *, env: dict[str, str] | None = None, timeout: float = 60,
+            cwd: pathlib.Path | None = None) -> subprocess.CompletedProcess:
+        return self.runner(list(argv), env=self.base_env() if env is None else env, timeout=timeout,
+                           cwd=str(cwd) if cwd else None)
+
+    def host_facts(self) -> dict[str, Any]:
+        if self.host is not None:
+            return self.host
+        return {"system": platform.system(), "machine": platform.machine(), "euid": os.geteuid()}
+
+    # ---- observations --------------------------------------------------------------------------
+    def go_state(self) -> dict[str, Any]:
+        if not self.go_prefix.exists():
+            return {"state": "absent"}
+        result = self.run([str(self.go), "version"], env=self.go_env(), timeout=30)
+        version = result.stdout.strip()
+        if result.returncode != 0 or version != f"go version go{GO_VERSION} darwin/arm64":
+            return {"state": "mismatch", "detail": tail(version or result.stderr)}
+        return {"state": "ok", "version": version}
+
+    def rustup(self) -> pathlib.Path | None:
+        for candidate in self.rustup_candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def rust_state(self) -> dict[str, Any]:
+        rustup = self.rustup()
+        if rustup is None:
+            return {"state": "no_rustup"}
+        result = self.run([str(rustup), "toolchain", "list"], timeout=30)
+        have = any(line.split()[0].startswith(f"{RUST_TOOLCHAIN}-") for line in result.stdout.splitlines() if line.strip())
+        return {"state": "ok" if have else "absent", "rustup": str(rustup), "toolchain": RUST_TOOLCHAIN}
+
+    def source(self) -> dict[str, Any]:
+        head = self.run(["/usr/bin/git", "-C", str(self.repo), "rev-parse", "HEAD"], timeout=30)
+        status = self.run(["/usr/bin/git", "-C", str(self.repo), "status", "--porcelain", "--untracked-files=no"],
+                          timeout=60)
+        if head.returncode != 0 or status.returncode != 0:
+            raise Failed(f"cannot read the checkout's commit: {tail(head.stderr or status.stderr)}")
+        return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip())}
+
+    def read_json(self, path: pathlib.Path) -> dict[str, Any] | None:
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            if path.stat().st_size <= MAX_JSON_BYTES:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                return value if isinstance(value, dict) else None
+        return None
+
+    def staged(self, commit: str) -> dict[str, Any] | None:
+        """The stage receipt when it was built from `commit` and every staged file still has its digest."""
+        receipt = self.read_json(self.stage_receipt)
+        if not receipt or receipt.get("created_by") != SCHEMA or receipt.get("source_commit") != commit:
+            return None
+        for name in ARTIFACTS:
+            want = (receipt.get("artifacts") or {}).get(name, {}).get("sha256")
+            path = self.stage / name
+            if not want or not path.is_file() or sha256_file(path) != want:
+                return None
+        return receipt
+
+    def installed(self, receipt: dict[str, Any] | None) -> dict[str, Any]:
+        """Read-only: do the installed program and bridge meet the service's exact path contracts?"""
+        uid, gid = self.root_ids
+        dirs = [dir_facts(path) for path in self.install_dirs]
+        dirs_ok = all(d["state"] == "dir" and d["uid"] == uid and d["gid"] == gid and int(d["mode"], 8) & 0o022 == 0
+                      for d in dirs)
+        out: dict[str, Any] = {"dirs_ok": dirs_ok}
+        for key, path, limit, exact_mode in (("program", self.program, MAX_PROGRAM_BYTES, None),
+                                             ("bridge", self.bridge, MAX_BRIDGE_BYTES, "0555")):
+            facts = file_facts(path, limit=limit)
+            ok = facts["state"] == "present" and facts["uid"] == uid and facts["nlink"] == 1 and \
+                int(facts["mode"], 8) & 0o022 == 0 and int(facts["mode"], 8) & 0o111 != 0
+            if exact_mode:
+                ok = ok and facts["gid"] == gid and facts["mode"] == exact_mode
+            want = ((receipt or {}).get("artifacts") or {}).get("glaeda" if key == "program" else "scaleset-bridge", {})
+            facts["contract_ok"] = ok
+            facts["matches_stage"] = bool(want) and facts.get("sha256") == want.get("sha256")
+            out[key] = {k: facts[k] for k in ("state", "sha256", "mode", "contract_ok", "matches_stage") if k in facts}
+        return out
+
+    def operator_paths_ok(self) -> dict[str, Any]:
+        """From the operator home down, the enrollment's parents are root- or operator-owned, never group/world
+        writable (the service's own check walks from /; on macOS /Users is root-owned 0755)."""
+        uid = os.geteuid()
+        bad = []
+        probes = [self.home]
+        for part in self.enrollment.parent.relative_to(self.home).parts:
+            probes.append(probes[-1] / part)
+        for probe in probes:
+            facts = dir_facts(str(probe))
+            if facts["state"] == "absent":
+                break
+            if facts["state"] != "dir" or facts["uid"] not in (0, uid) or int(facts["mode"], 8) & 0o022:
+                bad.append(str(probe))
+        launch_agents = dir_facts(str(self.home / "Library" / "LaunchAgents"))
+        return {"enrollment_parents_ok": not bad, "unsafe_parents": bad,
+                "launch_agents_ok": launch_agents["state"] == "dir" and launch_agents["uid"] == uid
+                and int(launch_agents["mode"], 8) & 0o022 == 0}
+
+    def base_state(self) -> str | None:
+        return (self.read_json(self.base_receipt) or {}).get("state")
+
+    # ---- operator mutations ----------------------------------------------------------------------
+    def install_go(self) -> None:
+        private_mkdir(self.root)
+        stage = pathlib.Path(tempfile.mkdtemp(prefix=".go-stage-", dir=self.root))
+        try:
+            archive = stage / "go.tar.gz"
+            self.download(GO_URL, archive, 600)
+            size = archive.stat().st_size
+            digest = sha256_file(archive)
+            if size != GO_BYTES or digest != GO_SHA256:
+                raise Failed(f"Go archive is {size} bytes sha256:{digest}, want {GO_BYTES} sha256:{GO_SHA256}")
+            tree = stage / "tree"
+            tree.mkdir()
+            with tarfile.open(archive, "r:gz") as tar:
+                for member in tar.getmembers():
+                    name = pathlib.PurePosixPath(member.name)
+                    if name.is_absolute() or ".." in name.parts or not name.parts or name.parts[0] != "go" or \
+                            not (member.isfile() or member.isdir()):
+                        raise Failed(f"Go archive holds an unexpected entry {member.name!r}")
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(tree, filter="data")
+                else:  # every member was checked above
+                    tar.extractall(tree)  # noqa: S202
+            if not os.access(tree / "go" / "bin" / "go", os.X_OK):
+                raise Failed("Go archive has no go/bin/go")
+            os.rename(tree / "go", self.go_prefix)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        self.actions.append({"action": "install_go", "version": GO_VERSION, "sha256": GO_SHA256})
+
+    def install_rust(self, rustup: str) -> None:
+        result = self.run([rustup, "toolchain", "install", RUST_TOOLCHAIN, "--profile", "minimal", "--no-self-update"],
+                          timeout=1800)
+        if result.returncode != 0:
+            raise Failed(f"rustup toolchain install {RUST_TOOLCHAIN} failed: {tail(result.stderr)}")
+        self.actions.append({"action": "install_rust_toolchain", "toolchain": RUST_TOOLCHAIN})
+
+    def build(self, rustup: str, source: dict[str, Any]) -> dict[str, Any]:
+        private_mkdir(self.stage)
+        target = self.serve / "target"
+        # The pinned toolchain's own cargo, with its bin first on PATH: cargo runs `rustc` from PATH, and a
+        # Homebrew rustup's `rustup run` does not put the toolchain there.
+        which = self.run([rustup, "which", "--toolchain", RUST_TOOLCHAIN, "cargo"], timeout=60)
+        cargo_bin = pathlib.Path(which.stdout.strip())
+        if which.returncode != 0 or not cargo_bin.is_absolute() or cargo_bin.name != "cargo":
+            raise Failed(f"rustup cannot locate toolchain {RUST_TOOLCHAIN}: {tail(which.stderr)}")
+        env = self.base_env()
+        env.update({"PATH": f"{cargo_bin.parent}:/usr/bin:/bin", "CARGO_TARGET_DIR": str(target),
+                    "RUSTUP_TOOLCHAIN": RUST_TOOLCHAIN})
+        cargo = self.run([str(cargo_bin), "build", "--locked", "--release", "--bin", "glaeda"],
+                         env=env, timeout=BUILD_TIMEOUT, cwd=self.repo)
+        if cargo.returncode != 0:
+            raise Failed(f"cargo build failed: {tail(cargo.stderr)}")
+        built = {"glaeda": target / "release" / "glaeda"}
+        bridge_dir = self.repo / "tools" / "scaleset-bridge"
+        for name, package in (("scaleset-bridge", "."), ("scaleset-enroll", "./cmd/scaleset-enroll")):
+            out = self.stage / f".{name}.build"
+            result = self.run([str(self.go), "build", "-trimpath", "-buildvcs=false", "-o", str(out), package],
+                              env=self.go_env(), timeout=BUILD_TIMEOUT, cwd=bridge_dir)
+            if result.returncode != 0:
+                raise Failed(f"go build {name} failed: {tail(result.stderr)}")
+            built[name] = out
+        artifacts: dict[str, Any] = {}
+        for name, path in built.items():
+            dest = self.stage / name
+            stage = self.stage / f".{name}.new"
+            shutil.copyfile(path, stage)
+            os.chmod(stage, 0o700)
+            os.replace(stage, dest)
+            if path.parent == self.stage:
+                path.unlink()
+            artifacts[name] = {"sha256": sha256_file(dest), "bytes": dest.stat().st_size}
+        rustc = self.run([str(cargo_bin.parent / "rustc"), "--version"], env=env, timeout=60).stdout.strip()
+        receipt = {"created_by": SCHEMA, "source_commit": source["commit"], "staged_at": now(),
+                   "go": GO_VERSION, "rustc": tail(rustc), "artifacts": artifacts}
+        write_private(self.stage_receipt, (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode())
+        self.actions.append({"action": "build_stage", "commit": source["commit"],
+                             "sha256": {k: v["sha256"] for k, v in artifacts.items()}})
+        return receipt
+
+    def ensure_state_root(self) -> None:
+        try:
+            st = os.lstat(self.state_root)
+        except FileNotFoundError:
+            private_mkdir(self.state_root.parent)
+            os.mkdir(self.state_root, 0o750)
+            os.chmod(self.state_root, 0o750)
+            self.actions.append({"action": "create_state_root"})
+            return
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o750:
+            raise Refused(f"{self.state_root} exists but is not an operator-owned 0750 directory; not touching it")
+
+    def write_template(self, bridge_sha256: str) -> None:
+        placeholder = dict(SCALE_SET_DEFAULTS, id=0, runner_group_id=0)
+        data = canonical_json(self.enrollment_for(bridge_sha256, placeholder))
+        if self.template_path.is_file() and self.template_path.read_bytes() == data:
+            return
+        write_private(self.template_path, data)
+        self.actions.append({"action": "write_enrollment_template", "fill": ["scale_set.id", "scale_set.runner_group_id"]})
+
+    def enrollment_for(self, bridge_sha256: str, scale_set: dict[str, Any]) -> dict[str, Any]:
+        return enrollment_document(state_root=str(self.state_root), limactl=str(self.limactl),
+                                   lima_home=str(self.lima_home), bridge_sha256=bridge_sha256,
+                                   token_file=str(self.token_file), scale_set=scale_set)
+
+    # ---- the operator plan/apply driver ------------------------------------------------------------
+    def execute(self, *, apply: bool) -> dict[str, Any]:
+        out: dict[str, Any] = {"schema": SCHEMA, "mode": "apply" if apply else "plan", "program": str(self.program),
+                               "bridge": str(self.bridge)}
+        host = self.host_facts()
+        if host["system"] != "Darwin" or host["machine"] != "arm64":
+            raise Refused(f"needs an Apple-silicon Mac, this is {host['system']} {host['machine']}")
+        if host["euid"] == 0:
+            raise Refused("run the build as the operator; only install-root runs as root")
+        source = self.source()
+        out["source"] = source
+        go, rust = self.go_state(), self.rust_state()
+        out["go"], out["rust"] = go, rust
+        if go["state"] == "mismatch":
+            raise Refused(f"{self.go_prefix} is not Go {GO_VERSION}: {go['detail']}")
+        if rust["state"] == "no_rustup":
+            raise Refused("no rustup found; the build needs the pinned toolchain " + RUST_TOOLCHAIN)
+        receipt = self.staged(source["commit"])
+        out["base_vm"] = self.base_state()
+        plan: list[str] = []
+        if go["state"] == "absent":
+            plan.append("install_go")
+        if rust["state"] == "absent":
+            plan.append("install_rust_toolchain")
+        if receipt is None:
+            plan.append("build_stage")
+        if not self.state_root.exists():
+            plan.append("create_state_root")
+        out["plan"] = plan
+        if apply:
+            if source["dirty"]:
+                raise Refused("the checkout has uncommitted changes; an installed binary must map to one commit")
+            if out["base_vm"] != "ready_stopped":
+                raise Refused(f"the base VM receipt is {out['base_vm']!r}; run glaeda-linux-vm-base --apply first")
+            if "install_go" in plan:
+                self.install_go()
+                if self.go_state()["state"] != "ok":
+                    raise Failed(f"installed Go does not report {GO_VERSION}")
+            if "install_rust_toolchain" in plan:
+                self.install_rust(rust["rustup"])
+            if receipt is None:
+                receipt = self.build(rust["rustup"], source)
+            self.ensure_state_root()
+            self.write_template(receipt["artifacts"]["scaleset-bridge"]["sha256"])
+        out["stage"] = {k: v["sha256"] for k, v in (receipt or {}).get("artifacts", {}).items()} or None
+        out["installed"] = self.installed(receipt)
+        out["operator_paths"] = self.operator_paths_ok()
+        out["token_file_present"] = self.token_file.exists()
+        out["next"] = self.next_steps(receipt, out["installed"])
+        out["actions"] = self.actions
+        out["disposition"] = ("changed" if self.actions else "unchanged") if apply else ("plan" if plan else "unchanged")
+        return out
+
+    def next_steps(self, receipt: dict[str, Any] | None, installed: dict[str, Any]) -> list[str]:
+        if receipt is None:
+            return ["glaeda-linux-vm-serve --apply"]
+        steps = []
+        art = receipt["artifacts"]
+        if not (installed["program"].get("matches_stage") and installed["bridge"].get("matches_stage")
+                and installed["program"].get("contract_ok") and installed["bridge"].get("contract_ok")):
+            steps.append(f"fleet-sudo <host> {self.repo}/scripts/glaeda-linux-vm-serve install-root --from {self.root} "
+                         f"--glaeda-sha256 {art['glaeda']['sha256']} --bridge-sha256 {art['scaleset-bridge']['sha256']} --apply")
+        steps.append(f"{self.stage}/scaleset-enroll --token-file {self.token_file} --workflow <ORG/REPO/.github/workflows/F.yml"
+                     f"@refs/heads/main> --apply > {self.serve}/scaleset-enroll.json")
+        steps.append(f"glaeda-linux-vm-serve finish --scale-set {self.serve}/scaleset-enroll.json")
+        return steps
+
+    # ---- root install -----------------------------------------------------------------------------
+    def install_root(self, *, apply: bool, want: dict[str, str]) -> dict[str, Any]:
+        out: dict[str, Any] = {"schema": SCHEMA, "mode": "apply" if apply else "plan", "command": "install-root"}
+        host = self.host_facts()
+        uid, gid = self.root_ids
+        if host["euid"] != uid:
+            raise Refused("install-root runs as root (fleet-sudo HOST ...)")
+        receipt = self.read_json(self.stage_receipt)
+        if not receipt or receipt.get("created_by") != SCHEMA:
+            raise Refused(f"no stage receipt at {self.stage_receipt}; run glaeda-linux-vm-serve --apply as the operator")
+        out["source_commit"] = receipt.get("source_commit")
+        for name in ("glaeda", "scaleset-bridge"):
+            staged = (receipt.get("artifacts") or {}).get(name, {}).get("sha256")
+            if staged != want[name]:
+                raise Refused(f"staged {name} is sha256:{staged}, the command names sha256:{want[name]}")
+        for d in self.install_dirs:
+            facts = dir_facts(d)
+            if facts["state"] == "absent":
+                continue
+            if facts["state"] != "dir" or facts["uid"] != uid or facts["gid"] != gid or int(facts["mode"], 8) & 0o022:
+                raise Refused(f"{d} is not a {uid}:{gid} directory without group/world write; not touching it")
+        ours = (self.read_json(self.root_receipt) or {}).get("installed") or {}
+        plan = []
+        for name, dest, limit in (("glaeda", self.program, MAX_PROGRAM_BYTES), ("scaleset-bridge", self.bridge, MAX_BRIDGE_BYTES)):
+            facts = file_facts(dest, limit=limit)
+            exact = facts["state"] == "present" and facts.get("sha256") == want[name] and facts["uid"] == uid and \
+                facts["gid"] == gid and facts["mode"] == "0555" and facts["nlink"] == 1
+            if exact:
+                continue
+            if facts["state"] != "absent" and not (facts["state"] == "present" and ours.get(str(dest)) == facts.get("sha256")):
+                raise Refused(f"{dest} exists and this command did not install it; reported, not replaced")
+            plan.append(name)
+        out["plan"] = plan
+        if apply and plan:
+            for d in self.install_dirs:
+                if not os.path.lexists(d):
+                    os.mkdir(d, 0o755)
+                    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        self.chown(fd, uid, gid)
+                        os.fchmod(fd, 0o755)
+                    finally:
+                        os.close(fd)
+                    self.actions.append({"action": "create_dir", "path": d})
+            for name in plan:
+                dest = self.program if name == "glaeda" else self.bridge
+                limit = MAX_PROGRAM_BYTES if name == "glaeda" else MAX_BRIDGE_BYTES
+                self.copy_root(self.stage / name, dest, want[name], limit)
+                ours[str(dest)] = want[name]
+                self.write_root_receipt(ours, receipt.get("source_commit"))
+        out["installed"] = self.installed(receipt)
+        if apply and not (out["installed"]["program"]["contract_ok"] and out["installed"]["bridge"]["contract_ok"]
+                          and out["installed"]["dirs_ok"]):
+            raise Failed("installed files do not meet the service's path contract")
+        out["actions"] = self.actions
+        out["disposition"] = ("changed" if self.actions else "unchanged") if apply else ("plan" if plan else "unchanged")
+        return out
+
+    def copy_root(self, source: pathlib.Path, dest: pathlib.Path, want: str, limit: int) -> None:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            data = b""
+            while len(data) <= limit:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(fd)
+        if len(data) > limit or sha256_bytes(data) != want:
+            raise Refused(f"staged {source.name} changed after review (sha256:{sha256_bytes(data)})")
+        temp = dest.parent / f".{dest.name}.new-{os.getpid()}"
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(out, view):]
+            os.fsync(out)
+            self.chown(out, *self.root_ids)
+            os.fchmod(out, 0o555)
+        finally:
+            os.close(out)
+        if sha256_file(temp) != want:
+            os.unlink(temp)
+            raise Failed(f"copy of {source.name} does not hash to sha256:{want}")
+        os.replace(temp, dest)
+        self.actions.append({"action": "install", "path": str(dest), "sha256": want})
+
+    def write_root_receipt(self, installed: dict[str, str], commit: str | None) -> None:
+        data = (json.dumps({"created_by": SCHEMA, "installed": installed, "source_commit": commit, "at": now()},
+                           indent=2, sort_keys=True) + "\n").encode()
+        temp = self.root_receipt.with_name(f".{self.root_receipt.name}.new")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+            self.chown(fd, *self.root_ids)
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        os.replace(temp, self.root_receipt)
+
+    # ---- finish: enrollment + service plan/apply ------------------------------------------------------
+    def glaeda_service(self, verb: str, *, enrollment_digest: str, program_digest: str,
+                       extra: Sequence[str] = ()) -> dict[str, Any]:
+        argv = [str(self.program), "--output", "json", "service", verb]
+        if verb in ("plan", "apply"):
+            argv += ["--desired", "installed"]
+        argv += ["--operator-home", str(self.home), "--program", str(self.program), "--program-digest",
+                 f"sha256:{program_digest}", "--enrollment", str(self.enrollment), "--enrollment-digest",
+                 f"sha256:{enrollment_digest}", *extra]
+        result = self.run(argv, env={}, timeout=120, cwd=pathlib.Path("/"))
+        try:
+            document = json.loads(result.stdout)
+        except ValueError:
+            document = None
+        if result.returncode != 0 or not isinstance(document, dict):
+            raise Failed(f"glaeda service {verb} failed ({result.returncode}): {tail(result.stdout or result.stderr)}")
+        return document
+
+    def finish(self, *, scale_set_file: pathlib.Path, apply: bool, approve: str | None) -> dict[str, Any]:
+        out: dict[str, Any] = {"schema": SCHEMA, "mode": "apply" if apply else "plan", "command": "finish"}
+        if self.host_facts()["euid"] == 0:
+            raise Refused("finish runs as the operator that owns the LaunchAgent, never root")
+        scale_set = scale_set_from_enroll_output(scale_set_file.read_bytes())
+        installed = self.installed(self.read_json(self.stage_receipt))
+        out["installed"] = installed
+        if not (installed["dirs_ok"] and installed["program"]["contract_ok"] and installed["bridge"]["contract_ok"]):
+            raise Refused("the program or bridge is not installed to its contract; run install-root first")
+        paths = self.operator_paths_ok()
+        if not (paths["enrollment_parents_ok"] and paths["launch_agents_ok"]):
+            raise Refused(f"operator paths are unsafe for the service: {paths}")
+        if not self.state_root.is_dir():
+            raise Refused(f"{self.state_root} is missing; run glaeda-linux-vm-serve --apply")
+        data = canonical_json(self.enrollment_for(installed["bridge"]["sha256"], scale_set))
+        digest = sha256_bytes(data)
+        out["enrollment_digest"] = f"sha256:{digest}"
+        out["program_digest"] = f"sha256:{installed['program']['sha256']}"
+        out["scale_set"] = {k: scale_set[k] for k in ("id", "name", "runner_group_id", "labels")}
+        current = self.enrollment.read_bytes() if self.enrollment.is_file() else None
+        out["enrollment"] = "unchanged" if current == data else ("absent" if current is None else "differs")
+        plan = self.glaeda_service("plan", enrollment_digest=digest, program_digest=installed["program"]["sha256"])
+        out["plan_identity"] = plan.get("plan_identity")
+        out["service_plan"] = {k: plan.get(k) for k in ("desired_state", "service_label", "launchd_domain",
+                                                        "requires_operator_approval")}
+        if not apply:
+            out["next"] = [f"glaeda-linux-vm-serve finish --scale-set {scale_set_file} --apply "
+                           f"--approve-plan {out['plan_identity']}"]
+            out["disposition"] = "plan"
+            return out
+        if not approve:
+            raise Refused("finish --apply needs --approve-plan with the plan_identity a plan run printed")
+        if approve != out["plan_identity"]:
+            raise Refused(f"the plan identity is {out['plan_identity']}, the approval names {approve}; re-plan")
+        if not self.token_file.exists():
+            raise Refused(f"{self.token_file} is absent; the service would start without its credential")
+        if current != data:
+            write_private(self.enrollment, data)
+            self.actions.append({"action": "write_enrollment", "sha256": digest})
+        replan = self.glaeda_service("plan", enrollment_digest=digest, program_digest=installed["program"]["sha256"])
+        if replan.get("plan_identity") != approve:
+            raise Refused("the plan identity changed after the enrollment was written; re-plan")
+        applied = self.glaeda_service("apply", enrollment_digest=digest, program_digest=installed["program"]["sha256"],
+                                      extra=["--approve-plan", approve])
+        self.actions.append({"action": "service_apply", "disposition": applied.get("disposition")})
+        status = self.glaeda_service("status", enrollment_digest=digest, program_digest=installed["program"]["sha256"])
+        out["service_apply"] = {k: applied.get(k) for k in ("disposition", "plan_identity")}
+        out["service_status"] = {k: status.get(k) for k in ("state", "service_loaded", "plan_identity",
+                                                            "installation_remediation", "runtime_health")}
+        if status.get("state") != "loaded_exact" or status.get("plan_identity") != approve:
+            raise Failed(f"service status is {status.get('state')!r} after apply")
+        out["actions"] = self.actions
+        out["disposition"] = "changed" if self.actions else "unchanged"
+        return out
+
+
+def private_mkdir(path: pathlib.Path) -> None:
+    """Create each missing component as 0700 whatever the umask; existing directories are left as they are."""
+    missing = []
+    probe = path
+    while not os.path.lexists(probe):
+        missing.append(probe)
+        probe = probe.parent
+    for directory in reversed(missing):
+        os.mkdir(directory, 0o700)
+        os.chmod(directory, 0o700)
+
+
+def write_private(path: pathlib.Path, data: bytes) -> None:
+    private_mkdir(path.parent)
+    stage = path.with_name(f".{path.name}.new")
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    os.replace(stage, path)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-linux-vm-serve", description=__doc__.split("\n\n")[0])
+    parser.add_argument("command", nargs="?", choices=("stage", "install-root", "finish"), default="stage")
+    parser.add_argument("--apply", action="store_true", help="make the changes (default: plan only)")
+    parser.add_argument("--from", dest="from_root", help="install-root: the operator's ~/.glaeda/linux-vm")
+    parser.add_argument("--glaeda-sha256", help="install-root: the exact staged glaeda digest")
+    parser.add_argument("--bridge-sha256", help="install-root: the exact staged scaleset-bridge digest")
+    parser.add_argument("--scale-set", help="finish: scaleset-enroll --apply output JSON")
+    parser.add_argument("--approve-plan", help="finish --apply: the exact plan_identity approved")
+    parser.add_argument("--root", default=str(pathlib.Path.home() / ".glaeda" / "linux-vm"), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    code = 0
+    lock = None
+    serve = None
+    try:
+        if args.command == "install-root":
+            if not (args.from_root and args.glaeda_sha256 and args.bridge_sha256):
+                raise Refused("install-root needs --from, --glaeda-sha256 and --bridge-sha256")
+            root = pathlib.Path(args.from_root)
+            if not root.is_absolute() or root.parent.name != ".glaeda":
+                raise Refused("--from must be an operator's absolute ~/.glaeda/linux-vm")
+            serve = Serve(root=root, home=root.parent.parent)
+            document = serve.install_root(apply=args.apply, want={"glaeda": args.glaeda_sha256,
+                                                                 "scaleset-bridge": args.bridge_sha256})
+        else:
+            root = pathlib.Path(args.root)
+            serve = Serve(root=root, home=pathlib.Path.home())
+            if args.apply:
+                private_mkdir(root)
+                lock = (root / ".serve.lock").open("w")
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise Refused("another glaeda-linux-vm-serve --apply holds the lock") from None
+            if args.command == "finish":
+                if not args.scale_set:
+                    raise Refused("finish needs --scale-set FILE (scaleset-enroll --apply output)")
+                document = serve.finish(scale_set_file=pathlib.Path(args.scale_set), apply=args.apply,
+                                        approve=args.approve_plan)
+            else:
+                document = serve.execute(apply=args.apply)
+    except Refused as error:
+        document, code = {"schema": SCHEMA, "disposition": "refused", "reason": tail(str(error))}, 2
+    except Failed as error:
+        document, code = {"schema": SCHEMA, "disposition": "failed", "reason": tail(str(error))}, 1
+    finally:
+        if lock is not None:
+            lock.close()
+    if code and serve is not None:
+        document["actions"] = serve.actions
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

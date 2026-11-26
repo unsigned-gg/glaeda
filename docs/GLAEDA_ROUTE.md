@@ -84,7 +84,7 @@ never sees the document and must never route to an owned pool anyway.
       "class": "std", "xcode": "26.6", "rank": 0,
       "declared": 11, "conforming": 10, "reserved": 1, "locked": 0,
       "runners": 11, "online": 11, "busy": 2, "idle": 8,
-      "resource": {"cpuCores": 196, "capacityUnits": 69,
+      "resource": {"cpuCores": 196, "capacityUnits": 140,
                     "compileSlots": 17, "canonicalRoots": 18,
                     "guiRunners": 9, "simulatorHosts": 9}
     }
@@ -106,7 +106,7 @@ never sees the document and must never route to an owned pool anyway.
 | `idle` | Runners that are online, not busy, and belong to a conforming member (`<member>-glaeda`). The routable capacity at `observed_at`. |
 | `resource` | Optional manifest-derived aggregate for the pool's declared members. It contains no host names and is descriptive capacity, not a live free-capacity claim. |
 | `resource.cpuCores` | Sum of the physical CPU cores declared by each member's hardware class. |
-| `resource.capacityUnits` | Sum of the members' weighted Glaeda capacity units (a compile costs two units; light and GUI work costs one). |
+| `resource.capacityUnits` | Sum of the members' weighted Glaeda capacity units (units are cores: a compile costs 5, an isolated job 4, a GUI or simulator job 1). |
 | `resource.compileSlots`, `resource.canonicalRoots`, `resource.guiRunners` | Sum of the configured compile, canonical-root and GUI token counts. |
 | `resource.simulatorHosts` | Number of declared pool members with the iOS simulator role and runtime policy. |
 
@@ -125,7 +125,7 @@ job keeps its Blacksmith route. `glaeda-route check --state FILE` applies the sa
 4. `order` and `pools` name the same labels, every label is `glaeda-<std|light>-xcode-<version>`,
    and every count is a non-negative integer, with `idle` and `busy` at most `online`. If
    `resource` is present, all of its fields are non-negative integers, `compileSlots` does not
-   exceed `canonicalRoots`, and two units are available for each compile slot.
+   exceed `canonicalRoots`, and five units are available for each compile slot.
 5. The run is trusted: a same-repository pull request, or a push, merge group, schedule or
    dispatch on the repository itself, and attempt 1. Fork runs never read the document.
 
@@ -236,6 +236,20 @@ Each agent tick, for every live reservation on the routed repository:
   it ended `cancelled`, and (for a pull request) the pull request is still open at that head (a
   push during the cancel starts its own run, which must not be overwritten). The re-run is
   attempt 2 and lands on overflow as a whole run.
+- Never cancelled: a nightly or DEV reservation, and any run of a workflow that builds, signs or
+  publishes a feed (`nightly.yml`, `nightly-sign.yml`, `release.yml`, `cmux-next-dev-daily.yml`,
+  the nightly-next train, tick and canary, and `cmux-next.yml` push runs), is released instead of
+  rescued, in `held` and in `rescuing` alike (`never_cancelled()`). The rulebook allows cancelling a
+  started nightly, DEV or promote build only when it is stuck past its timeout or certain to fail;
+  cmux's own owned-pool rescue re-runs their refused or timed-out jobs elsewhere.
+  `test_nightly_dev_and_promote_runs_are_never_cancelled` lists them by name, so dropping one fails CI.
+- Every cancel and force-cancel goes through `scripts/glaeda_never_cancel.py` (`cancel_run`), the only
+  code in glaeda that cancels a run. It refuses a started run of a nightly, DEV or promote workflow on
+  any branch (the delivery list of cmux `scripts/ci/delivery_workflows.py`, plus `release.yml` and
+  `cmux-next.yml` push runs) unless one of its jobs has run past the longest job `timeout-minutes` of
+  its workflow at the run's own head. A job's wait for a runner never counts, and an unreadable jobs
+  list or workflow refuses. `scripts/test-glaeda-never-cancel.py` scans the repository for any other
+  cancel call, so a new path that skips the guard fails CI.
 
 This is cmux#14234's rule, moved into Glaeda and driven by the ledger instead of a marker
 artifact and a watcher workflow per run.

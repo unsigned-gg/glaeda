@@ -1,8 +1,9 @@
 //! One-step production composition of disposable Scale Set delivery and worker lifecycle.
 //!
 //! The coordinator owns no new external semantics. It gives durable delivery recovery priority,
-//! keeps advertised capacity at zero while one attempt is active, and dispatches exactly one
-//! already-reviewed canonical-lock transaction per call. A live zero-capacity Scale Set poll is
+//! advertises only the free slots under the per-host worker ceiling (zero while one attempt is
+//! active on the default one-worker host, and zero while the host yields), and dispatches exactly
+//! one already-reviewed canonical-lock transaction per call. A live zero-capacity Scale Set poll is
 //! repeated inside every pre-clone checkpoint boundary; a message observed there is durably
 //! reconciled through the existing paired delivery transaction before any retry.
 
@@ -22,6 +23,7 @@ use crate::disposable_clone_runtime::{
     DisposableCloneRuntimeError, DisposableCloneTransactionOutcome, admission_seal,
 };
 use crate::disposable_host_storage::{DisposableHostStorageSource, HOST_STORAGE_UNAVAILABLE_CODE};
+use crate::disposable_host_yield::{DisposableHostYieldSource, HostYieldReason, NoHostYield};
 use crate::disposable_runner_runtime::{
     DisposableRunnerRegistrationSource, DisposableRunnerRuntime, DisposableRunnerRuntimeError,
 };
@@ -89,6 +91,8 @@ impl DisposableWorkerServiceBridge for ScaleSetBridgeClient {
 pub(crate) enum DisposableWorkerCoordinatorDisposition {
     Idle,
     HostStorageUnavailable,
+    /// The Mac's own work holds new workers off; zero capacity was advertised.
+    HostYielding(HostYieldReason),
     TemplateAdvanced(DisposableTemplateRuntimeDisposition),
     DeliverySettled {
         acquired: usize,
@@ -133,6 +137,7 @@ pub(crate) struct DisposableWorkerCoordinator {
     state_root: PathBuf,
     policy: ScaleSetDeliveryConsumerPolicy,
     host_storage: Box<dyn DisposableHostStorageSource>,
+    host_yield: Box<dyn DisposableHostYieldSource>,
 }
 
 impl DisposableWorkerCoordinator {
@@ -145,7 +150,18 @@ impl DisposableWorkerCoordinator {
             state_root: state_root.into(),
             policy,
             host_storage,
+            host_yield: Box::new(NoHostYield),
         }
+    }
+
+    /// Advertise zero capacity while the host's own work holds new workers off. A worker that
+    /// already has its job keeps it.
+    pub(crate) fn with_host_yield(
+        mut self,
+        host_yield: Box<dyn DisposableHostYieldSource>,
+    ) -> Self {
+        self.host_yield = host_yield;
+        self
     }
 
     #[cfg(test)]
@@ -224,7 +240,7 @@ impl DisposableWorkerCoordinator {
             .and_then(map_delivery_disposition);
         }
         let catalog = load_catalog(&self.state_root)?;
-        if catalog.active().len() > 1 {
+        if catalog.active().len() > usize::from(self.policy.host_budget().max_workers()) {
             return Err(coordinator_error("disposable_capacity_invariant_violated"));
         }
 
@@ -241,9 +257,10 @@ impl DisposableWorkerCoordinator {
             }
         }
 
-        let operation_owns_live_poll = catalog
-            .active()
-            .first()
+        let selected_at = clock
+            .epoch_millis()
+            .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+        let operation_owns_live_poll = select_attempt(&catalog, selected_at)?
             .map(operation_for)
             .transpose()?
             .is_some_and(|operation| {
@@ -254,12 +271,26 @@ impl DisposableWorkerCoordinator {
                 )
             });
         if !operation_owns_live_poll {
-            let available_capacity = advertised_capacity(&catalog, self.host_storage.as_ref());
-            let host_storage_available = available_capacity == 1;
+            // The host is asked only while a slot is free: on a one-worker host that is exactly
+            // while no attempt is active. While it yields, no new worker is admitted; attempts
+            // that already hold a job keep it.
+            let has_free_slot =
+                catalog.active().len() < usize::from(self.policy.host_budget().max_workers());
+            let host_yield = if has_free_slot {
+                self.host_yield.host_yield()
+            } else {
+                None
+            };
+            let available_capacity = advertised_capacity(
+                &catalog,
+                &self.policy,
+                self.host_storage.as_ref(),
+                host_yield.is_some(),
+            );
             let observed_at = clock
                 .epoch_millis()
                 .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
-            let delivery = if available_capacity == 1 {
+            let delivery = if available_capacity > 0 {
                 consume_with_bridge_capacity_at_revision(
                     &self.state_root,
                     &self.policy,
@@ -289,19 +320,24 @@ impl DisposableWorkerCoordinator {
                 ScaleSetDeliveryControllerDisposition::Idle => {}
             }
 
-            if catalog.active().is_empty() && !host_storage_available {
+            if let Some(reason) = host_yield
+                && catalog.active().is_empty()
+            {
+                return Ok(DisposableWorkerCoordinatorDisposition::HostYielding(reason));
+            }
+            if catalog.active().is_empty() && available_capacity == 0 {
                 return Ok(DisposableWorkerCoordinatorDisposition::HostStorageUnavailable);
             }
         }
 
         let catalog = load_catalog(&self.state_root)?;
-        let Some(reservation) = catalog.active().first() else {
-            return Ok(DisposableWorkerCoordinatorDisposition::Idle);
-        };
-        let attempt_id = reservation.attempt().attempt_id().clone();
         let now = clock
             .epoch_millis()
             .map_err(|_| coordinator_error("disposable_clock_unavailable"))?;
+        let Some(reservation) = select_attempt(&catalog, now)? else {
+            return Ok(DisposableWorkerCoordinatorDisposition::Idle);
+        };
+        let attempt_id = reservation.attempt().attempt_id().clone();
         if requires_post_start_deadline_cleanup(reservation, now) {
             let mut durable = DisposableAttemptCatalog::new(open_catalog(&self.state_root)?);
             let (next, _) = durable
@@ -502,19 +538,88 @@ enum PhysicalBackend<'a> {
     OwnedLinux(&'a OwnedLinuxJitRuntime),
 }
 
+/// New workers this host can take now: zero while it yields, else the smallest of the slots left
+/// under the worker ceiling, the workers the host budget still fits beside the reserved ones, and
+/// the workers host storage has room for beside every occupied clone. On a one-worker host this
+/// is one exactly when the catalog is empty and storage admits a worker, as before.
 fn advertised_capacity(
     catalog: &DisposableAttemptCatalogDocument,
+    policy: &ScaleSetDeliveryConsumerPolicy,
     host_storage: &dyn DisposableHostStorageSource,
+    host_yields: bool,
 ) -> u16 {
-    if !catalog.active().is_empty() {
+    if host_yields {
         return 0;
     }
-    u16::from(host_storage_available(host_storage))
+    let budget = policy.host_budget();
+    let Ok(occupied) = u16::try_from(catalog.active().len()) else {
+        return 0;
+    };
+    let slots = budget.max_workers().saturating_sub(occupied);
+    if slots == 0 {
+        return 0;
+    }
+    let Ok(mut usage) = catalog.host_usage() else {
+        return 0;
+    };
+    let mut fits = 0_u16;
+    while fits < slots && budget.admits_another(usage, policy.resources()) {
+        fits += 1;
+        let Some(next) = add_worker(usage, policy.resources()) else {
+            break;
+        };
+        usage = next;
+    }
+    if fits == 0 {
+        return 0;
+    }
+    match host_storage.new_worker_room(occupied) {
+        Ok(room) => fits.min(room),
+        Err(error) => {
+            debug_assert_eq!(error.code(), HOST_STORAGE_UNAVAILABLE_CODE);
+            0
+        }
+    }
 }
 
-fn host_storage_available(host_storage: &dyn DisposableHostStorageSource) -> bool {
-    match host_storage.admits_new_worker() {
-        Ok(available) => available,
+fn add_worker(
+    usage: crate::disposable_worker_reconciler::DisposableHostUsage,
+    request: crate::disposable_worker_reconciler::DisposableWorkerResources,
+) -> Option<crate::disposable_worker_reconciler::DisposableHostUsage> {
+    let used = usage.resources();
+    let resources = crate::disposable_worker_reconciler::DisposableWorkerResources::new(
+        used.cpu_millis().checked_add(request.cpu_millis())?,
+        used.memory_bytes().checked_add(request.memory_bytes())?,
+        used.disk_bytes().checked_add(request.disk_bytes())?,
+    )
+    .ok()?;
+    crate::disposable_worker_reconciler::DisposableHostUsage::new(
+        usage.workers().checked_add(1)?,
+        resources,
+    )
+    .ok()
+}
+
+/// The attempt this step advances: the first, in catalog order, with work to do now (a post-start
+/// deadline cleanup or any operation but waiting), else the first attempt. With one attempt this
+/// is always that attempt, as before.
+fn select_attempt(
+    catalog: &DisposableAttemptCatalogDocument,
+    now: EpochMillis,
+) -> Result<Option<&DisposableAttemptReservation>, DisposableWorkerCoordinatorError> {
+    for reservation in catalog.active() {
+        if requires_post_start_deadline_cleanup(reservation, now)
+            || operation_for(reservation)? != CoordinatorOperation::Wait
+        {
+            return Ok(Some(reservation));
+        }
+    }
+    Ok(catalog.active().first())
+}
+
+fn host_storage_room_for_one(host_storage: &dyn DisposableHostStorageSource, others: u16) -> bool {
+    match host_storage.new_worker_room(others) {
+        Ok(room) => room >= 1,
         Err(error) => {
             debug_assert_eq!(error.code(), HOST_STORAGE_UNAVAILABLE_CODE);
             false
@@ -646,7 +751,12 @@ impl<B: DeliveryBridge, C: CloneRuntimeClock> DisposableCloneAdmissionSource
                 "clone_scale_set_message_pending",
             ));
         }
-        if requires_host_storage(reservation) && !host_storage_available(self.host_storage) {
+        // This clone is admitted beside every other active attempt on the host; on a one-worker
+        // host there are none and this is the plain storage check.
+        let others = u16::try_from(catalog.active().len().saturating_sub(1)).unwrap_or(u16::MAX);
+        if requires_host_storage(reservation)
+            && !host_storage_room_for_one(self.host_storage, others)
+        {
             return Err(DisposableCloneRuntimeError::observation(
                 HOST_STORAGE_UNAVAILABLE_CODE,
             ));
@@ -659,7 +769,8 @@ impl<B: DeliveryBridge, C: CloneRuntimeClock> DisposableCloneAdmissionSource
         let capacity_reserved = catalog
             .find_active(reservation.attempt().attempt_id())
             .is_some_and(|current| current == reservation)
-            && catalog.host_usage().is_ok_and(|usage| usage.workers() == 1);
+            && reservation.attempt().phase() != DisposableAttemptPhase::Complete
+            && catalog.host_usage().is_ok_and(|usage| usage.workers() >= 1);
         Ok(DisposableCloneAdmissionObservation::new(
             catalog,
             reservation,
@@ -962,8 +1073,118 @@ mod tests {
             .reserve(reservation())
             .unwrap()
     }
+    fn worker_resources() -> DisposableWorkerResources {
+        DisposableWorkerResources::new(4_000, 8 * GIB, 80 * GIB).unwrap()
+    }
+
+    fn single_policy() -> ScaleSetDeliveryConsumerPolicy {
+        ScaleSetDeliveryConsumerPolicy::new_owned_linux(
+            7,
+            "repo",
+            "owner",
+            &["self-hosted".to_owned()],
+            worker_resources(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A host ceiling of `max_workers` whose memory total fits `memory_fits` workers.
+    fn budget_policy(max_workers: u16, memory_fits: u64) -> ScaleSetDeliveryConsumerPolicy {
+        let total = DisposableWorkerResources::new(
+            64_000,
+            memory_fits * 8 * GIB,
+            u64::from(max_workers) * 80 * GIB,
+        )
+        .unwrap();
+        single_policy()
+            .with_host_budget(
+                crate::disposable_worker_reconciler::DisposableHostBudget::new(max_workers, total)
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+
+    /// Storage with room for `self.0` new workers whatever is occupied.
+    struct RoomHostStorage(u16);
+
+    impl DisposableHostStorageSource for RoomHostStorage {
+        fn admits_new_worker(
+            &self,
+        ) -> Result<bool, crate::disposable_host_storage::DisposableHostStorageError> {
+            Ok(self.0 > 0)
+        }
+
+        fn new_worker_room(
+            &self,
+            _: u16,
+        ) -> Result<u16, crate::disposable_host_storage::DisposableHostStorageError> {
+            Ok(self.0)
+        }
+    }
+
+    /// Storage that holds `self.0` clones in total, occupied ones included.
+    struct OccupiedRoomHostStorage(u16);
+
+    impl DisposableHostStorageSource for OccupiedRoomHostStorage {
+        fn admits_new_worker(
+            &self,
+        ) -> Result<bool, crate::disposable_host_storage::DisposableHostStorageError> {
+            Ok(self.0 > 0)
+        }
+
+        fn new_worker_room(
+            &self,
+            occupied: u16,
+        ) -> Result<u16, crate::disposable_host_storage::DisposableHostStorageError> {
+            Ok(self.0.saturating_sub(occupied))
+        }
+    }
+
+    fn second_reservation() -> DisposableAttemptReservation {
+        DisposableAttemptReservation::new(
+            crate::disposable_attempt_state::DisposableAttemptState::reserved(
+                DisposableAttemptId::parse("attempt-2").unwrap(),
+                CapacityClaimId::parse("claim-2").unwrap(),
+                DisposableVmId::parse("smol-2").unwrap(),
+                ScaleSetRunnerName::parse("smol-2").unwrap(),
+                ScaleSetRunnerRequestId::new(42).unwrap(),
+                EpochMillis::new(1_900_000_600_000).unwrap(),
+            ),
+            worker_resources(),
+            current_disposable_prepared_template()
+                .unwrap()
+                .identity()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn two_reserved_catalog() -> DisposableAttemptCatalogDocument {
+        catalog().reserve(second_reservation()).unwrap()
+    }
+
+    fn idle_bridge() -> FakeDeliveryBridge {
+        FakeDeliveryBridge {
+            polls: VecDeque::from([ScaleSetBridgePoll::Idle {
+                statistics: statistics(),
+            }]),
+            capacities: Vec::new(),
+            poisoned: false,
+        }
+    }
+
     fn runner_registered_catalog() -> DisposableAttemptCatalogDocument {
-        let mut catalog = catalog();
+        register_first(catalog())
+    }
+
+    /// Drive the first active attempt to a registered runner, leaving any others as they are.
+    fn register_first(
+        mut catalog: DisposableAttemptCatalogDocument,
+    ) -> DisposableAttemptCatalogDocument {
         let attempt_id = catalog.active()[0].attempt().attempt_id().clone();
         for action in [
             crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::AuthorizeClone,
@@ -1107,16 +1328,168 @@ mod tests {
 
     #[test]
     fn host_storage_refusal_and_unknown_state_advertise_zero_capacity() {
+        // The deployed one-worker host: exactly the old rule.
+        let policy = single_policy();
         let empty = DisposableAttemptCatalogDocument::empty();
-        assert_eq!(advertised_capacity(&empty, &FixedHostStorage(Ok(true))), 1);
-        assert_eq!(advertised_capacity(&empty, &FixedHostStorage(Ok(false))), 0);
         assert_eq!(
-            advertised_capacity(&empty, &FixedHostStorage(Err(unavailable_storage_error()))),
+            advertised_capacity(&empty, &policy, &FixedHostStorage(Ok(true)), false),
+            1
+        );
+        assert_eq!(
+            advertised_capacity(&empty, &policy, &FixedHostStorage(Ok(false)), false),
             0
         );
         assert_eq!(
-            advertised_capacity(&catalog(), &FixedHostStorage(Ok(true))),
+            advertised_capacity(
+                &empty,
+                &policy,
+                &FixedHostStorage(Err(unavailable_storage_error())),
+                false
+            ),
             0
+        );
+        assert_eq!(
+            advertised_capacity(&catalog(), &policy, &FixedHostStorage(Ok(true)), false),
+            0
+        );
+        // Even a storage source with room for many keeps a one-worker host at one.
+        assert_eq!(
+            advertised_capacity(&empty, &policy, &RoomHostStorage(9), false),
+            1
+        );
+        assert_eq!(
+            advertised_capacity(&catalog(), &policy, &RoomHostStorage(9), false),
+            0
+        );
+    }
+
+    #[test]
+    fn three_worker_host_advertises_free_slots_and_admission_refuses_the_third() {
+        let policy = budget_policy(3, 3);
+        let empty = DisposableAttemptCatalogDocument::empty();
+        let one = catalog();
+        let two = two_reserved_catalog();
+        assert_eq!(two.active().len(), 2);
+
+        // Ceiling 3, plenty of storage: 3, then 2 beside one, then 1 beside two.
+        assert_eq!(
+            advertised_capacity(&empty, &policy, &RoomHostStorage(9), false),
+            3
+        );
+        assert_eq!(
+            advertised_capacity(&one, &policy, &RoomHostStorage(9), false),
+            2
+        );
+        assert_eq!(
+            advertised_capacity(&two, &policy, &RoomHostStorage(9), false),
+            1
+        );
+        // Storage room counts every occupied clone: no room beside two refuses the third.
+        assert_eq!(
+            advertised_capacity(&two, &policy, &OccupiedRoomHostStorage(2), false),
+            0
+        );
+        assert_eq!(
+            advertised_capacity(&one, &policy, &OccupiedRoomHostStorage(2), false),
+            1
+        );
+        // The host memory budget fits two workers of this size: the third is refused even
+        // though the ceiling is three.
+        let memory_bound = budget_policy(3, 2);
+        assert_eq!(
+            advertised_capacity(&empty, &memory_bound, &RoomHostStorage(9), false),
+            2
+        );
+        assert_eq!(
+            advertised_capacity(&two, &memory_bound, &RoomHostStorage(9), false),
+            0
+        );
+        // A source that only knows the single-worker rule never admits a second clone.
+        assert_eq!(
+            advertised_capacity(&one, &policy, &FixedHostStorage(Ok(true)), false),
+            0
+        );
+    }
+
+    #[test]
+    fn host_yield_advertises_zero_new_capacity_on_any_ceiling() {
+        let empty = DisposableAttemptCatalogDocument::empty();
+        for policy in [single_policy(), budget_policy(3, 3)] {
+            assert_eq!(
+                advertised_capacity(&empty, &policy, &RoomHostStorage(9), true),
+                0
+            );
+            assert_eq!(
+                advertised_capacity(&catalog(), &policy, &RoomHostStorage(9), true),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn live_admission_counts_other_clones_against_host_storage() {
+        let two = two_reserved_catalog();
+        let second = &two.active()[1];
+        // Room for exactly one clone beside one other: admitted.
+        let mut bridge = idle_bridge();
+        let admission =
+            LiveScaleSetAdmission::new(&mut bridge, &FixedClock, &OccupiedRoomHostStorage(2));
+        let observation = admission.observe(&two, second).unwrap();
+        assert!(observation.capacity_reserved());
+        drop(admission);
+        // No room beside one other: refused.
+        let mut bridge = idle_bridge();
+        let admission =
+            LiveScaleSetAdmission::new(&mut bridge, &FixedClock, &OccupiedRoomHostStorage(1));
+        let error = match admission.observe(&two, second) {
+            Ok(_) => panic!("a clone without storage room beside the others was admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), HOST_STORAGE_UNAVAILABLE_CODE);
+    }
+
+    #[test]
+    fn select_attempt_advances_the_first_attempt_with_work() {
+        let now = EpochMillis::new(1_900_000_000_000).unwrap();
+        let single = catalog();
+        assert_eq!(
+            select_attempt(&single, now).unwrap().unwrap(),
+            &single.active()[0]
+        );
+        // A waiting first attempt does not block a reserved second one.
+        let registered = register_first(two_reserved_catalog());
+        let first = &registered.active()[0];
+        let waiting_then_reserved = registered
+            .replace_attempt(
+                first.attempt().attempt_id(),
+                first.attempt().revision(),
+                crate::disposable_attempt_catalog::DisposableAttemptCatalogAction::RecordRunnerStartStarted,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting_then_reserved.active()[0]
+                .attempt()
+                .attempt_id()
+                .as_str(),
+            "attempt-1"
+        );
+        assert_eq!(
+            operation_for(&waiting_then_reserved.active()[0]).unwrap(),
+            CoordinatorOperation::Wait
+        );
+        assert_eq!(
+            select_attempt(&waiting_then_reserved, now)
+                .unwrap()
+                .unwrap()
+                .attempt()
+                .attempt_id()
+                .as_str(),
+            "attempt-2"
+        );
+        assert!(
+            select_attempt(&DisposableAttemptCatalogDocument::empty(), now)
+                .unwrap()
+                .is_none()
         );
     }
 

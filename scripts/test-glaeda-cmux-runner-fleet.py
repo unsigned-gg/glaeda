@@ -21,7 +21,7 @@ TOOL = ROOT / "scripts" / "glaeda-cmux-runner-fleet"
 # What the tool needs beside itself: the staged files and the labels module. Each test runs a copy from its own
 # git checkout with a local bare origin, so HEAD and origin's main are whatever the test makes them.
 CHECKOUT_FILES = ("glaeda-cmux-runner-fleet", "glaeda-cmux-runner", "glaeda-cmux-runner-hook",
-                  "glaeda_fleet_labels.py", "glaeda_reservation.py")
+                  "glaeda_fleet_labels.py", "glaeda_reservation.py", "glaeda-promotion-admit")
 TOKEN = "AAAREGTOKEN123"
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]},
@@ -40,20 +40,56 @@ FAKE_SSH = """#!{python}
 import json, os, sys, time
 log = os.environ["FAKE_LOG"]
 args = sys.argv[1:]
-while args and args[0] == "-o":
+user = None
+while args and args[0] in ("-o", "-l"):
+    if args[0] == "-l":
+        user = args[1]
     args = args[2:]
 host, remote = args[0], " ".join(args[1:])
 data = sys.stdin.read()
-open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}) + "\\n")
+open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "user": user, "remote": remote, "stdin": data[:40]}}) + "\\n")
+if user and user in os.environ.get("FAKE_USER_DENIED", "").split(","):
+    sys.stderr.write(user + "@" + host + ": Permission denied (publickey).\\n"); sys.exit(255)
 if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
+if remote.startswith("/usr/bin/python3 - ") and "pool-node" in remote:  # POOL_USER: publish_node_view
+    if host in os.environ.get("FAKE_PUBLISH_FAILS", "").split(","):
+        sys.stderr.write("refusing: not a link this step made\\n"); sys.exit(1)
+    print("published /Users/Shared/cmux-build-fleet/pool-node.d/1-2 generation abcdef012345"); sys.exit(0)
+if " disk-shape " in remote:
+    shapes = json.loads(os.environ.get("FAKE_DISK_SHAPE", "{{}}"))
+    if host in shapes:
+        print(json.dumps(shapes[host])); sys.exit(0)
+    sys.stderr.write("disk-shape: no such phase\\n"); sys.exit(2)
 if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
     print("glaeda-cmux-runner-hook: refused: node not eligible (no Glaeda enrollment on this mini)"); sys.exit(1)
+owner = host if not user else user + "@" + host  # each account's own receipts (POOL_USER)
+if "actions-runner-glaeda*" in remote:  # POOL_RECEIPTS: FAKE_RECEIPTS seeds [user@]host=k:k:..., uninstalls remove
+    path = log + ".receipts." + owner
+    if not os.path.exists(path):
+        seeds = dict(x.split("=") for x in os.environ.get("FAKE_RECEIPTS", "").split(",") if x)
+        open(path, "w").write(json.dumps([int(k) for k in seeds.get(owner, "").split(":") if k]))
+    for k in json.load(open(path)):
+        print("receipt " + ("receipt.json" if k == 0 else "instance-%d/receipt.json" % k))
+        print("dir actions-runner-glaeda" + ("" if k == 0 else "-%d" % k))
+    print("end"); sys.exit(0)
+if "--uninstall --apply" in remote:
+    k = int(remote.split("--instance ")[1].split()[0])
+    if host + ":" + str(k) in os.environ.get("FAKE_BUSY", "").split(","):
+        print(json.dumps({{"actions": [{{"kind": "deregister", "state": "failed",
+                                        "note": "the runner has a job (or a listener runs); nothing removed, re-run when idle"}}]}}))
+        sys.exit(1)
+    path = log + ".receipts." + owner
+    if os.path.exists(path):
+        kept = [x for x in json.load(open(path)) if x != k]
+        open(path, "w").write(json.dumps(kept))
+    print(json.dumps({{"actions": [{{"kind": "deregister", "state": "remove", "applied": True}}]}}))
+    sys.exit(0)
 if "--uninstall" in remote and "--apply" not in remote:
     k = remote.split("--instance ")[1].split()[0]
     scopes = dict(x.split("=") for x in os.environ.get("FAKE_SCOPES", "").split(",") if x)
@@ -69,7 +105,7 @@ if "--apply" in remote and "--uninstall" not in remote and host in os.environ.ge
     sys.exit(1)
 if "--apply" in remote:
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
-    k = remote.split("--instance ")[1].split()[0]
+    k = remote.split("--dedicated ")[1].split()[0] if "--dedicated " in remote else remote.split("--instance ")[1].split()[0]
     ok = data.strip() == "{token}"
     print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed",
                                     "name": host + "-glaeda" + ("" if k == "0" else "-" + k)}},
@@ -90,11 +126,23 @@ if dest.endswith("mini-fleet.json"):
 """
 FAKE_GH = """#!{python}
 import json, os, sys
-open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:]}}) + "\\n")
+open(os.environ["FAKE_LOG"], "a").write(json.dumps({{"tool": "gh", "argv": sys.argv[1:],
+                                                     "gh_token": os.environ.get("GH_TOKEN", "")}}) + "\\n")
 path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
 if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
     groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
     print(json.dumps({{"runner_groups": groups}}))
+elif path == "repos/actions/runner/releases/latest":
+    if os.environ.get("FAKE_NO_RELEASE"):
+        sys.exit(1)
+    print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
+                      "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
+                                  "browser_download_url": "https://example.invalid/x"}}]}}))
+elif path.endswith("/actions/runners?per_page=100"):  # the operator's one list of a scope's runners; FAKE_NO_RUNNERS: none
+    hosts = ("mini-a", "mini-b", "mini-light")
+    names = [h + "-glaeda" + s for h in hosts for s in [""] + ["-" + str(k) for k in range(1, 16)] + ["-nightly-next"]]
+    for name in [] if os.environ.get("FAKE_NO_RUNNERS") else names:  # gh --jq prints one tojson line per runner
+        print(json.dumps([name, ["self-hosted", "glaeda-mini"]]))
 elif "/repositories" in path:
     print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
 elif path.startswith("repos/") and path.count("/") == 2:
@@ -104,7 +152,22 @@ elif path.startswith("orgs/") and path.endswith("registration-token") and os.env
 else:
     print("{token}")
 """
+def load_labels_module():
+    spec = importlib.util.spec_from_file_location("glaeda_fleet_labels_t", ROOT / "scripts" / "glaeda_fleet_labels.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 GROUP = json.dumps([{"id": 7, "name": "glaeda-minis", "visibility": "selected", "allows_public_repositories": True}])
+
+
+def load_runner_module():
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_pins", os.fspath(ROOT / "scripts" / "glaeda-cmux-runner"))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_pins", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 class FleetTest(unittest.TestCase):
@@ -137,17 +200,20 @@ class FleetTest(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.tool = self.repo / "scripts" / "glaeda-cmux-runner-fleet"
 
-    def git(self, *args: str, cwd: Path | None = None) -> str:
+    def git(self, *args: str, cwd: Path | None = None, **env: str) -> str:
         return subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
                                "-c", "commit.gpgsign=false", "-C", os.fspath(cwd or self.repo), *args],
                               capture_output=True, text=True, check=True, timeout=60,
-                              env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1"},
+                              env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                                   **env},
                               ).stdout.strip()
 
-    def commit(self, name: str) -> str:
+    def commit(self, name: str, ago: int | None = None) -> str:
+        """A commit; ago: committed that many seconds ago."""
         (self.repo / f"{name}.txt").write_text(name + "\n")
         self.git("add", "-A")
-        self.git("commit", "-q", "-m", name)
+        when = {} if ago is None else {"GIT_COMMITTER_DATE": f"@{int(time.time()) - ago} +0000"}
+        self.git("commit", "-q", "-m", name, **when)
         return self.git("rev-parse", "HEAD")
 
     @staticmethod
@@ -161,6 +227,31 @@ class FleetTest(unittest.TestCase):
         return subprocess.run([sys.executable, os.fspath(self.tool), "--manifest", os.fspath(self.manifest),
                                "--output", "json", *args], capture_output=True, text=True, timeout=120,
                               env={**self.env, **env}, check=False)
+
+    def test_runner_calls_go_on_the_fleet_app_not_the_login(self) -> None:
+        """A direct --apply mints the fleet runner App's token (fleet_app_token.py) for the runner reads and mints,
+        so they stop spending the operator's gh login; other calls, a caller's GH_TOKEN and a host with no App
+        (exit 3) keep the login."""
+        tool = self.dir / "fleet_app_token.py"
+        tool.write_text("import os, sys\n"
+                        "open(os.environ['FAKE_LOG'] + '.mints', 'a').write(sys.argv[2] + '\\n')\n"
+                        "sys.exit(int(os.environ.get('FAKE_APP_RC', '0')) or print('ghs_apptoken' + sys.argv[2]))\n")
+        result = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        gh = [c for c in self.calls() if c["tool"] == "gh"]
+        runner_calls = [c for c in gh if any("actions/runners" in a for a in c["argv"])]
+        self.assertTrue(runner_calls)
+        self.assertTrue(all(c["gh_token"] == "ghs_apptokenrepo" for c in runner_calls), runner_calls)
+        release = [c for c in gh if "repos/actions/runner/releases/latest" in c["argv"]]
+        self.assertEqual([c["gh_token"] for c in release], [""], "the release read keeps the login")
+        self.assertEqual((self.dir / "calls.jsonl.mints").read_text().split(), ["repo"], "one mint per scope")
+        self.log.unlink()
+        self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), GH_TOKEN="ghs_caller")
+        self.assertTrue(all(c["gh_token"] == "ghs_caller" for c in self.calls() if c["tool"] == "gh"))
+        self.log.unlink()
+        none = self.fleet("--apply", FLEET_APP_TOKEN_TOOL=os.fspath(tool), FAKE_APP_RC="3")
+        self.assertEqual(none.returncode, 0, none.stdout + none.stderr)
+        self.assertTrue(all(c["gh_token"] == "" for c in self.calls() if c["tool"] == "gh"))
 
     def calls(self) -> list[dict]:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -181,6 +272,29 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(all(c["stdin"].startswith("#!/usr/bin/env python3") for c in checks), "hook sent on stdin")
         self.assertTrue(all("--fleet-class m4pro-48" in c["remote"] or "m4-16" in c["remote"] for c in checks))
 
+    def test_plan_prints_the_listener_count_with_its_disk_term(self) -> None:
+        """LISTENER_DISK: the plan reads each member's disk-shape and sizes the listeners by it too."""
+        shape = {"schema": "glaeda-disk-shape/v1", "free_gib": 160, "runners_gib": 20, "floor_gib": 0,
+                 "per_runner_gib": 15, "per_runner_source": "job log p90 of 3051 jobs", "runner_dirs": {},
+                 "listeners_by_disk": 12}
+        shapes = json.dumps({"mini-a": shape, "mini-b": {**shape, "free_gib": 110}})
+        result = self.fleet(FAKE_DISK_SHAPE=shapes)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        # the member's floor (the manifest's disk.min_free_gib, 100) wins: (160 + 20 - 100) // 15 and (110 + 20 - 100)
+        self.assertEqual((rows["mini-a"]["listeners"], rows["mini-b"]["listeners"]), (5, 2))
+        self.assertGreater(rows["mini-a"]["listenersNoDisk"], 5)
+        self.assertIn("disk-shape exit 2", rows["mini-light"]["diskError"], "an old hook: no disk term, no failure")
+        shapes_sent = [c for c in self.calls() if " disk-shape " in c["remote"]]
+        self.assertTrue(shapes_sent and all("--min-free-gib 100" in c["remote"] for c in shapes_sent))
+        self.assertTrue(all(c["stdin"].startswith("#!/usr/bin/env python3") for c in shapes_sent), "hook on stdin")
+        text = subprocess.run([sys.executable, os.fspath(self.tool), "--manifest", os.fspath(self.manifest)],
+                              capture_output=True, text=True, timeout=120, check=False,
+                              env={**self.env, "FAKE_DISK_SHAPE": shapes})
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("listeners 2 (declared runners exceed it)", text.stdout)
+        self.assertIn("(110 free + 20 in runners' _work - 100 floor) / 15 GiB per runner", text.stdout)
+
     def test_apply_every_instance_in_parallel_with_piped_tokens(self) -> None:
         start = time.monotonic()
         result = self.fleet("--apply", FAKE_APPLY_S="2")
@@ -197,7 +311,27 @@ class FleetTest(unittest.TestCase):
         applies = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertEqual(len(applies), 8)
         self.assertTrue(all(c["stdin"].strip() == TOKEN for c in applies))
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 8, "one token per instance")
+        tokens = [c for c in calls if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
+        self.assertEqual(len(tokens), 1, "one token per scope, shared by every instance")
+        # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
+        releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 3,
+                         "one token, one runner list for the scope and one release read")
+        # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
+        self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
+        reads = [c["argv"] for c in calls if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertEqual(len(reads), 1, "eight instances on one scope read its runners once, not once each")
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners?per_page=100", reads[0])
+        self.assertIn("--paginate", reads[0])
+        unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
+        self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
+        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
+                             if c["tool"] == "ssh"), "a runner GitHub does not list: the mini decides as before")
+        self.assertTrue(all(f"--latest-runner-version 2.401.0 --latest-runner-sha256 {'d' * 64}" in c["remote"]
+                            for c in applies))
+        self.assertEqual(json.loads(result.stdout)["runnerRelease"],
+                         {"version": "2.401.0", "sha256": "d" * 64, "from": "latest"})
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(set(staged["hosts"]), {"mini-a"})
         self.assertEqual(set(staged["defaults"]), {"xcode", "disk", "ios_simulator"},
@@ -208,6 +342,404 @@ class FleetTest(unittest.TestCase):
                                "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
+
+    def test_apply_installs_the_gateway_runners_after_the_pool_instances(self) -> None:
+        """gatewayRunners adds instances after `runners` (glaeda_fleet_labels): the apply installs them too, as
+        instances runners and on, and the plan shows them beside the pool count."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        plan = self.fleet("--hosts", "mini-a", "--output", "human")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        self.assertIn("4 runners/14 units+2gw", plan.stdout)
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual((row["runners"], row["gatewayRunners"]), (4, 2))
+        self.assertEqual([i["instance"] for i in row["instances"]], [0, 1, 2, 3, 4, 5])
+        applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(sorted(int(r.split("--instance ")[1].split()[0]) for r in applies), [0, 1, 2, 3, 4, 5])
+
+    def test_the_small_runners_are_declared_instances_never_surplus(self) -> None:
+        """SMALL_ONLY: smallRunners adds instances after the gateway runners; the plan and the apply count them as
+        declared (member_instance_count), so they are installed and never retired as surplus."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2, "smallRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(9))}
+        plan = self.fleet("--hosts", "mini-a", "--output", "human", **seeds)
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        self.assertIn("4 runners/14 units+2gw+2small", plan.stdout)
+        row = json.loads(self.fleet("--hosts", "mini-a", **seeds).stdout)["members"][0]
+        self.assertEqual(row["smallRunners"], 2)
+        self.assertEqual(row.get("retire"), [8], "only the instance past 0-7 is surplus")
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual([i["instance"] for i in row["instances"] if not i.get("surplus")], list(range(8)))
+        self.assertEqual([i["instance"] for i in row["instances"] if i.get("surplus")], [8])
+
+    def test_a_lowered_count_retires_the_idle_instances_past_it(self) -> None:
+        """#1821: after runners drops (an xl Studio from 10 to 6), the apply re-applies 0..count-1 and retires each
+        pool instance installed at or past the count, deregistering it; a busy one is left and reported, and does
+        not fail the apply."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(10)), "FAKE_BUSY": "mini-a:9"}
+        plan = self.fleet("--hosts", "mini-a", **seeds)
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["retire"], [6, 7, 8, 9])
+        self.assertIn("retire surplus instances [6, 7, 8, 9] when idle", row["action"])
+        self.assertFalse(any("--uninstall --apply" in c.get("remote", "") for c in self.calls()), "plan is read-only")
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["action"], "applied")
+        applied = [i for i in row["instances"] if not i.get("surplus")]
+        self.assertEqual([i["instance"] for i in applied], [0, 1, 2, 3, 4, 5])
+        surplus = {i["instance"]: i for i in row["instances"] if i.get("surplus")}
+        self.assertEqual(sorted(surplus), [6, 7, 8, 9])
+        self.assertEqual([surplus[k]["state"] for k in (6, 7, 8)], ["retired"] * 3)
+        self.assertTrue(surplus[9]["deferred"])
+        self.assertTrue(surplus[9]["state"].startswith("retire when idle"), surplus[9]["state"])
+        uninstalls = [c for c in self.calls() if "--uninstall --apply" in c.get("remote", "")]
+        self.assertEqual(sorted(int(c["remote"].split("--instance ")[1].split()[0]) for c in uninstalls),
+                         [6, 7, 8, 9])
+        self.assertTrue(all(c["stdin"].strip() == TOKEN for c in uninstalls), "remove token piped, never argv")
+        left = json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text())
+        self.assertEqual(left, [0, 1, 2, 3, 4, 5, 9])
+        again = self.fleet("--apply", "--hosts", "mini-a", FAKE_BUSY="")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text()), [0, 1, 2, 3, 4, 5])
+
+    def test_a_failed_declared_apply_keeps_the_surplus_listeners(self) -> None:
+        """SURPLUS_AFTER_DECLARED: a surplus instance is retired only once every declared instance applied. On a light mini
+        (2026-11-16) instances 12 and 13 were the only live listeners and the plan named them for retirement; an apply
+        whose declared instances failed would have retired them and left the mini listening on none."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        seeds = {"FAKE_RECEIPTS": "mini-a=" + ":".join(str(k) for k in range(10)), "FAKE_REGISTER_FAILS": "mini-a"}
+        plan = self.fleet("--hosts", "mini-a", **seeds)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertIn("when idle, once instances 0-5 apply", row["action"])
+        result = self.fleet("--apply", "--hosts", "mini-a", **seeds)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["action"], "failed")
+        self.assertFalse(any("--uninstall --apply" in c.get("remote", "") for c in self.calls()),
+                         "no surplus instance is retired while a declared one failed")
+        kept = [i for i in row["instances"] if i.get("surplus")]
+        self.assertTrue(kept and all(i["deferred"] for i in kept), kept)
+        self.assertIn("kept: instances 0-5 did not all apply", kept[0]["state"])
+        self.assertEqual(json.loads((self.dir / "calls.jsonl.receipts.mini-a").read_text()), list(range(10)))
+
+    def test_an_unregistered_surplus_instance_retires_with_no_token(self) -> None:
+        """A surplus instance with no registration (an interrupted install) is removed without a remove token."""
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_RECEIPTS="mini-a=0:1:2:3:4",
+                            FAKE_SCOPES="mini-a:4=")
+        row = json.loads(result.stdout)["members"][0]
+        surplus = [i for i in row["instances"] if i.get("surplus")]
+        self.assertEqual([i["instance"] for i in surplus], [4])
+        self.assertEqual(surplus[0]["state"], "retired", "an unregistered surplus instance retires with no token")
+
+    def test_apply_installs_a_members_dedicated_runners_on_their_own_scope(self) -> None:
+        """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A member's runner.dedicated runners (a
+        nightly builder's) are applied with the member's instances: one token minted for the entry's own scope, piped
+        on stdin, and --dedicated NAME instead of --instance. An org migration never moves them."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicated": [
+            {"name": "nightly-next", "repo": "manaflow-ai/cmux", "labels": ["glaeda-trusted-next-nightly"],
+             "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit"]}]}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["dedicated"], ["nightly-next"])
+        self.assertEqual(row["instances"][-1], {"dedicated": "nightly-next", "exit": 0, "state": "create/ok",
+                                                "name": "mini-a-glaeda-nightly-next"})
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--dedicated" in c["remote"]]
+        self.assertEqual(len(applies), 1)
+        self.assertIn("--repo manaflow-ai/cmux", applies[0]["remote"])
+        self.assertNotIn("--org", applies[0]["remote"])
+        self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
+        tokens = [c["argv"] for c in self.calls() if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners/registration-token", [a for t in tokens for a in t])
+        lists = [c["argv"] for c in self.calls() if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?per_page=100" in a for a in lists),
+                        "its labels are read from its own scope, so a mini without gh never re-registers it")
+        staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
+        self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
+
+    def test_a_user_entry_is_staged_and_applied_as_its_user_at_its_own_repo(self) -> None:
+        """DEDICATED_USER (cmuxterm-hq#13863): a trusted entry with a user is staged into that account's home and applied
+        over ssh -l USER, at its own repository even under --org (a light pool member's org pools), with the token on
+        stdin. Nothing for it runs as the member's user. When ssh as that user fails, that entry alone fails, typed."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        entry = {"name": "hq-two-mac-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-two-mac-a"], "admit": ["/usr/bin/true"],
+                 "user": "cmuxci-gui-01"}
+        plain = {"name": "nightly-next", "repo": "manaflow-ai/cmux", "labels": ["glaeda-trusted-next-nightly"],
+                 "admit": ["/usr/bin/true"]}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicated": [plain, entry]}}
+        self.manifest.write_text(json.dumps(manifest))
+        plan = self.fleet("--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["dedicatedUsers"], {"hq-two-mac-a": "cmuxci-gui-01"})
+        self.assertFalse([c for c in self.calls() if c["tool"] == "ssh" and c.get("user")], "a plan never ssh's as it")
+        self.log.unlink()
+        result = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        mine = [i for i in row["instances"] if i.get("dedicated") == "hq-two-mac-a"]
+        self.assertEqual(mine[0]["exit"], 0, mine)
+        self.assertEqual(mine[0]["user"], "cmuxci-gui-01")
+        as_user = [c for c in self.calls() if c["tool"] == "ssh" and c.get("user") == "cmuxci-gui-01"]
+        applies = [c for c in as_user if "--dedicated" in c["remote"]]
+        self.assertEqual(len(applies), 1)
+        self.assertIn("--dedicated hq-two-mac-a", applies[0]["remote"])
+        self.assertTrue(applies[0]["remote"].startswith(
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin DEVELOPER_DIR=/Library/Developer/CommandLineTools /usr/bin/python3 "
+            "~/glaeda-runner/scripts/glaeda-cmux-runner "), "a protected interpreter, never Homebrew's")
+        self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
+        self.assertNotIn("--org", applies[0]["remote"])
+        self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
+        self.assertTrue(any("mkdir -p ~/glaeda-runner/scripts" in c["remote"] for c in as_user), "staged as the user")
+        self.assertFalse([c for c in as_user if "glaeda-promotion-admit ~/.local/bin" in c["remote"]
+                          or ".local/bin/glaeda-promotion-admit" in c["remote"]])
+        member_side = [c for c in self.calls() if c["tool"] == "ssh" and not c.get("user")]
+        self.assertFalse([c for c in member_side if "hq-two-mac-a" in c["remote"]], "never applied as the member user")
+        scps = [c["argv"][-1] for c in self.calls() if c["tool"] == "scp"]
+        self.assertIn("cmuxci-gui-01@mini-a:glaeda-runner/mini-fleet.json", scps)
+        # that account has no ssh access yet: its entry fails typed, the member's own entry still applies
+        self.log.unlink()
+        denied = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP, FAKE_USER_DENIED="cmuxci-gui-01")
+        row = json.loads(denied.stdout)["members"][0]
+        mine = [i for i in row["instances"] if i.get("dedicated") == "hq-two-mac-a"][0]
+        self.assertEqual(mine["missing"], "user-ssh")
+        self.assertIn("authorized_keys", mine["state"])
+        self.assertEqual([i for i in row["instances"] if i.get("dedicated") == "nightly-next"][0]["exit"], 0)
+        self.assertFalse([c for c in self.calls() if c["tool"] == "ssh" and "--dedicated hq-two-mac-a" in c["remote"]])
+        self.assertEqual(row["action"], "failed")
+
+    def pool_user_manifest(self, prefix: str | None = None) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        runner = {"poolUser": "cmux-pr-runner", **({"poolPrefix": prefix} if prefix else {})}
+        manifest["hosts"]["mini-a"].update(ssh_user="ec2-user", gui=False, overrides={"runner": runner})
+        self.manifest.write_text(json.dumps(manifest))
+
+    def test_a_pool_user_member_runs_every_pool_step_as_that_account(self) -> None:
+        """POOL_USER (cmuxterm-hq#18007): a member's runner.poolUser runs its pool runners in that non-admin account.
+        The plan's gate runs as it, reading the node view; the apply publishes that view as the member user first,
+        stages the scripts in both homes, installs every instance over ssh -l poolUser on the workload PATH without
+        --headless (no sudo there), and then retires the pool instance the member user still had, while idle."""
+        self.pool_user_manifest()
+        plan = self.fleet("--hosts", "mini-a")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["poolUser"], "cmux-pr-runner")
+        checks = [c for c in self.calls() if c["tool"] == "ssh" and " check " in c["remote"]]
+        self.assertEqual([c["user"] for c in checks], ["cmux-pr-runner"])
+        self.assertIn("GLAEDA_NODE_VIEW=/Users/Shared/cmux-build-fleet/pool-node ", checks[0]["remote"])
+        self.assertFalse([c for c in self.calls() if "pool-node" in c.get("remote", "") and " check " not in c["remote"]],
+                         "a plan publishes nothing")
+        self.log.unlink()
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_RECEIPTS="mini-a=0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        calls = [c for c in self.calls() if c["tool"] == "ssh"]
+        publish = [i for i, c in enumerate(calls) if c["remote"].startswith("/usr/bin/python3 - ")]
+        self.assertEqual(len(publish), 1)
+        self.assertIsNone(calls[publish[0]]["user"], "published as the member user")
+        self.assertIn("m4pro-48 cmux-pr-runner /Users/Shared/cmux-build-fleet/pool-node", calls[publish[0]]["remote"])
+        first_check = next(i for i, c in enumerate(calls) if " check " in c["remote"])
+        self.assertLess(publish[0], first_check, "the view exists before its gate is asked")
+        applies = [c for c in calls if "--apply --token-stdin" in c["remote"] and "--uninstall" not in c["remote"]]
+        self.assertEqual(len(applies), row["runners"])
+        for call in applies:
+            self.assertEqual(call["user"], "cmux-pr-runner")
+            self.assertTrue(call["remote"].startswith(
+                "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin ~/glaeda-runner/scripts/"))
+            self.assertNotIn("--headless", call["remote"])
+        self.assertTrue([c for c in calls if c["user"] == "cmux-pr-runner" and "mkdir -p ~/glaeda-runner" in c["remote"]])
+        self.assertTrue([c for c in calls if c["user"] is None and "mkdir -p ~/glaeda-runner" in c["remote"]])
+        scps = [c["argv"][-1] for c in self.calls() if c["tool"] == "scp"]
+        self.assertIn("cmux-pr-runner@mini-a:glaeda-runner/mini-fleet.json", scps)
+        mine = [i for i in row["instances"] if i.get("instance") is not None and not i.get("ownAccount")]
+        self.assertTrue(mine and all(i.get("user") == "cmux-pr-runner" and i["exit"] == 0 for i in mine), mine)
+        own = [i for i in row["instances"] if i.get("ownAccount")]
+        self.assertEqual([(i["instance"], i["exit"], i["state"]) for i in own], [(0, 0, "retired")])
+        uninstalls = [c for c in calls if "--uninstall --apply" in c["remote"]]
+        self.assertEqual([c["user"] for c in uninstalls], [None], "the old instance is the member user's")
+        self.assertEqual(row["action"], "applied")
+
+    def test_a_pool_user_works_with_and_without_a_pool_prefix(self) -> None:
+        """POOL_USER needs no namespace: a default-namespace member (the plain side-std label) and an aws- one both
+        plan and run their gate as the pool account."""
+        for prefix in (None, "aws-"):
+            with self.subTest(prefix=prefix):
+                self.log.unlink(missing_ok=True)
+                self.pool_user_manifest(prefix)
+                plan = self.fleet("--hosts", "mini-a")
+                self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+                row = json.loads(plan.stdout)["members"][0]
+                self.assertEqual((row["poolUser"], row["action"]), ("cmux-pr-runner", "would apply"))
+                summary, why = load_labels_module().member_labels(json.loads(self.manifest.read_text()), "mini-a",
+                                                                  lambda app: True)
+                self.assertIsNone(why)
+                side = "glaeda-" + (prefix or "") + "side-std-xcode-26.6"
+                self.assertIn(side, summary["sidePools"])
+
+    def test_a_pool_user_without_ssh_access_or_a_view_fails_typed_and_installs_nothing(self) -> None:
+        """POOL_USER: no operator key in the account yet leaves its gate unreachable, so nothing is installed, and a
+        node view that cannot be published fails the member before its gate is asked."""
+        self.pool_user_manifest()
+        denied = self.fleet("--apply", "--hosts", "mini-a", FAKE_USER_DENIED="cmux-pr-runner",
+                            FAKE_ELIGIBLE="mini-a")
+        row = json.loads(denied.stdout)["members"][0]
+        self.assertFalse([c for c in self.calls() if "--apply --token-stdin" in c.get("remote", "")])
+        self.assertNotEqual(row["action"], "applied")
+        self.log.unlink()
+        failed = self.fleet("--apply", "--hosts", "mini-a", FAKE_PUBLISH_FAILS="mini-a")
+        row = json.loads(failed.stdout)["members"][0]
+        self.assertTrue(row["action"].startswith("node view failed:"), row)
+        self.assertFalse([c for c in self.calls() if " check " in c.get("remote", "")])
+
+    def test_pool_user_refusals_in_the_manifest(self) -> None:
+        """POOL_USER: member-level, never root, never the ssh_user or a dedicated entry's user, never dedicatedOnly."""
+        labels = load_labels_module()
+        base = json.loads(json.dumps(MANIFEST))
+        base["hosts"]["mini-a"]["ssh_user"] = "ec2-user"
+        trusted = {"name": "hq-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                   "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-a"], "admit": ["/usr/bin/true"],
+                   "user": "cmux-pr-runner"}
+        cases = {
+            "root": ({"poolUser": "root"}, "never root"),
+            "upper": ({"poolUser": "Bad User"}, "macOS short name"),
+            "ssh_user": ({"poolUser": "ec2-user"}, "own ssh_user"),
+            "dedicated": ({"poolUser": "cmux-pr-runner", "dedicated": [trusted]}, "trusted code only"),
+            "dedicatedOnly": ({"poolUser": "cmux-pr-runner", "dedicatedOnly": True,
+                               "dedicated": [{**trusted, "user": "other-acct"}]}, "dedicatedOnly"),
+        }
+        for name, (runner, why) in cases.items():
+            with self.subTest(name):
+                manifest = json.loads(json.dumps(base))
+                manifest["hosts"]["mini-a"]["overrides"] = {"runner": runner}
+                summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+                self.assertIsNone(summary)
+                self.assertIn(why, got)
+        manifest = json.loads(json.dumps(base))
+        manifest["defaults"]["runner"] = {"poolUser": "cmux-pr-runner"}
+        summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+        self.assertIsNone(summary)
+        self.assertIn("member-level", got)
+        manifest = json.loads(json.dumps(base))
+        summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+        self.assertIsNone(got)
+        self.assertIsNone(summary["poolUser"], "no poolUser: the pool runs as the member user, as before")
+
+    def test_a_repo_dedicated_only_member_needs_no_org_group_but_every_other_member_does(self) -> None:
+        """REPO_DEDICATED_ONLY: a dedicatedOnly member whose only runners are repository-scoped dedicated ones
+        registers nothing in the org group, so the apply neither lists the group (an org-admin read) nor refuses on
+        it. A pool instance still installed there, an org-scoped entry, or any other member keeps the check."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        entry = {"name": "fleet-route", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                 "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-fleet-route"], "admit": ["/usr/bin/true"]}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicatedOnly": True, "dedicated": [entry]}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]")  # no group is visible to this login
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["instances"][-1]["dedicated"], "fleet-route")
+        self.assertFalse([c for c in self.calls()
+                          if c["tool"] == "gh" and any("runner-groups" in a for a in c["argv"])])
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--dedicated" in c["remote"]]
+        self.assertIn("--repo manaflow-ai/other", applies[0]["remote"])
+        # a pool instance still installed there: the apply would retire it, so the group is checked again
+        self.log.unlink()
+        Path(f"{self.log}.receipts.mini-a").unlink(missing_ok=True)
+        refused = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]", FAKE_RECEIPTS="mini-a=0")
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("no runner group named 'glaeda-minis'", refused.stderr)
+        # an org-scoped dedicated entry, and a member with pool runners, keep the check
+        org_entry = {k: v for k, v in entry.items() if k not in ("repo", "trustedRef", "trustedRepo")}
+        manifest["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"] = [{**org_entry, "org": "manaflow-ai"}]
+        self.manifest.write_text(json.dumps(manifest))
+        self.assertIn("no runner group", self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]").stderr)
+        self.assertIn("no runner group", self.fleet("--apply", "--hosts", "mini-b", FAKE_GROUPS="[]").stderr)
+
+    def test_with_no_scope_flags_each_member_registers_where_the_manifest_says(self) -> None:
+        """A re-apply needs no --org/--group: runner.org and runner.group come from the manifest (defaults or a host's
+        overrides), a trusted-only member stays on its repository, and the group is checked before anything changes."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        manifest["hosts"]["mini-b"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                               "trustedRepo": "manaflow-ai/cmux"}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a,mini-b", FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = {r["member"]: r for r in json.loads(result.stdout)["members"]}
+        self.assertEqual((rows["mini-a"]["scope"], rows["mini-b"]["scope"]),
+                         ("manaflow-ai/glaeda-minis", "manaflow-ai/cmux"))
+        registers = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"]
+                            for c in registers if c["host"] == "mini-a"))
+        self.assertTrue(all("--repo manaflow-ai/cmux" in c["remote"] and "--org" not in c["remote"]
+                            for c in registers if c["host"] == "mini-b"))
+        self.assertEqual(len(registers), 8)
+        # a trusted member whose own overrides name the org registers there (a trusted runner in the org's group)
+        self.log.unlink()
+        manifest["hosts"]["mini-b"]["overrides"]["runner"].update({"org": "manaflow-ai", "group": "glaeda-minis"})
+        self.manifest.write_text(json.dumps(manifest))
+        trusted = self.fleet("--apply", "--hosts", "mini-b", FAKE_GROUPS=GROUP)
+        self.assertEqual(trusted.returncode, 0, trusted.stdout + trusted.stderr)
+        self.assertTrue(all("--org manaflow-ai --group glaeda-minis" in c["remote"] for c in self.calls()
+                            if c["tool"] == "ssh" and "--apply" in c["remote"]))
+        # a group the org lacks: nothing changes
+        self.log.unlink()
+        missing = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS="[]")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("no runner group named", missing.stderr)
+        self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+        # flags still win, for every member
+        self.log.unlink()
+        flagged = self.fleet("--apply", "--hosts", "mini-a", "--repo", "manaflow-ai/other")
+        self.assertEqual(flagged.returncode, 0, flagged.stdout + flagged.stderr)
+        self.assertTrue(all("--repo manaflow-ai/other" in c["remote"] for c in self.calls()
+                            if c["tool"] == "ssh" and "--apply" in c["remote"]))
+        # an unusable scope refuses that member and touches nothing on it
+        self.log.unlink()
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"org": "not an org"}}
+        self.manifest.write_text(json.dumps(manifest))
+        bad = self.fleet("--apply", "--hosts", "mini-a", FAKE_GROUPS=GROUP)
+        self.assertIn("bad runner scope", json.loads(bad.stdout)["members"][0]["action"])
+        self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
+        # a malformed trustedRepo never falls back to the pools' org scope
+        labels = load_labels_module()
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"trustedRepo": "no-slash"}}
+        scope, why = labels.pool_scope(manifest, "mini-a")
+        self.assertIsNone(scope)
+        self.assertIn("trustedRepo", why)
+        # a null org in the host's own overrides is no org: the trusted member stays on its repository
+        manifest["defaults"]["runner"] = {"org": "manaflow-ai", "group": "glaeda-minis"}
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"trustedRepo": "manaflow-ai/private", "org": None,
+                                                               "group": None}}
+        self.assertEqual(labels.pool_scope(manifest, "mini-a"), ({"repo": "manaflow-ai/private"}, None))
+
+    def test_without_a_manifest_scope_the_default_repository_is_used(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        registers = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertTrue(registers and all("--repo manaflow-ai/cmux" in c["remote"] for c in registers))
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))
@@ -224,8 +756,9 @@ class FleetTest(unittest.TestCase):
         calls = self.calls()
         gh = [c["argv"][3] for c in calls if c["tool"] == "gh" and len(c["argv"]) > 3]
         # mini-b instance 1 already moved and instance 2 has no registration: only 6 deregistrations
-        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 6)
-        self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 8)
+        # one token per scope and kind for the run, however many instances move
+        self.assertEqual(gh.count("repos/manaflow-ai/cmux/actions/runners/remove-token"), 1)
+        self.assertEqual(gh.count("orgs/manaflow-ai/actions/runners/registration-token"), 1)
         ssh = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertNotIn("mini-t", {c["host"] for c in ssh})
         registers = [c for c in ssh if "--uninstall" not in c["remote"]]
@@ -299,6 +832,29 @@ class FleetTest(unittest.TestCase):
         self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
 
 
+    def test_stage_installs_the_promotion_admit_helper(self) -> None:
+        """HQ's promotion lease runs ~/.local/bin/glaeda-promotion-admit: every stage copies it with the runner
+        scripts and installs it there by an atomic rename."""
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        scp = [c for c in calls if c["tool"] == "scp" and any(a.endswith("/glaeda-cmux-runner-hook") for a in c["argv"])]
+        self.assertTrue(scp and any(a.endswith("/glaeda-promotion-admit") for a in scp[0]["argv"]), scp)
+        self.assertTrue(any(a.endswith("/glaeda-capture-admit") for a in scp[0]["argv"]), scp)
+        install = [c["remote"] for c in calls if c["tool"] == "ssh" and "~/.local/bin/glaeda-promotion-admit" in c["remote"]]
+        self.assertEqual(len(install), 1, install)
+        self.assertIn("mv -f ~/.local/bin/.glaeda-promotion-admit.tmp ~/.local/bin/glaeda-promotion-admit", install[0])
+
+    def test_an_unreadable_latest_release_tells_every_instance_the_pin(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_NO_RELEASE="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runner = load_runner_module()
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(len(applies), 4)
+        self.assertTrue(all(f"--latest-runner-version {runner.PINNED_RUNNER_VERSION} "
+                            f"--latest-runner-sha256 {runner.PINNED_RUNNER_SHA256}" in c["remote"] for c in applies))
+        self.assertEqual(json.loads(result.stdout)["runnerRelease"]["from"], "pinned")
+
     def test_a_failure_before_register_names_the_step(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-a", FAKE_LAUNCHCTL_FAILS="mini-a")
         self.assertEqual(result.returncode, 1)
@@ -315,7 +871,7 @@ class FleetTest(unittest.TestCase):
         self.assertFalse(any(c["tool"] == "gh" for c in calls), "no token minted")
 
     def test_apply_from_a_checkout_that_is_not_origin_main_refuses_and_changes_nothing(self) -> None:
-        newer = self.commit("three")
+        newer = self.commit("three", ago=3 * 3600)  # main moved off this checkout hours ago: an old checkout
         self.git("push", "-q", "origin", "main")
         self.git("checkout", "-q", "--detach", self.head)  # an old checkout: origin's main moved on
         result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
@@ -323,6 +879,38 @@ class FleetTest(unittest.TestCase):
         self.assertIn(f"HEAD {self.head} is not origin/main {newer}", result.stderr)
         self.assertIn("--allow-downgrade REASON", result.stderr)
         self.assertIn("nothing changed", result.stderr)
+        self.assert_nothing_changed()
+
+    def test_apply_accepts_a_head_origin_main_moved_past_during_the_run(self) -> None:
+        """MAIN_MOVED: a run that started at origin/main is not refused when main moves on under it (2026-11-22:
+        five runs of cmux11s-13s, ~20 min each with busy-runner retries, all refused at their final apply). The
+        checkout does not have main's new commits: the guard fetches their objects, not a ref."""
+        clone = self.dir / "clone"
+        self.git("clone", "-q", os.fspath(self.origin), os.fspath(clone), cwd=self.dir)
+        self.git("checkout", "-q", "--detach", self.head, cwd=clone)
+        self.commit("three", ago=600)
+        newer = self.commit("four", ago=60)
+        self.git("push", "-q", "origin", "main")
+        self.tool = clone / "scripts" / "glaeda-cmux-runner-fleet"
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        guard = json.loads(result.stdout)["source"]
+        self.assertEqual((guard["head"], guard["originMain"]), (self.head, newer))
+        self.assertEqual(guard["refusals"], [])
+        self.assertEqual(guard["behindMain"]["commits"], 2)
+        self.assertEqual(self.git("rev-parse", "origin/main", cwd=clone), self.head, "no ref was moved")
+        human = self.fleet("--hosts", "mini-a", "--output", "human")
+        self.assertIn("HEAD is on main, accepted", human.stdout)
+
+    def test_apply_still_refuses_a_head_with_local_commits_even_when_fresh(self) -> None:
+        local = self.commit("local only")  # ahead of origin's main: not an ancestor, whatever its age
+        self.git("checkout", "-q", "-b", "other", self.head)
+        self.commit("three", ago=60)
+        self.git("push", "-q", "origin", "other:main")
+        self.git("checkout", "-q", "--detach", local)
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"HEAD {local} is not origin/main", result.stderr)
         self.assert_nothing_changed()
 
     def test_apply_refuses_a_host_whose_stamp_is_not_an_ancestor_of_head(self) -> None:
@@ -491,12 +1079,101 @@ class FleetTest(unittest.TestCase):
         # no git checkout (an OTA release copy, run with --allow-downgrade): the copy's own record is all there is
         self.assertEqual(fleet.stamp_for(None)["source"], "a" * 40)
 
+    def test_a_token_is_minted_once_per_scope_and_kind_and_a_failure_is_not_kept(self) -> None:
+        """A quota shim refused one POST per instance on 29 instances; a run now asks once per scope and kind."""
+        loader = importlib.machinery.SourceFileLoader("fleet_mint_under_test", os.fspath(self.tool))
+        spec = importlib.util.spec_from_loader("fleet_mint_under_test", loader)
+        fleet = importlib.util.module_from_spec(spec)
+        loader.exec_module(fleet)
+        answers = [(1, "", "refused"), (0, TOKEN + "\n", ""), (0, "REMOVE1\n", ""), (0, "FRESH2\n", "")]
+        asked: list[list[str]] = []
+
+        def fake_run(argv, timeout, stdin=None):
+            asked.append(argv)
+            return answers.pop(0)
+
+        clock = [1000.0]
+        with mock.patch.object(fleet, "run", side_effect=fake_run), \
+                mock.patch.object(fleet.time, "monotonic", side_effect=lambda: clock[0]):
+            self.assertIsNone(fleet.mint("orgs/o"), "the refusal comes back as no token")
+            self.assertEqual(fleet.mint("orgs/o"), TOKEN, "and is not kept: the next instance asks again")
+            self.assertEqual([fleet.mint("orgs/o") for _ in range(5)], [TOKEN] * 5)
+            self.assertEqual(fleet.mint("repos/o/r", "remove-token"), "REMOVE1", "another kind is its own token")
+            self.assertEqual(len(asked), 3)
+            clock[0] += fleet.TOKEN_REUSE_S
+            self.assertEqual(fleet.mint("orgs/o"), "FRESH2", "a token near its hour's end is minted again")
+        self.assertEqual(len(asked), 4)
+
     def test_apply_refuses_when_origin_main_cannot_be_read(self) -> None:
         self.git("remote", "set-url", "origin", os.fspath(self.dir / "gone.git"))
         result = self.fleet("--apply")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("cannot read origin's main", result.stderr)
         self.assert_nothing_changed()
+
+
+def load_fleet_module():
+    loader = importlib.machinery.SourceFileLoader("fleet_procs_under_test", os.fspath(TOOL))
+    spec = importlib.util.spec_from_loader("fleet_procs_under_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class ProcessBoundTest(unittest.TestCase):
+    """Every member and instance runs at once, but the children they launch are bounded across the run."""
+
+    def test_children_at_once_never_exceed_the_bound(self) -> None:
+        import threading
+        fleet = load_fleet_module()
+        fleet.set_max_procs(3)
+        lock, live, peak, calls = threading.Lock(), [0], [0], [0]
+
+        def fake_run(argv, **kwargs):
+            with lock:
+                live[0] += 1
+                calls[0] += 1
+                peak[0] = max(peak[0], live[0])
+            time.sleep(0.02)
+            with lock:
+                live[0] -= 1
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        with mock.patch.object(fleet.subprocess, "run", side_effect=fake_run):
+            threads = [threading.Thread(target=fleet.run, args=(["ssh", f"m{i}"], 5)) for i in range(40)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(calls[0], 40)
+        self.assertEqual(peak[0], 3, "the bound holds and is used")
+
+    def test_a_launch_that_hits_emfile_is_retried_once(self) -> None:
+        import errno
+        fleet = load_fleet_module()
+        fleet.set_max_procs(2)
+        emfile = OSError(errno.EMFILE, "Too many open files")
+        ok = subprocess.CompletedProcess(["scp"], 0, "done", "")
+        with mock.patch.object(fleet, "EMFILE_BACKOFF_S", 0), \
+                mock.patch.object(fleet.subprocess, "run", side_effect=[emfile, ok]) as launched:
+            self.assertEqual(fleet.run(["scp", "x"], 5), (0, "done", ""))
+            self.assertEqual(launched.call_count, 2)
+        with mock.patch.object(fleet, "EMFILE_BACKOFF_S", 0), \
+                mock.patch.object(fleet.subprocess, "run", side_effect=[emfile, emfile, ok]) as launched:
+            code, _, err = fleet.run(["scp", "x"], 5)
+            self.assertEqual((code, launched.call_count), (127, 2), "one retry, then a failure as before")
+            self.assertIn("Too many open files", err)
+        with mock.patch.object(fleet.subprocess, "run", side_effect=FileNotFoundError(errno.ENOENT, "no ssh")) as launched:
+            self.assertEqual(fleet.run(["ssh"], 5)[0], 127)
+            self.assertEqual(launched.call_count, 1, "other launch errors are not retried")
+
+    def test_the_bound_follows_the_open_file_limit_and_the_override(self) -> None:
+        fleet = load_fleet_module()
+        self.assertEqual(fleet.max_procs(256), 32)
+        self.assertEqual(fleet.max_procs(16), 4)
+        self.assertEqual(fleet.max_procs(1_000_000), 128)
+        self.assertEqual(fleet.max_procs(256, 7), 7)
+        self.assertGreaterEqual(fleet.raise_nofile(), 1)
 
 
 if __name__ == "__main__":

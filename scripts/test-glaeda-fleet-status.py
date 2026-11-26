@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -117,6 +118,37 @@ class JoinTests(unittest.TestCase):
         [f] = by_id(doc, "controller.stale@mini-a")
         self.assertEqual((f["severity"], f["action"]["who"]), ("error", "person"))
         self.assertEqual(next(m for m in doc["members"] if m["name"] == "mini-a")["status"], "broken")
+
+    def test_live_controller_reports_missing_host_lock_with_lawrence_repair_route(self):
+        doc = build(controller=src({"workers": {
+            "mini-a": {
+                "healthy": True,
+                "online": True,
+                "claim_paused": "host_lock",
+                "host_bin": {"current": ["disk-pressure.sh"],
+                             "refused": {"with-host-lock": "absent"}},
+            },
+        }}))
+        [finding] = by_id(doc, "controller.host_lock_tool_missing@mini-a")
+        self.assertEqual(finding["severity"], "error")
+        self.assertEqual(finding["action"]["id"], "repair_host_lock_tool")
+        self.assertIn("cmux-lawrence", finding["summary"])
+        self.assertIn("Tailscale", finding["summary"])
+
+    def test_live_controller_runner_job_is_not_misreported_as_host_failure(self):
+        doc = build(controller=src({"workers": {
+            "mini-a": {
+                "healthy": True,
+                "online": True,
+                "claim_paused": "runner_job",
+                "running": [],
+            },
+        }}))
+        [finding] = by_id(doc, "controller.runner_job@mini-a")
+        self.assertEqual(finding["severity"], "warn")
+        self.assertIn("Runner.Worker", finding["summary"])
+        self.assertEqual(next(m for m in doc["members"] if m["name"] == "mini-a")["controller"]["controller_route"],
+                         "cmux-lawrence")
 
     def test_runner_suffix_names_map_to_members_and_offline_is_an_error(self):
         doc = build(runners=src({"runners": [
@@ -387,6 +419,12 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("never_touch", f["action"]["note"])
         self.assertTrue(next(m for m in doc["members"] if m["name"] == "coordinator")["never_touch"])
 
+    def test_a_dotted_installation_token_is_redacted_whole(self):
+        """GitHub's installation tokens now carry "." and "-" (about 383 characters): none of it may stay."""
+        token = "ghs_" + ".".join(["A1b-C_d" * 9] * 5) + "-x" * 30
+        self.assertEqual(len(token), 383)
+        self.assertEqual(fs.clean(f"mint gave {token} here", limit=1000), "mint gave [redacted] here")
+
     def test_secrets_and_home_paths_never_reach_the_document(self):
         doc = build(check=src({"issues": [{"host": "mini-a", "area": "worker",
                                            "detail": "token=abc123 ghp_" + "x" * 30 + " in /Users/alice/secret",
@@ -417,6 +455,58 @@ class SafetyTests(unittest.TestCase):
         self.assertLessEqual(len(fs.canonical(doc)), fs.MAX_DOCUMENT_BYTES)
         self.assertTrue(all(len(f["summary"]) <= fs.MAX_TEXT for f in doc["findings"]))
         self.assertLessEqual(len(next(m for m in doc["members"] if m["name"] == "mini-a")["lima"]["orphans"]), 16)
+
+    def test_live_builder_valid_status_is_joined_to_explicit_profile(self):
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA,
+            "host_id": "mini-a",
+            "host_role": "personal-live-builder",
+            "profile": "personal-dev-builder",
+            "health": {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS},
+            "last": {"event": "build_published", "result": "ok", "reason": "published",
+                     "branch": "feat-cmux-next", "sha": "a" * 40, "tag": "leo-live"},
+        }))
+        member = next(m for m in doc["members"] if m["name"] == "mini-a")
+        self.assertEqual(member["live_builder"]["profile"], "personal-dev-builder")
+        self.assertEqual(member["live_builder"]["health"]["verifier"], "pass")
+        self.assertFalse(by_id(doc, "live_builder."))
+
+    def test_live_builder_blocked_health_is_a_warning_without_a_command(self):
+        health = {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS}
+        health["publish_secrets"] = "blocked"
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA, "host_id": "mini-a",
+            "host_role": "personal-live-builder", "profile": "personal-dev-builder",
+            "health": health,
+            "last": {"event": "preflight", "result": "blocked", "reason": "publish_secret_unavailable"},
+        }))
+        [finding] = by_id(doc, "live_builder.publish_secrets@mini-a")
+        self.assertEqual(finding["severity"], "warn")
+        self.assertEqual(finding["action"]["who"], "person")
+        self.assertIsNone(finding["action"]["command"])
+
+    def test_live_builder_missing_and_stale_sources_are_warnings(self):
+        missing = build(live_builder=src(None, error="status file unavailable"))
+        self.assertEqual(missing["sources"]["live_builder"]["state"], "unavailable")
+        self.assertTrue(by_id(missing, "live_builder.unavailable@fleet"))
+        stale = build(live_builder=src({"schema": fs.LIVE_BUILDER_SCHEMA}, at=AT - 5000))
+        self.assertEqual(stale["sources"]["live_builder"]["state"], "stale")
+        self.assertTrue(by_id(stale, "live_builder.stale@fleet"))
+
+    def test_live_builder_output_drops_unknown_private_fields(self):
+        health = {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS}
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA, "host_id": "mini-a",
+            "host_role": "personal-live-builder", "profile": "personal-dev-builder",
+            "health": health,
+            "last": {"event": "pass", "result": "ok", "reason": "ready",
+                     "detail": "token=secret /Users/alice/private"},
+            "secret": "do-not-publish",
+        }))
+        text = json.dumps(doc)
+        self.assertNotIn("do-not-publish", text)
+        self.assertNotIn("alice", text)
+        self.assertNotIn("token=secret", text)
 
     def test_rejects_a_foreign_bundle(self):
         with self.assertRaises(fs.Failure):
@@ -479,6 +569,26 @@ class CollectTests(unittest.TestCase):
     def test_cache_spec_must_be_name_equals_url(self):
         with self.assertRaises(fs.Failure):
             fs.collect_cache(["t5"])
+
+    def test_live_builder_reader_requires_explicit_profile_and_bounded_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status.json"
+            path.write_text(json.dumps({"schema": fs.LIVE_BUILDER_SCHEMA}))
+            missing_profile = fs.collect_live_builder(path, None)
+            self.assertFalse(missing_profile["ok"])
+            self.assertEqual(missing_profile["error"], "live-builder profile is required")
+            path.write_text("x" * (fs.MAX_LIVE_BUILDER_BYTES + 1))
+            got = fs.collect_live_builder(path, "personal-dev-builder")
+            self.assertFalse(got["ok"])
+            self.assertEqual(got["error"], "live-builder status is too large")
+
+    def test_live_builder_reader_rejects_wrong_schema_and_preserves_no_private_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status.json"
+            path.write_text(json.dumps({"schema": "other", "detail": "/Users/alice/private"}))
+            got = fs.collect_live_builder(path, "personal-dev-builder")
+            self.assertFalse(got["ok"])
+            self.assertEqual(got["error"], "live-builder status has an unsupported schema")
 
 
 GIB = 1024**3
@@ -580,6 +690,14 @@ class DiskTests(unittest.TestCase):
         [f] = by_id(build(disk=disk(mini_a=row)), "disk.")
         self.assertEqual((f["code"], f["severity"]), ("unreadable", "info"))
 
+    def test_deferred_disk_report_is_unavailable_instead_of_empty_accounting(self):
+        row = fs.parse_disk('@disk\n{"status":"deferred","complete":false,'
+                            '"reason":"measurement_busy"}\n@now\n1800000000\n', AT)
+        self.assertEqual(row["measurement_status"], "deferred")
+        self.assertEqual(row["error"], "glaeda-disk deferred: measurement_busy")
+        self.assertNotIn("families", row)
+        self.assertNotIn("accounting", row)
+
     def test_parse_reduces_the_probe_to_numbers_without_paths(self):
         report = {"free": 100 * GIB, "total": 460 * GIB, "idle_hours": 24,
                   "filesystems": [{"dev": 1, "mount": "/", "free": 100 * GIB, "total": 460 * GIB, "low": 69 * GIB,
@@ -624,6 +742,24 @@ class DiskTests(unittest.TestCase):
         self.assertEqual(row["gc"]["result"], "ran")  # "not due" is not a gc outcome
         self.assertEqual(row["gc"]["suspect_entries"], 0)  # the count, never the tool's text
         self.assertEqual(row["sizes_at"], 1799999100)
+
+    def test_tmpdir_test_scratch_is_counted_and_a_buildup_warns(self):
+        report = {"schema": "glaeda-disk/v2", "free": 200 * GIB, "total": 460 * GIB,
+                  "filesystems": [{"free": 200 * GIB, "total": 460 * GIB, "low": 69 * GIB}],
+                  "tmp_test_residue": {"entries": 47000, "test_residue": 45000, "idle": 44000, "idle_hours": 12,
+                                       "runner_host": True, "path": "/private/var/folders/x/T"}}
+        row = fs.parse_disk("@disk\n" + json.dumps(report) + "\n@now\n1800000000\n", AT)
+        self.assertEqual(row["tmp_test_residue"], {"entries": 47000, "test_residue": 45000, "idle": 44000})
+        doc = build(disk=disk(mini_a=row, mini_b=disk_row(tmp_test_residue={"entries": 300, "test_residue": 20,
+                                                                            "idle": 3})))
+        [f] = by_id(doc, "disk.tmp_test_residue")
+        self.assertEqual((f["member"], f["severity"]), ("mini-a", "warn"))
+        self.assertIn("44000 test scratch entries", f["summary"])
+        self.assertIn("tmp test scratch 20 (3 idle 12h+)", fs.disk_line(self.member(doc, "mini-b")["disk"], AT))
+        # an older glaeda-disk prints no count: nothing is shown and nothing warns
+        old = build(disk=disk(mini_a=disk_row()))
+        self.assertNotIn("tmp test scratch", fs.disk_line(self.member(old)["disk"], AT))
+        self.assertFalse(by_id(old, "disk.tmp_test_residue"))
 
     def test_disk_output_stays_bounded(self):
         families = [{"family": f"f{i}" + "x" * 500, "bytes": i * GIB, "owner": "o" * 5000, "retired": True}
@@ -962,6 +1098,203 @@ class ToolingTests(unittest.TestCase):
         self.assertEqual(got["data"]["origin_main"], self.commits[-1])
         self.assertTrue(fs.parser().parse_args(["--no-tooling"]).no_tooling)
 
+
+
+def heal_stdout(report=None, installed=True, now=AT, loaded=True):
+    body = "" if report is None else json.dumps(report)
+    return (f"{'@installed' if installed else '@missing'}\n{'@loaded' + chr(10) if loaded else ''}@report\n{body}\n"
+            f"@now\n{now}\n")
+
+
+def heal_report(at=AT, **release):
+    iso = fs.daemon_heal().iso
+    rel = {"tag": "r-20261026-aaaaaaaaaaaa", "wants": "r-20261026-aaaaaaaaaaaa", "okAt": iso(at), "error": None,
+           "behindSince": None, "staleAfterS": 3600, **release}
+    return {"schema": "glaeda-daemon-heal/v1", "at": iso(at), "staleAfterS": 360, "hot": [], "release": rel}
+
+
+class DaemonHealTests(unittest.TestCase):
+    """The root daemon-heal per macOS member, judged from its own report by glaeda-daemon-heal's judge."""
+
+    def build_rows(self, **rows):
+        return build(daemon_heal=src({"hosts": rows}))
+
+    def test_missing_stale_and_current_members(self):
+        iso = fs.daemon_heal().iso
+        rows = {
+            "mini-a": fs.parse_daemon_heal(heal_stdout(installed=False), AT),
+            "mini-b": fs.parse_daemon_heal(heal_stdout(heal_report(at=AT - 3 * 3600, behindSince=iso(AT - 7200),
+                                                                   wants="r-20261026-bbbbbbbbbbbb",
+                                                                   error="no release source answered")), AT),
+        }
+        doc = self.build_rows(**rows)
+        self.assertEqual([(f["code"], f["member"]) for f in by_id(doc, "daemon_heal.")],
+                         [("daemon_heal_missing", "mini-a"), ("daemon_heal_stale", "mini-b")])
+        stale = by_id(doc, "daemon_heal.daemon_heal_stale")[0]
+        self.assertIn("not running", stale["summary"], "a report three hours old: the passes stopped")
+        self.assertEqual((stale["action"]["who"], stale["action"]["safe_to_apply"]), ("password", False))
+        current = fs.parse_daemon_heal(heal_stdout(heal_report()), AT)
+        self.assertEqual(current["state"], "current")
+        self.assertEqual(by_id(self.build_rows(**{"mini-a": current}), "daemon_heal."), [])
+        unloaded = fs.parse_daemon_heal(heal_stdout(heal_report(), loaded=False), AT)
+        self.assertEqual((unloaded["state"], unloaded["reinstall"]), ("stale", True))
+        self.assertIn("not loaded", unloaded["why"])
+        behind = fs.parse_daemon_heal(heal_stdout(heal_report(wants="r-20261026-bbbbbbbbbbbb",
+                                                              behindSince=iso(AT - 7200), error="plan pass failed")), AT)
+        self.assertEqual(behind["state"], "stale")
+        self.assertIn("plan pass failed", behind["why"])
+        refused = by_id(self.build_rows(**{"mini-a": behind}), "daemon_heal.daemon_heal_stale")[0]
+        self.assertEqual((refused["action"]["id"], refused["action"]["safe_to_apply"]),
+                         ("read_daemon_heal_report", True), "a reinstall cannot fix a release it refused")
+
+    def test_a_copy_from_before_it_updated_itself_is_stale(self):
+        row = fs.parse_daemon_heal(heal_stdout({"schema": "glaeda-daemon-heal/v1", "at": fs.daemon_heal().iso(AT),
+                                                "hot": [], "healed": []}), AT)
+        self.assertEqual(row["state"], "stale")
+        self.assertIn("one root --install", row["why"])
+        self.assertEqual(fs.parse_daemon_heal(heal_stdout(None), AT)["state"], "stale")
+
+    def test_the_members_clock_judges_and_linux_members_are_skipped(self):
+        skewed = fs.parse_daemon_heal(heal_stdout(heal_report(at=AT - 7200), now=AT - 7200), AT)
+        self.assertEqual(skewed["state"], "current", "the member's own clock, not this machine's")
+        linux = fs.parse_daemon_heal("@not_darwin\n", AT)
+        doc = self.build_rows(**{"mini-a": linux, "mini-b": {"reachable": False, "error": "timeout",
+                                                               "observed_at": AT}})
+        self.assertEqual([f["code"] for f in by_id(doc, "daemon_heal.")], ["probe_failed"])
+        self.assertNotIn("daemon_heal", next(m for m in doc["members"] if m["name"] == "mini-a"))
+
+    def test_output_that_is_not_the_probes_is_a_probe_failure_never_a_verdict(self):
+        good = heal_stdout(heal_report())
+        cases = {
+            "no clock": good.replace(f"@now\n{AT}\n", ""),
+            "clock not seconds": good.replace(f"@now\n{AT}", "@now\nsoon"),
+            "huge clock": good.replace(f"@now\n{AT}", "@now\n" + "9" * 40),
+            "marker twice": good.replace("@report\n", "@report\n@now\n1\n@report\n"),
+            "out of order": good.replace("@installed\n@loaded\n", "@loaded\n@installed\n"),
+            "two report lines": good.replace("@report\n", "@report\n{}\n"),
+            "nested json": heal_stdout().replace("@report\n", "@report\n" + "[" * 60000 + "\n"),
+            "not json": heal_stdout().replace("@report\n", "@report\n{nope\n"),
+            "too long": good + "x" * fs.DAEMON_HEAL_MAX_OUT,
+            "empty": "",
+        }
+        for name, out in cases.items():
+            row = fs.parse_daemon_heal(out, AT)
+            self.assertFalse(row["reachable"], name)
+            self.assertIn("refused", row["error"], name)
+        self.assertEqual(fs.parse_daemon_heal(good, AT)["state"], "current")
+        with mock.patch.object(fs.daemon_heal(), "judge", side_effect=RuntimeError("boom")):
+            self.assertIn("RuntimeError", fs.parse_daemon_heal(good, AT)["error"])
+        self.assertIn(f"/usr/bin/head -c {fs.DAEMON_HEAL_MAX_OUT}", fs.DAEMON_HEAL_SCRIPT, "bounded on the member")
+
+    def test_the_read_only_action_quotes_and_runs_on_the_member(self):
+        iso = fs.daemon_heal().iso
+        row = fs.parse_daemon_heal(heal_stdout(heal_report(wants="r-20261026-bbbbbbbbbbbb",
+                                                           behindSince=iso(AT - 7200), error="x")), AT)
+        action = by_id(self.build_rows(**{"mini-a": row}), "daemon_heal.daemon_heal_stale")[0]["action"]
+        inner = shlex.split(action["command"])[-1]
+        self.assertIn('json.load(open("/Library/Application Support/glaeda/daemon-heal/state/report.json"))', inner)
+        self.assertTrue(action["command"].startswith("ssh "), action["command"])
+        src_text = (Path(fs.__file__).parent / "glaeda-daemon-heal").read_text()
+        self.assertNotIn("import fcntl", src_text, "fleet-status imports it on Linux and on the operator machine")
+
+    def test_probe_is_read_only_skips_never_touch_and_shows_in_text(self):
+        for word in (" rm ", "unlink", "sudo", "bootout", "bootstrap", "kickstart", "--apply", "--install", "> "):
+            self.assertNotIn(word, fs.DAEMON_HEAL_SCRIPT, word)
+        seen = []
+        with mock.patch.object(fs, "daemon_heal_host", side_effect=lambda h, u: seen.append(h) or {"reachable": True}):
+            fs.collect_daemon_heal({"ssh_user": "builder", "never_touch": ["coordinator"]}, ["mini-a", "coordinator"])
+        self.assertEqual(seen, ["mini-a"])
+        doc = self.build_rows(**{"mini-a": fs.parse_daemon_heal(heal_stdout(installed=False), AT)})
+        self.assertIn("root daemon-heal:", fs.render_text(doc))
+        self.assertTrue(fs.parser().parse_args(["--no-daemon-heal"]).no_daemon_heal)
+
+
+
+def declared_bundle(runners, declared=3, never=("coordinator",), truncated=False):
+    """mini-a declares `declared` runners; mini-c is never_touch and declares 2."""
+    hosts = {
+        "mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "mini-a", "node_id": None,
+                   "lima_expected": [], "runners_declared": declared},
+        "mini-c": {"class": "std", "roles": ["ci-runner"], "hostname": "mini-c", "node_id": None,
+                   "lima_expected": [], "runners_declared": 2},
+    }
+    data = {"runners": [{"name": n, "status": "online", "busy": False, "labels": ["self-hosted"]} for n in runners]}
+    if truncated:
+        data["truncated"] = True
+    sources = {"manifest": src({"fleet": "test", "hosts": hosts, "never_touch": [*never, "mini-c"]}),
+               "runners": src(data)}
+    return fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": sources}, at=AT)
+
+
+class DeclaredRunnerTests(unittest.TestCase):
+    """Each declared runner instance is judged by name (2026-10-24: deleted registrations on hosts that kept others)."""
+
+    def test_runner_names_follow_the_installer(self):
+        self.assertEqual(fs.runner_names("mini-a", 3), ["mini-a-glaeda", "mini-a-glaeda-1", "mini-a-glaeda-2"])
+
+    def test_a_host_with_some_runners_still_reports_each_missing_instance(self):
+        doc = declared_bundle(["mini-a-glaeda", "Mini-A-glaeda-2"])
+        [f] = by_id(doc, "runners.missing@mini-a")
+        self.assertEqual(f["severity"], "error")
+        self.assertIn("1 of 3", f["summary"])
+        self.assertIn("mini-a-glaeda-1", f["summary"])
+        member = next(m for m in doc["members"] if m["name"] == "mini-a")
+        self.assertEqual(member["runners_missing"], ["mini-a-glaeda-1"])
+
+    def test_one_finding_lists_every_missing_instance(self):
+        doc = declared_bundle([])
+        [f] = by_id(doc, "runners.missing@mini-a")
+        self.assertIn("3 of 3", f["summary"])
+        for name in ("mini-a-glaeda,", "mini-a-glaeda-1", "mini-a-glaeda-2"):
+            self.assertIn(name, f["summary"])
+
+    def test_an_instance_registered_under_the_hostname_counts(self):
+        doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "MINI-A.local-glaeda-2"])
+        self.assertTrue(by_id(doc, "runners.missing@mini-a"), "a .local name is not the hostname alias")
+        hosts = {"mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "studio-a.example.com",
+                            "node_id": None, "lima_expected": [], "runners_declared": 3}}
+        data = {"runners": [{"name": n, "status": "online", "busy": False, "labels": []}
+                            for n in ("mini-a-glaeda", "studio-a.example.com-glaeda-1", "studio-a-glaeda-2")]}
+        doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
+            "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
+        self.assertFalse(by_id(doc, "runners.missing"))
+        hosts["mini-a"]["hostname"] = "studio_a.example.com"  # glaeda-cmux-runner's default_name: studio-a-glaeda
+        data["runners"] = [{"name": n, "status": "online", "busy": False, "labels": []}
+                           for n in ("mini-a-glaeda", "studio-a-glaeda-1", "mini-a-glaeda-2")]
+        doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
+            "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
+        self.assertFalse(by_id(doc, "runners.missing"))
+
+    def test_every_declared_instance_registered_is_not_a_finding(self):
+        doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "mini-a-glaeda-2", "mini-a-glaeda-7"])
+        self.assertFalse(by_id(doc, "runners.missing"))
+
+    def test_truncated_list_and_never_touch_are_not_judged(self):
+        self.assertFalse(by_id(declared_bundle([], truncated=True), "runners.missing"))
+        self.assertFalse(by_id(declared_bundle(["mini-a-glaeda"]), "runners.missing@mini-c"))
+
+    def test_manifest_source_carries_the_declared_count_from_fleet_labels(self):
+        host = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4-test",
+                "hostname": "mini-a"}
+        manifest = {"fleet": "test", "defaults": {}, "never_touch": [],
+                    "hosts": {"mini-a": host,
+                              "mini-b": {**host, "overrides": {"runner": {"classes": {"std": {"runners": 6}}}}},
+                              "mini-c": {**host, "overrides": {"runner": {"classes": {"std": {
+                                  "runners": 6, "gatewayRunners": 2}}}}},
+                              "mini-e": {**host, "overrides": {"runner": {"classes": {"std": {
+                                  "runners": 6, "smallRunners": 2}}}}},
+                              "mini-d": {**host, "roles": ["dev-builds"]}}}
+        hosts = fs.manifest_source(manifest)["data"]["hosts"]
+        self.assertEqual(hosts["mini-a"]["runners_declared"], 4)  # the std class default
+        self.assertEqual(hosts["mini-b"]["runners_declared"], 6)
+        self.assertEqual(hosts["mini-c"]["runners_declared"], 8, "the gateway runners come after the pool instances")
+        self.assertEqual(hosts["mini-e"]["runners_declared"], 8, "a missing small runner is a missing instance")
+        self.assertNotIn("runners_declared", hosts["mini-d"])
+
+    def test_an_unknown_declared_count_keeps_the_zero_runner_check(self):
+        doc = build(runners=src({"runners": [{"name": "mini-a-ci2", "status": "online", "busy": False,
+                                              "labels": []}]}))
+        self.assertFalse(by_id(doc, "runners.missing@mini-a"))
 
 if __name__ == "__main__":
     unittest.main()

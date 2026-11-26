@@ -32,8 +32,8 @@ SCHEMA = "glaeda-macos-desktop-vm/v1"
 DEFAULT_VM = "glaeda-desktop"
 DEFAULT_CAPACITY_DIR = "/Users/Shared/cmux-build-fleet/capacity"
 DEFAULT_MIN_FREE_GIB = 120.0
-CPU_PAUSE_PCT = 85.0
-CPU_RESUME_PCT = 70.0
+CPU_PAUSE_PCT = 95.0  # 2026-11-19 (Leo: "wary at >95%"): was 85
+CPU_RESUME_PCT = 90.0  # was 70
 MEMORY_PRESSURE_HOLD = 2
 
 

@@ -3,13 +3,18 @@
 
     glaeda-cmux-runner-fleet                        plan: which members are eligible and how many runners each gets
     glaeda-cmux-runner-fleet --apply                stage the scripts and apply every instance on every eligible member
-    glaeda-cmux-runner-fleet --apply --hosts a,b    only these members
+    glaeda-cmux-runner-fleet --apply --hosts a,b    only these members, each on the manifest's runner.org/group
     glaeda-cmux-runner-fleet --apply --include-ineligible --skip-launchctl
                                                     install on members that do not pass the gate yet, left stopped
     glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --migrate-from-repo manaflow-ai/cmux
                                                     move every member from repo to org scope, one member at a time
     glaeda-cmux-runner-fleet --apply --hosts a --allow-downgrade "roll back #1384"
                                                     deploy although the guard below refuses, with the reason recorded
+
+Scope. With no --org or --repo, each member's pool instances register where the manifest says: runner.org and
+runner.group (defaults, or the host's overrides; a trusted-only member stays on runner.trustedRepo), or
+manaflow-ai/cmux when the manifest names neither. So a re-apply keeps the scope the pools have, with no flags.
+--org/--group or --repo, when passed, apply to every chosen member instead.
 
 Org scope (--org, --group) lets every repository the runner group allows use the pools; the hook then admits
 any repository of that org and costs other repositories as guests (glaeda-cmux-runner-hook job_class). A member
@@ -30,10 +35,17 @@ its hook and their two modules into ~/glaeda-runner/scripts, with a .glaeda-sour
 commit and its date (glaeda-cmux-runner blocks a copy older than the mini's OTA release; glaeda-update
 refreshes one), and a manifest trimmed to that member (its own
 entry and the xcode, disk and runner defaults: never other hosts, keys or people), mints one registration token
-per instance here and pipes it over SSH (never an argv or a file), and applies --instance K for every K.
+per scope here (reused for its hour) and pipes it over SSH (never an argv or a file), and applies --instance K
+for every K.
 The gate checks the manifest's first Xcode for the member; if that app is missing there, the member reads as
 not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
 fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
+
+Runner release. The minis share one public IP, so they must not each ask GitHub's unauthenticated API for the
+latest actions/runner. The first instance that applies reads "latest" here, once per run, through this
+machine's gh, and every instance gets it as --latest-runner-version/--latest-runner-sha256 (the pinned
+fallback in glaeda-cmux-runner when the read fails). A mini uses it only when it has no version to reuse: one an
+instance there already runs, or a tarball in its runner cache (glaeda-cmux-runner resolve_release).
 
 Downgrade guard. Before anything is staged, the run compares this checkout's HEAD with origin's main as origin
 reports it now (git ls-remote: nothing is fetched or written here, and an old checkout's own stale origin/main
@@ -56,22 +68,32 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import functools
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import resource
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
+STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
+          "glaeda-promotion-admit", "glaeda-capture-admit", "glaeda-nightly-only-admit",
+          "glaeda-job-needs.json",  # the hook's measured job needs (CAPACITY_ARITHMETIC in glaeda-cmux-runner-hook)
+          "glaeda-runner-job-disk.json")  # one runner job's measured disk (RUNNER_JOBS_DISK in the hook)
+# HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh: every stage installs the staged copy
+# there (a temp file renamed into place, so a running request never reads a half-written file)
+PROMOTION_ADMIT = "glaeda-promotion-admit"
 REMOTE_DIR = "glaeda-runner"
 SOURCE_STAMP = ".glaeda-source.json"  # glaeda-cmux-runner script_source reads it
 DEFAULT_REPO = "manaflow-ai/cmux"
@@ -85,6 +107,8 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 STAMP_READ = f"head -c 4096 ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP} 2>/dev/null || echo @no-stamp"  # read-only
 MAX_REASON = 200
+# MAIN_MOVED: how long after origin's main moves past HEAD an apply from HEAD is still accepted (see main_moved)
+MAIN_GRACE_S = 2 * 3600
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -93,19 +117,139 @@ def load_labels() -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
 
+@functools.cache
+def load_runner() -> Any:
+    """glaeda-cmux-runner beside this script, as a module: its release parsing and pinned fallback."""
+    path = SCRIPT_DIR / "glaeda-cmux-runner"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_for_fleet", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_for_fleet", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
+    loader.exec_module(module)
+    return module
+
+
+# Members and their instances run at once, so a big rollout would start hundreds of ssh and scp children together,
+# each holding pipes. One semaphore bounds the children across the whole run, sized from the open-file limit, so an
+# operator Mac with a low limit does not fail launches with EMFILE (2026-11-01: "[Errno 24] Too many open files").
+MAX_PROCS_ENV = "GLAEDA_FLEET_MAX_PROCS"
+MAX_PROCS_RANGE = (4, 128)
+NOFILE_TARGET = 10240  # macOS refuses a soft limit above OPEN_MAX even when the hard limit is unlimited
+EMFILE_BACKOFF_S = 2.0
+_PROCS: threading.BoundedSemaphore | None = None
+
+
+def raise_nofile() -> int:
+    """Raise the soft open-file limit toward the hard one; return the soft limit in force."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = NOFILE_TARGET if hard == resource.RLIM_INFINITY else min(hard, NOFILE_TARGET)
+    if soft != resource.RLIM_INFINITY and soft < want:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            soft = want
+        except (OSError, ValueError):
+            pass
+    return NOFILE_TARGET if soft == resource.RLIM_INFINITY else soft
+
+
+def max_procs(nofile: int, override: int | None = None) -> int:
+    """Children at once: an explicit override, else an eighth of the open-file limit, clamped."""
+    if override is not None:
+        return max(1, override)
+    low, high = MAX_PROCS_RANGE
+    return max(low, min(high, nofile // 8))
+
+
+def set_max_procs(limit: int) -> None:
+    global _PROCS
+    _PROCS = threading.BoundedSemaphore(max(1, limit))
+
+
+# The runner reads and mints go out as the fleet's runner App (manaflow-glaeda-route, minted by cmuxterm-hq's
+# build-fleet/mini-ops/fleet_app_token.py), not the operator's gh login. runner-apply.sh already does this, but a
+# direct `--apply` fell back to the login: on the operator's Mac they were the login's largest caller and it hit
+# GitHub's rate limit. Only the runner paths on the App's installation take the token: anything else, a GH_TOKEN
+# the caller set, or a host with no App (exit 3) keeps gh's own login as before. Tokens live an hour.
+APP_TOKEN_REUSE_S = 50 * 60
+APP_SCOPES = (("orgs/manaflow-ai/actions/runner", "org"), ("repos/manaflow-ai/cmux/actions/runners", "repo"))
+_APP_TOKENS: dict[str, tuple[str | None, float]] = {}
+_APP_LOCK = threading.Lock()
+_APP_SAID: list[str] = []
+
+
+def app_token_tool() -> Path | None:
+    candidates = [os.environ.get("FLEET_APP_TOKEN_TOOL", "")]
+    if os.environ.get("MINI_OPS_DIR"):
+        candidates.append(os.path.join(os.environ["MINI_OPS_DIR"], "fleet_app_token.py"))
+    candidates += [os.path.expanduser(f"~/{root}/build-fleet/mini-ops/fleet_app_token.py")
+                   for root in ("Projects/cmuxterm-hq", "src/cmuxterm-hq", "cmuxterm-hq")]
+    return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
+
+
+def app_scope(argv: list[str]) -> str | None:
+    """The fleet_app_token scope a gh call takes, or None to keep gh's own login."""
+    if not argv or argv[0] != "gh" or os.environ.get("GH_TOKEN"):
+        return None
+    path = next((a for a in argv[2:] if "/" in a and not a.startswith("-")), "")
+    return next((scope for prefix, scope in APP_SCOPES if path.startswith(prefix)), None)
+
+
+def app_token(scope: str) -> str | None:
+    with _APP_LOCK:  # one mint per scope in flight; a host with no App is learned once per run
+        cached = _APP_TOKENS.get(scope)
+        if cached and (cached[0] is None or time.monotonic() - cached[1] < APP_TOKEN_REUSE_S):
+            return cached[0]
+        tool = app_token_tool()
+        if tool is None:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        try:
+            out = subprocess.run(["/usr/bin/env", "python3", os.fspath(tool), "token", scope], capture_output=True,
+                                 text=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None  # not cached: the next call asks again, this one keeps the login
+        token = out.stdout.strip()
+        if out.returncode == 3:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        if out.returncode != 0 or not TOKEN_RE.fullmatch(token):
+            return None
+        _APP_TOKENS[scope] = (token, time.monotonic())
+        if scope not in _APP_SAID:
+            _APP_SAID.append(scope)
+            print(f"github: the fleet's runner App ({scope} scope) for runner calls", file=sys.stderr)
+        return token
+
+
+def _launch(argv: list[str], timeout: float, stdin: str | None) -> subprocess.CompletedProcess:
+    if _PROCS is None:
+        set_max_procs(max_procs(raise_nofile()))
+    scope = app_scope(argv)
+    token = app_token(scope) if scope else None
+    env = {**os.environ, "GH_TOKEN": token} if token else None
+    with _PROCS:  # type: ignore[union-attr]
+        return subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
+                              timeout=timeout, check=False, env=env)
+
+
 def run(argv: list[str], timeout: float, stdin: str | None = None) -> tuple[int, str, str]:
-    try:
-        out = subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
-                             timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout:g}s"
-    except OSError as error:
-        return 127, "", str(error)
-    return out.returncode, out.stdout, out.stderr
+    for attempt in (0, 1):
+        try:
+            out = _launch(argv, timeout, stdin)
+        except subprocess.TimeoutExpired:
+            return 124, "", f"timed out after {timeout:g}s"
+        except OSError as error:
+            if attempt == 0 and error.errno in (errno.EMFILE, errno.ENFILE):
+                time.sleep(EMFILE_BACKOFF_S)  # the launch never started; another child's pipes free up meanwhile
+                continue
+            return 127, "", str(error)
+        return out.returncode, out.stdout, out.stderr
+    raise AssertionError("unreachable")
 
 
 def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
@@ -129,8 +273,13 @@ def members(manifest: dict[str, Any], labels: Any, only: list[str] | None,
 
 def trimmed(manifest: dict[str, Any], member: str) -> dict[str, Any]:
     defaults = manifest.get("defaults") if isinstance(manifest.get("defaults"), dict) else {}
-    return {"defaults": {k: defaults[k] for k in TRIMMED_DEFAULTS if k in defaults},
-            "hosts": {member: manifest["hosts"][member]}}
+    out = {"defaults": {k: defaults[k] for k in TRIMMED_DEFAULTS if k in defaults},
+           "hosts": {member: manifest["hosts"][member]}}
+    if isinstance(manifest.get("ssh_user"), str):
+        # DEDICATED_USER: the member's own user, so glaeda-cmux-runner on the mini refuses a user entry run as anyone
+        # else and an entry without a user run by another account
+        out["ssh_user"] = manifest["ssh_user"]
+    return out
 
 
 def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
@@ -139,13 +288,47 @@ def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
     argv = ["python3", "-", "check", "--fleet-class", summary["hardware"]]
     if summary.get("xcodeApps"):
         argv += ["--toolchain-xcode", summary["xcodeApps"][0]]
-    remote = f"PATH={WORKLOAD_PATH} /usr/bin/" + " ".join(_quote(a) for a in argv)
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], CHECK_TIMEOUT_S,
+    remote = f"PATH={WORKLOAD_PATH} {node_view_env(summary)}/usr/bin/" + " ".join(_quote(a) for a in argv)
+    code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [err.strip() or f"ssh exited {code}"])[-1]
     if code not in (0, 1) or not line.startswith("glaeda-cmux-runner-hook: "):
         return None, f"unreachable (exit {code}): {(err.strip() or line)[-200:]}"
     return code == 0, line.removeprefix("glaeda-cmux-runner-hook: ")
+
+
+def disk_shape(member: str, summary: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """LISTENER_DISK: the member's `glaeda-cmux-runner-hook disk-shape`, read-only over SSH like check(): (the JSON
+    answer, "") or (None, why)."""
+    floor = summary.get("minFreeGib") or 0
+    remote = f"PATH={WORKLOAD_PATH} /usr/bin/python3 - disk-shape --min-free-gib {_quote(f'{floor:g}')}"
+    code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
+                         stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
+    line = (out.strip().splitlines() or [""])[-1]
+    try:
+        doc = json.loads(line) if code == 0 else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        return None, f"disk-shape exit {code}: {(err.strip() or line)[-200:]}"
+    return doc, ""
+
+
+def disk_listener_row(row: dict[str, Any], member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """The plan's advisory listener count with its disk term (glaeda_fleet_labels.listener_count): row["listeners"],
+    and row["disk"] (what the host measured) or row["diskError"]."""
+    labels = load_labels()
+    doc, why = disk_shape(member, summary)
+    shape = labels.parse_disk_shape(json.dumps(doc), summary.get("minFreeGib") or 0.0) if doc else None
+    if shape is None:
+        row["diskError"] = why or "disk-shape answered no usable numbers"
+        return
+    row["disk"] = doc
+    row["diskFloorGib"] = shape.floor_gib  # the floor the count used: the member's minFreeGib wins over the host's
+    row["listeners"] = labels.member_listeners(manifest, summary.get("hardware") or "", summary.get("capacityUnits")
+                                               or 0, summary.get("reserveCores") or 0, shape)
+    row["listenersNoDisk"] = labels.member_listeners(manifest, summary.get("hardware") or "",
+                                                     summary.get("capacityUnits") or 0, summary.get("reserveCores") or 0)
 
 
 def _quote(text: str) -> str:
@@ -156,11 +339,109 @@ def scope_api(repo: str | None, org: str | None) -> str:
     return f"orgs/{org}" if org else f"repos/{repo}"
 
 
+_RELEASE_LOCK = threading.Lock()
+_RELEASE: list[tuple[str, str, str]] = []
+
+
+def latest_release() -> tuple[str, str, str]:
+    """(version, osx-arm64 SHA-256, where from): the actions/runner release a mini installs when it has no
+    version of its own to reuse. Read at most once per run, through this operator's logged-in gh (the minis
+    share one public IP, and 60 unauthenticated reads an hour run out across a fleet apply); the pinned
+    fallback in glaeda-cmux-runner when that read fails. Every instance gets the answer on its command line."""
+    with _RELEASE_LOCK:
+        if not _RELEASE:
+            runner = load_runner()  # main() loaded it once already, so this cannot fail here
+            code, out, _ = run(["gh", "api", f"{runner.RUNNER_RELEASE_API}/latest"], 60)
+            try:
+                found = runner.release_from_doc(json.loads(out)) if code == 0 else {"state": "blocked"}
+            except ValueError:
+                found = {"state": "blocked"}
+            if found.get("state") == "ok":
+                _RELEASE.append((found["version"], found["sha256"], "latest"))
+            else:
+                _RELEASE.append((runner.PINNED_RUNNER_VERSION, runner.PINNED_RUNNER_SHA256, "pinned"))
+        return _RELEASE[0]
+
+
+# GitHub's registration and remove tokens last one hour and register or remove any number of runners in that
+# hour, so a run mints each (scope, kind) once and reuses it until shortly before it expires. One POST per
+# instance spent the operator's shared gh quota, and a quota shim that refuses calls under a floor then left
+# every later instance with "no registration token". A failed mint is not cached: the next instance asks again.
+TOKEN_REUSE_S = 50 * 60
+_MINTED: dict[tuple[str, str], tuple[str, float]] = {}
+_MINT_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_MINT_LOCKS_GUARD = threading.Lock()
+
+
 def mint(scope: str, kind: str = "registration-token") -> str | None:
-    # gh's stderr is dropped: it never carries the token, but keep it quiet
-    code, out, _ = run(["gh", "api", "-X", "POST", f"{scope}/actions/runners/{kind}", "--jq", ".token"], 60)
-    token = out.strip()
-    return token if code == 0 and TOKEN_RE.fullmatch(token) else None
+    key = (scope, kind)
+    with _MINT_LOCKS_GUARD:
+        lock = _MINT_LOCKS.setdefault(key, threading.Lock())
+    with lock:  # instances run at once: one mint per key in flight, the rest wait for its answer
+        cached = _MINTED.get(key)
+        if cached and time.monotonic() - cached[1] < TOKEN_REUSE_S:
+            return cached[0]
+        # gh's stderr is dropped: it never carries the token, but keep it quiet
+        code, out, _ = run(["gh", "api", "-X", "POST", f"{scope}/actions/runners/{kind}", "--jq", ".token"], 60)
+        token = out.strip()
+        if code != 0 or not TOKEN_RE.fullmatch(token):
+            _MINTED.pop(key, None)
+            return None
+        _MINTED[key] = (token, time.monotonic())
+        return token
+
+
+# A run reads every runner's labels from one list of its scope, not one `?name=` read per instance: the operator's
+# gh holds the only credential that may read runners (no role App may hold the runner permission), and on
+# cosmic-gray one apply's per-instance reads were ~550 of the login's calls in 4.6 h. The list is kept for the run
+# (LABELS_REUSE_S bounds a long one); a failed read is not cached, so the next instance asks again.
+LABELS_REUSE_S = 5 * 60
+_LISTED: dict[str, tuple[dict[str, str], float]] = {}
+_LIST_LOCKS: dict[str, threading.Lock] = {}
+_LIST_LOCKS_GUARD = threading.Lock()
+
+
+def scope_runner_labels(scope: str) -> dict[str, str] | None:
+    """Runner name -> its labels, sorted and comma-separated, for every runner GitHub lists in `scope`; None when
+    the read fails."""
+    with _LIST_LOCKS_GUARD:
+        lock = _LIST_LOCKS.setdefault(scope, threading.Lock())
+    with lock:  # instances run at once: one list per scope in flight, the rest wait for its answer
+        cached = _LISTED.get(scope)
+        if cached and time.monotonic() - cached[1] < LABELS_REUSE_S:
+            return cached[0]
+        code, out, _ = run(["gh", "api", "--paginate", f"{scope}/actions/runners?per_page=100",
+                            "--jq", ".runners[] | [.name, [.labels[]?.name]] | tojson"], 60)
+        if code != 0:
+            _LISTED.pop(scope, None)
+            return None
+        listed: dict[str, str] = {}
+        try:
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                name, labels = json.loads(line)
+                if isinstance(name, str) and isinstance(labels, list):
+                    found = sorted(str(label) for label in labels if label)
+                    listed[name] = ",".join(label for label in found if "," not in label)
+        except (ValueError, TypeError):
+            _LISTED.pop(scope, None)
+            return None
+        _LISTED[scope] = (listed, time.monotonic())
+        return listed
+
+
+def github_labels(scope: str, name: str) -> str | None:
+    """The labels GitHub lists for runner `name` now, comma-separated, read with this operator's gh; None when the
+    read fails or GitHub lists no such runner (the mini then decides as before). The minis hold no gh login, so
+    without this each apply re-registered every idle runner whatever its labels were."""
+    listed = scope_runner_labels(scope)
+    return listed.get(name) if listed is not None else None
+    for found in runners if isinstance(runners, list) else []:
+        if isinstance(found, dict) and found.get("name") == name:
+            labels = sorted(str(label.get("name")) for label in found.get("labels") or [] if isinstance(label, dict))
+            return ",".join(label for label in labels if label and "," not in label)
+    return None
 
 
 def group_refusal(org: str, group: str, repo: str | None) -> str | None:
@@ -222,9 +503,10 @@ def git(*args: str, timeout: float = 30) -> tuple[int, str, str]:
 
 
 def checkout_source() -> dict[str, Any]:
-    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now. ls-remote
-    fetches nothing and writes nothing here, and a stale local origin/main ref cannot vouch for a stale checkout.
-    refusal is why --apply must not deploy from here, or None."""
+    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now (ls-remote: a
+    stale local origin/main ref cannot vouch for a stale checkout). refusal is why --apply must not deploy from
+    here, or None. MAIN_MOVED: a HEAD origin's main has moved past within MAIN_GRACE_S is accepted (behindMain
+    says by how much), so a run that started at origin/main survives main moving under it; see main_moved."""
     code, out, _ = git("rev-parse", "--verify", "HEAD^{commit}")
     head = out.strip() if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out.strip()) else None
     if head is None:
@@ -236,10 +518,34 @@ def checkout_source() -> dict[str, Any]:
     if main is None:  # git's stderr may name the remote URL: keep it out
         refusal = f"cannot read origin's main (git ls-remote exit {code}), so HEAD {head} cannot be checked"
     elif main != head:
+        moved = main_moved(head, main)
+        if moved is not None:
+            return {"head": head, "originMain": main, "refusal": None, "behindMain": moved}
         refusal = f"HEAD {head} is not origin/main {main}; roll out from a worktree at origin/main"
     else:
         refusal = None
     return {"head": head, "originMain": main, "refusal": refusal}
+
+
+def main_moved(head: str, main: str) -> dict[str, Any] | None:
+    """{commits, seconds}: how far origin's main has moved past HEAD, when HEAD is an ancestor of main and main first
+    moved off it at most MAIN_GRACE_S ago; else None (refused). glaeda's main moves every 10-20 min and a rollout
+    with busy-runner retries runs ~20 min, so a run that checked HEAD == origin/main at its start was refused at
+    its end (2026-11-22, five runs of cmux11s-13s). Not a downgrade: HEAD is on main, and every member's stamp is
+    still checked against HEAD. A HEAD with local commits is not an ancestor of main, and an old checkout's main
+    moved on long ago: both still refused. Fetches main's objects only (--refmap= and --no-write-fetch-head: no ref,
+    no FETCH_HEAD) when this checkout lacks them."""
+    if git("cat-file", "-e", f"{main}^{{commit}}")[0] != 0:
+        git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/main",
+            timeout=120)
+    if git("merge-base", "--is-ancestor", head, main)[0] != 0:  # not an ancestor, or main still unknown here
+        return None
+    code, out, _ = git("log", "--first-parent", "--reverse", "--format=%ct", f"{head}..{main}")
+    stamps = [int(x) for x in out.split() if x.isdigit()] if code == 0 else []
+    if not stamps:
+        return None
+    seconds = max(0, int(time.time()) - stamps[0])  # when main's first commit after HEAD landed
+    return {"commits": len(stamps), "seconds": seconds} if seconds <= MAIN_GRACE_S else None
 
 
 def clean_reason(text: object) -> str:
@@ -353,6 +659,10 @@ def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
 def guard_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     head, main = (guard.get("head") or "unknown")[:12], (guard.get("originMain") or "unknown")[:12]
     lines = [f"source: HEAD {head}, origin/main {main}"]
+    moved = guard.get("behindMain")
+    if moved:  # MAIN_MOVED
+        lines[0] += (f" ({moved['commits']} commit(s) ahead, landed {moved['seconds'] // 60} min ago; HEAD is on main,"
+                     " accepted)")
     for member, row in sorted(guard["hosts"].items()):
         if row["state"] in ("none", "unreadable"):
             what = "no stamp" if row["state"] == "none" else f"unreadable stamp ({row['note']})"
@@ -377,11 +687,59 @@ def refusal_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     return [head, *(f"  {r['text']}" for r in guard["refusals"])]
 
 
+def ssh_argv(member: str, user: str | None = None) -> list[str]:
+    """ssh to the member, as its own user (the operator's ssh config) or, for a runner.dedicated entry with a user
+    (DEDICATED_USER), as that macOS account: -l USER, the same options."""
+    return ["ssh", *SSH_OPTIONS, *(["-l", user] if user else []), member]
+
+
+# POOL_USER (glaeda_fleet_labels, cmuxterm-hq#18007): a member's runner.poolUser is the account its pool runners run as,
+# so every pool step (check, disk-shape, stage, apply, uninstall, retire, the receipt listing) runs over ssh as it;
+# the member user still gets its own stage (promotion-admit, its dedicated runners) and the steps only it can do: the
+# headless preparation (sudo), the node view and the canonical-root link (publish_node_view), and retiring any pool
+# instance it still has itself (an admin account's PR runner must not stay beside the non-admin one).
+_POOL_USERS: dict[str, str] = {}
+_POOL_USERS_LOCK = threading.Lock()
+NODE_VIEW_ENV = "GLAEDA_NODE_VIEW"  # glaeda-cmux-runner-hook NODE_VIEW_ENV
+POOL_NODE_VIEW = "/Users/Shared/cmux-build-fleet/pool-node"  # glaeda-cmux-runner POOL_NODE_VIEW
+
+
+def set_pool_user(member: str, user: str | None) -> None:
+    with _POOL_USERS_LOCK:
+        if user:
+            _POOL_USERS[member] = user
+        else:
+            _POOL_USERS.pop(member, None)
+
+
+def pool_login(member: str) -> str | None:
+    """The account the member's pool runners run as over ssh: its runner.poolUser, or None for its own user."""
+    with _POOL_USERS_LOCK:
+        return _POOL_USERS.get(member)
+
+
+def pool_ssh(member: str, user: str | None = None) -> list[str]:
+    """ssh_argv for a pool step: as `user` when given ("" is the member's own user), else as the member's poolUser."""
+    login = pool_login(member) if user is None else user
+    return ssh_argv(member, login or None)
+
+
+def node_view_env(summary: dict[str, Any]) -> str:
+    """'GLAEDA_NODE_VIEW=... ' for a poolUser member's check (the hook's NODE_VIEW), else ''."""
+    return f"{NODE_VIEW_ENV}={POOL_NODE_VIEW} " if summary.get("poolUser") else ""
+
+
+def scp_target(member: str, path: str, user: str | None = None) -> str:
+    return f"{user}@{member}:{path}" if user else f"{member}:{path}"
+
+
 def stage(member: str, manifest: dict[str, Any], scratch: Path,
-          override: dict[str, Any] | None = None, head: str | None = None) -> str | None:
+          override: dict[str, Any] | None = None, head: str | None = None, user: str | None = None) -> str | None:
     """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None.
     override: the --allow-downgrade reason and the refusals it overrode, recorded in the stamp. head: the commit
-    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us)."""
+    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us). user: a
+    runner.dedicated entry's macOS account (DEDICATED_USER): the copy goes to that account's home, over ssh as it, and
+    HQ's promotion-admit (the member user's) is not installed there."""
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
     files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
@@ -392,22 +750,29 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
         (scratch / member).mkdir(exist_ok=True)
         (scratch / member / SOURCE_STAMP).write_text(json.dumps(stamp, sort_keys=True) + "\n")
         files.append(os.fspath(scratch / member / SOURCE_STAMP))
-    code, _, err = run(["ssh", *SSH_OPTIONS, member, f"mkdir -p ~/{REMOTE_DIR}/scripts"], 60)
+    code, _, err = run([*ssh_argv(member, user), f"mkdir -p ~/{REMOTE_DIR}/scripts"], 60)
     if code != 0:
         return f"ssh: {err.strip()[-200:]}"
     if stamp is None:  # an old stamp would vouch for these new files
-        run(["ssh", *SSH_OPTIONS, member, f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
-    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, f"{member}:{REMOTE_DIR}/scripts/"], 300)
+        run([*ssh_argv(member, user), f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
+    code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, scp_target(member, f"{REMOTE_DIR}/scripts/", user)], 300)
     if code == 0:
         # scp normally preserves executable bits, but an SSH implementation or a mounted
         # home can discard them. The runner copy is ours, so repair the modes explicitly.
-        code, _, err = run(["ssh", *SSH_OPTIONS, member,
-                            f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
-                            f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
-                            f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
-                            f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py"], 60)
+        modes = (f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
+                 f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
+                 f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
+                 f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py "
+                 f"~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT}")
+        if not user:
+            modes += (f" && mkdir -p ~/.local/bin && "
+                      f"cp ~/{REMOTE_DIR}/scripts/{PROMOTION_ADMIT} ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
+                      f"chmod 755 ~/.local/bin/.{PROMOTION_ADMIT}.tmp && "
+                      f"mv -f ~/.local/bin/.{PROMOTION_ADMIT}.tmp ~/.local/bin/{PROMOTION_ADMIT}")
+        code, _, err = run([*ssh_argv(member, user), modes], 60)
     if code == 0:
-        code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
+        code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local),
+                            scp_target(member, f"{REMOTE_DIR}/mini-fleet.json", user)], 60)
     return None if code == 0 else f"scp: {err.strip()[-200:]}"
 
 
@@ -440,7 +805,7 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
             # drains, so an in-flight build never sees a moving toolchain.
             f"if [ \"$(/usr/bin/xcode-select -p 2>/dev/null || true)\" != {q}/Contents/Developer ]; then "
             "if /usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Listener' >/dev/null 2>&1 || "
-            "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Worker' >/dev/null 2>&1; then "
+            "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin[^/ ]*/Runner.Worker' >/dev/null 2>&1; then "
             "echo 'refusing Xcode selection change while a runner is active' >&2; exit 1; fi; "
             "fi; "
             f"if [ -d {q} ]; then "
@@ -458,11 +823,14 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
     return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
-def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
+def _uninstall_cmd(member: str, instance: int, apply: bool, receipt_only: bool = False, token: bool = True) -> str:
     # --token-stdin even for the plan: without gh on the mini, a plan lacking it reads "blocked", and a plan
-    # never reads stdin
-    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}--token-stdin "
-            f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} --output json")
+    # never reads stdin. receipt_only: no --manifest (a dedicatedOnly member declares no pool instance to name);
+    # an uninstall acts only on what the instance's receipt recorded anyway.
+    named = "" if receipt_only else f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} "
+    # token=False: an instance with no registration to deregister (an interrupted install) takes no token
+    return (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --uninstall {'--apply ' if apply else ''}"
+            f"{'--token-stdin ' if token else ''}{named}--instance {instance} --output json")
 
 
 def _failed_note(out: str, err: str, code: int) -> str:
@@ -474,15 +842,23 @@ def _failed_note(out: str, err: str, code: int) -> str:
     return "; ".join(notes)[-200:] or f"exit {code}: {(err or out).strip()[-200:]}"
 
 
-def registered_scope(member: str, instance: int) -> tuple[str | None, str | None]:
+def registered_scope(member: str, instance: int, receipt_only: bool = False,
+                     user: str | None = None) -> tuple[str | None, str | None]:
     """(scope the instance is registered to, "" when none; or None and why it could not be read). Read-only:
     the single-mini uninstall plan, which follows the instance's receipt."""
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, False)], CHECK_TIMEOUT_S)
+    code, out, err = run([*pool_ssh(member, user), _uninstall_cmd(member, instance, False, receipt_only)],
+                         CHECK_TIMEOUT_S)
     try:
         acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
     except (ValueError, AttributeError):
         return None, f"cannot read its registration: {_failed_note(out, err, code)}"
+    if not acts and receipt_only:  # retiring: no deregister plan at all is unknown state, never "unregistered"
+        return None, f"no deregistration plan for instance {instance} ({_failed_note(out, err, code)})"
     act = acts[0] if acts else {"state": "kept"}
+    if act.get("state") == "kept" and act.get("registered") and receipt_only:
+        # retiring: a recorded registration with no runner directory to deregister from is unknown state on GitHub
+        return None, (f"instance {instance}'s receipt records a registration ({act.get('scope') or '?'}) but its runner "
+                      "directory is gone: delete that runner on GitHub by hand, then remove the receipt")
     if act.get("state") == "kept":
         return "", None
     if act.get("state") == "remove" and isinstance(act.get("scope"), str) and act["scope"]:
@@ -495,10 +871,147 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
     token = mint(scope_api(repo, None), "remove-token")
     if token is None:
         return f"no remove token for {repo} (gh admin on the repo?)"
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, True)], APPLY_TIMEOUT_S,
+    code, out, err = run([*pool_ssh(member), _uninstall_cmd(member, instance, True)], APPLY_TIMEOUT_S,
                          stdin=token + "\n")
     del token
     return None if code == 0 else f"uninstall failed ({_failed_note(out, err, code)})"
+
+
+# DEDICATED_ONLY (glaeda_fleet_labels): the pool instances' receipts on a member (instance 0's at the top), and the
+# pool runner directories (~/actions-runner-glaeda, ~/actions-runner-glaeda-K), which glaeda-cmux-runner names after
+# the instance. Run by /bin/sh, never the login shell: zsh fails an unmatched glob ("no matches found").
+# Fails closed (review of 5758205): a state directory that exists but cannot be entered, or a home that cannot, exits 3;
+# an absent state directory is a mini with no receipts. The final "end" line proves the listing ran to completion.
+# Fails closed (reviews of 5758205 and a1de21e4): ls, not a glob, enumerates each directory, so one it cannot read or
+# enter exits 3 (a glob would skip it silently); an absent state directory is a mini with no receipts. The final "end"
+# line proves the listing ran to completion.
+POOL_RECEIPTS = ("/bin/sh -c 's=\"$HOME/.local/state/glaeda/cmux-runner\"; "
+                 "if [ -e \"$s\" ]; then l=$(ls -1A \"$s\") || exit 3; for n in $l; do case $n in "
+                 "receipt.json) echo \"receipt $n\";; instance-*) [ -d \"$s/$n\" ] || continue; "
+                 "c=$(ls -1A \"$s/$n\") || exit 3; case \" $(echo $c) \" in *\" receipt.json \"*) "
+                 "echo \"receipt $n/receipt.json\";; esac;; esac; done; fi; "
+                 "h=$(ls -1A \"$HOME\") || exit 3; for n in $h; do case $n in actions-runner-glaeda*) "
+                 "[ -d \"$HOME/$n\" ] && echo \"dir $n\";; esac; done; echo end; exit 0'")
+POOL_RECEIPT_RE = re.compile(r"receipt (?:instance-(\d+)/)?receipt\.json")
+POOL_DIR_RE = re.compile(r"dir actions-runner-glaeda(?:-(\d+))?")
+# what else the listing may name: a dedicated runner's receipt and directory (glaeda_fleet_labels DEDICATED_NAME_RE)
+DEDICATED_LISTING_RE = re.compile(r"receipt instance-dedicated-[a-z][a-z0-9-]{0,39}/receipt\.json"
+                                  r"|dir actions-runner-glaeda-[a-z][a-z0-9-]{0,39}")
+
+
+def installed_pool_instances(member: str, user: str | None = None) -> tuple[list[int] | None, str | None]:
+    """([instance numbers with a pool receipt], None) or (None, why it could not be read or is not safe). Read-only.
+    A dedicated runner (instance-dedicated-NAME, actions-runner-glaeda-NAME) is not a pool instance and never listed. A
+    pool runner directory with no receipt (an interrupted install) is unknown state: (None, why), which holds the
+    dedicated runners off until an operator removes it (fails closed)."""
+    code, out, err = run([*pool_ssh(member, user), POOL_RECEIPTS], CHECK_TIMEOUT_S)
+    if code != 0:
+        return None, f"cannot list its runner receipts (exit {code}: {(err or out).strip()[-160:]})"
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if not lines or lines[-1] != "end":
+        return None, "its runner receipt listing did not complete (no end marker); unknown state"
+    lines = lines[:-1]
+    odd = [line for line in lines if not (POOL_RECEIPT_RE.fullmatch(line) or POOL_DIR_RE.fullmatch(line)
+                                          or DEDICATED_LISTING_RE.fullmatch(line))]
+    if odd:
+        return None, f"its runner receipt listing has lines it cannot read ({odd[0][:80]!r}); unknown state"
+    receipts = {int(m[1] or 0) for m in map(POOL_RECEIPT_RE.fullmatch, lines) if m}
+    dirs = {int(m[1] or 0) for m in map(POOL_DIR_RE.fullmatch, lines) if m}
+    orphans = sorted(dirs - receipts)
+    if orphans:
+        return None, (f"pool runner directories with no receipt (instances {orphans}): unknown state, remove them by "
+                      "hand while idle (deregister any .runner), then re-run")
+    return sorted(receipts), None
+
+
+def repo_dedicated_only(member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    """REPO_DEDICATED_ONLY: whether every runner an apply would touch on the member is a repository-scoped dedicated
+    runner: runner.dedicatedOnly, at least one dedicated entry and none at org scope, and no pool instance installed
+    (read on the member; unreadable is False, so the org group check stays)."""
+    if summary.get("dedicatedOnly") is not True:
+        return False
+    entries, bad = load_labels().dedicated_runners(manifest, member)
+    if bad or not entries or any(e.get("org") for e in entries):
+        return False
+    installed, _ = installed_pool_instances(member)
+    return installed == []
+
+
+def retire_instance(member: str, instance: int, held: str = "dedicated runners held",
+                    user: str | None = None) -> dict[str, Any]:
+    """Deregister and remove one pool instance, by its receipt: every pool instance of a dedicatedOnly member, and on
+    any other member each instance at or past runners + gatewayRunners (SURPLUS). A runner with a job is never
+    stopped: glaeda-cmux-runner's uninstall fails ("the runner has a job") and changes nothing; drain the mini
+    (cmux-ci drain) and re-run."""
+    scope, why = registered_scope(member, instance, receipt_only=True, user=user)
+    if scope is None:
+        return {"instance": instance, "exit": None, "state": f"retire: {why}; nothing changed"}
+    token = mint(scope_api(None, scope) if "/" not in scope else scope_api(scope, None), "remove-token") if scope else ""
+    if token is None:
+        return {"instance": instance, "exit": None, "state": f"retire: no remove token for {scope}; nothing changed"}
+    code, out, err = run([*pool_ssh(member, user),
+                          _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope))],
+                         APPLY_TIMEOUT_S, stdin=token + "\n" if scope else None)
+    del token
+    if code != 0:
+        return {"instance": instance, "exit": code, "state": f"retire failed ({_failed_note(out, err, code)})",
+                "name": None}
+    # Exit 0 is no proof: an uninstall that keeps a directory it does not own (a missing or foreign ownership marker)
+    # also exits 0. Retired means the mini lists neither its receipt nor a pool directory without one.
+    left, why = installed_pool_instances(member, user)
+    if left is None or instance in left:
+        return {"instance": instance, "exit": 1, "name": None,
+                "state": f"retire unconfirmed ({why or 'its receipt is still there'}); {held}"}
+    return {"instance": instance, "exit": 0, "state": "retired", "name": None}
+
+
+# SURPLUS: the apply installs instances 0 .. runners + gatewayRunners - 1, so after a member's count drops (an xl
+# Studio from 10 to 6 runners, 2026-11-03) the instances past it kept their LaunchAgents and registrations, kept taking
+# side jobs and kept their listen claims, which held the root runners off: the problem the drop was meant to fix
+# (#1821). Each pool instance installed at or past the count is retired the way a dedicatedOnly member's are, only
+# while idle. A busy one is left installed and reported "retire when idle"; it does not fail the apply, and the next
+# apply retires it.
+SURPLUS_BUSY = "has a job"
+
+
+def surplus_instances(installed: list[int], count: int) -> list[int]:
+    """The installed pool instances past a member's declared count (runners + gatewayRunners)."""
+    return [k for k in installed if k >= count]
+
+
+def _instance_span(count: int) -> str:
+    return "0" if count <= 1 else f"0-{count - 1}"
+
+
+def keep_surplus(member: str, count: int) -> list[dict[str, Any]]:
+    """SURPLUS_AFTER_DECLARED: the surplus instances, each left installed and reported (deferred), when a declared
+    instance did not apply: the next apply retires them once the declared ones are up."""
+    installed, why = installed_pool_instances(member)
+    if installed is None:
+        return [{"instance": None, "exit": None, "surplus": True, "deferred": True,
+                 "state": f"surplus not checked: {why}"}]
+    return [{"instance": k, "exit": None, "surplus": True, "deferred": True, "name": None,
+             "state": f"kept: instances {_instance_span(count)} did not all apply; retire when they do"}
+            for k in surplus_instances(installed, count)]
+
+
+def retire_surplus(member: str, count: int) -> list[dict[str, Any]]:
+    """Retire every idle pool instance at or past `count` on `member` (SURPLUS). Each result carries "surplus": True;
+    a busy one ("deferred": True) is reported "retire when idle" and left installed. A listing that cannot be read
+    retires nothing and says why, without failing the apply (deferred too)."""
+    installed, why = installed_pool_instances(member)
+    if installed is None:
+        return [{"instance": None, "exit": None, "surplus": True, "deferred": True,
+                 "state": f"surplus not checked: {why}"}]
+    results = []
+    for k in surplus_instances(installed, count):
+        result = retire_instance(member, k, held=f"past the declared {count} instances")
+        result["surplus"] = True
+        if result["exit"] != 0 and SURPLUS_BUSY in str(result.get("state")):
+            result["deferred"] = True
+            result["state"] = f"retire when idle (past the declared {count} instances): {result['state']}"
+        results.append(result)
+    return results
 
 
 def apply_instance(member: str, instance: int, repo: str | None, extra: list[str], org: str | None = None,
@@ -522,10 +1035,19 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
             return {"instance": instance, "exit": None,
                     "state": f"registered to {scope}, not {migrate_from} or {org}; nothing changed"}
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
+    version, sha, _ = latest_release()
+    labels = None if deregistered else github_labels(scope_api(repo, org),
+                                                     f"{member}-glaeda" + (f"-{instance}" if instance else ""))
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
-              "--output json " + " ".join(_quote(a) for a in extra))
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
+              f"{observed}--output json " + " ".join(_quote(a) for a in extra))
+    if pool_login(member):
+        # POOL_USER: that account's non-login ssh has only the system PATH; the installer gets the workload one, as the
+        # member's check does (never --headless: a system LaunchDaemon needs sudo, which that account must not have)
+        remote = f"PATH={WORKLOAD_PATH} " + remote.replace(" --headless", "")
+    code, out, err = run([*pool_ssh(member), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
         doc = json.loads(out)
@@ -538,7 +1060,8 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
         # A failure before register (staging, launchctl) leaves register/verify
         # as "?": name the step that failed so the operator need not ssh in.
         state = f"{state} ({_failed_note(out, err, code)})"
-    result = {"instance": instance, "exit": code, "state": state, "name": name}
+    result = {"instance": instance, "exit": code, "state": state, "name": name,
+              **({"user": pool_login(member)} if pool_login(member) else {})}
     if deregistered:
         result["deregistered"] = deregistered
         if code != 0:  # the old runner is gone and the new one did not come up: say so loudly
@@ -546,22 +1069,247 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     return result
 
 
+def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dict[str, Any]:
+    """Apply one runner.dedicated runner (glaeda-cmux-runner --dedicated): a token for its own scope, piped over SSH.
+    A dedicated runner with a job is never stopped: its plan blocks a relabel and its agent step waits for idle. An entry
+    with a user (DEDICATED_USER) runs over ssh as that macOS account, so it installs under that account's home and loads
+    into its own gui/<uid> session; stage it there first (user_stage)."""
+    token = mint(scope_api(entry["repo"], entry["org"]))
+    if token is None:
+        return {"dedicated": entry["name"], "exit": None,
+                "state": f"no registration token (gh admin on {entry['org'] or entry['repo']}?); nothing changed"}
+    scope = (f"--org {_quote(entry['org'])}" + (f" --group {_quote(entry['group'])}" if entry["group"] else "")
+             if entry["org"] else f"--repo {_quote(entry['repo'])}")
+    version, sha, _ = latest_release()
+    # GitHub's labels for it, so a mini without gh sees a match and never re-registers it (#1645)
+    labels = github_labels(scope_api(entry["repo"], entry["org"]), f"{member}-glaeda-{entry['name']}")
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""
+    remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
+              f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
+              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
+              + " ".join(_quote(a) for a in extra if a != "--headless"))
+    if entry.get("user"):
+        # PROTECTED_TOOLCHAIN (glaeda-cmux-runner): the installer runs on Apple's python3 against the root-owned Command
+        # Line Tools with only the system PATH, never a Homebrew python the member user can replace
+        remote = f"PATH={USER_PATH} DEVELOPER_DIR={USER_DEVELOPER_DIR} {USER_PYTHON} {remote}"
+    code, out, err = run([*ssh_argv(member, entry.get("user")), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+    del token
+    try:
+        acts = {a["kind"]: a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and "kind" in a}
+        state = f"{acts.get('register', {}).get('state', '?')}/{acts.get('verify', {}).get('state', '?')}"
+        name = acts.get("register", {}).get("name")
+    except (ValueError, TypeError, AttributeError):
+        state, name = f"no receipt: {(err or out).strip()[-200:]}", None
+    if code != 0:
+        state = f"{state} ({_failed_note(out, err, code)})"
+    return {"dedicated": entry["name"], "exit": code, "state": state, "name": name,
+            **({"user": entry["user"]} if entry.get("user") else {})}
+
+
+# DEDICATED_USER: what an entry with a user needs on the member before its apply, outside glaeda (a root step per
+# host): that account reachable over ssh with the operator's key. Typed, so the operator sees the missing step.
+USER_SSH_MISSING = "user-ssh"
+USER_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"  # glaeda-cmux-runner PROTECTED_PATH
+USER_PYTHON = "/usr/bin/python3"  # PROTECTED_PYTHON
+USER_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"  # PROTECTED_DEVELOPER_DIR
+
+
+def user_stage(member: str, entry: dict[str, Any], manifest: dict[str, Any], scratch: Path,
+               override: dict[str, Any] | None, head: str | None) -> dict[str, Any] | None:
+    """Stage the scripts in the entry's user's home (DEDICATED_USER), or the failed result row for that entry alone."""
+    user = entry["user"]
+    failed = stage(member, manifest, scratch, override, head, user=user)
+    if not failed:
+        return None
+    if failed.startswith("ssh:"):
+        return {"dedicated": entry["name"], "exit": None, "user": user, "missing": USER_SSH_MISSING,
+                "state": (f"cannot ssh as {user} ({failed.removeprefix('ssh:').strip()[-160:] or 'no output'}): "
+                          f"{user} needs the operator's key in its ~/.ssh/authorized_keys and Remote Login access "
+                          "(com.apple.access_ssh), a root step on the host outside glaeda; nothing changed")}
+    return {"dedicated": entry["name"], "exit": None, "user": user, "state": f"stage as {user} failed: {failed}"}
+
+
+def member_scope(args: argparse.Namespace, manifest: dict[str, Any], member: str) -> tuple[str | None, str | None,
+                                                                                       str | None]:
+    """(repo, org, group) the member's pool instances register to: --repo/--org/--group when passed, for every
+    member; else the manifest's runner.org/runner.group (glaeda_fleet_labels.pool_scope; a trusted-only member stays
+    on its runner.trustedRepo); else the default repository."""
+    if args.scope_flags:
+        return args.repo, args.org, args.group
+    scope, _ = load_labels().pool_scope(manifest, member)
+    if scope is None:
+        return DEFAULT_REPO, None, None
+    return scope.get("repo"), scope.get("org"), scope.get("group")
+
+
+def publish_node_view(member: str, summary: dict[str, Any]) -> str | None:
+    """POOL_USER: as the member user, publish the node view the pool account's hook reads (NODE_VIEW: its enrollment,
+    its hardware's class receipt, its acceptance and the receipt's Glaeda generation, copied, owned by that user, 0755
+    and 0644, so the pool account reads and never writes them), and point FLEET_DIR/bin/glaeda-canonical-root at the
+    pool account's instance-0 hook shim (the link cmux's restore step calls; the pool account cannot write bin/, which
+    holds the member user's tools). Why it failed, or None."""
+    remote = (f"/usr/bin/python3 - {_quote(summary['hardware'])} {_quote(summary['poolUser'])} "
+              f"{_quote(POOL_NODE_VIEW)}")
+    code, out, err = run([*ssh_argv(member), remote], APPLY_TIMEOUT_S, stdin=NODE_VIEW_PUBLISH)
+    line = (out.strip().splitlines() or [""])[-1]
+    if code == 0 and line.startswith("published "):
+        return None
+    return f"exit {code}: {(err.strip() or line)[-240:]}"
+
+
+# Run by the member user's Apple python3 (stdin; argv: hardware class, pool user, view path). Builds the view in a fresh
+# directory beside the link and swaps the link atomically, so a hook reading it never sees half a copy, then removes
+# the views the link no longer names. A missing source file is left out (the hook then refuses, naming it).
+NODE_VIEW_PUBLISH = r"""
+import json, os, pwd, shutil, sys, time
+hardware, pool, view = sys.argv[1:4]
+home = os.path.expanduser("~")
+config = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "glaeda", "cmux-fleet")
+os.umask(0o022)
+store = view + ".d"
+os.makedirs(store, mode=0o755, exist_ok=True)
+fresh = os.path.join(store, "%d-%d" % (time.time(), os.getpid()))
+os.mkdir(fresh, 0o755)
+files = ("enrollment.json", os.path.join("class-acceptance", hardware + ".json"),
+         os.path.join("acceptance", "cmux_macos_native_build.json"))
+for rel in files:
+    src = os.path.join(config, rel)
+    if os.path.isfile(src):
+        dst = os.path.join(fresh, "cmux-fleet", rel)
+        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o644)
+generation = ""
+try:
+    receipt = json.load(open(os.path.join(config, "class-acceptance", hardware + ".json")))
+    generation = str((receipt.get("glaedaCandidate") or {}).get("commit") or "")[:12]
+except (OSError, ValueError, AttributeError):
+    pass
+gens = os.path.join(fresh, "glaeda-generations")
+os.makedirs(gens, mode=0o755, exist_ok=True)
+src = os.path.join(home, "Projects", "glaeda-generations", generation)
+if generation and os.path.isdir(src):
+    shutil.copytree(src, os.path.join(gens, generation), symlinks=True,
+                    ignore=shutil.ignore_patterns("__pycache__", ".git"))
+for root, dirs, names in os.walk(fresh):
+    for d in dirs:
+        p = os.path.join(root, d)
+        if not os.path.islink(p):
+            os.chmod(p, 0o755)
+    for n in names:
+        p = os.path.join(root, n)
+        if not os.path.islink(p):
+            os.chmod(p, 0o755 if os.stat(p).st_mode & 0o100 else 0o644)
+if os.path.lexists(view) and not os.path.islink(view):
+    sys.exit("refusing: " + view + " is not a link this step made")
+tmp = view + ".tmp-%d" % os.getpid()
+os.symlink(fresh, tmp)
+os.replace(tmp, view)
+for old in os.listdir(store):
+    if os.path.join(store, old) != fresh:
+        shutil.rmtree(os.path.join(store, old), ignore_errors=True)
+bin_dir = os.path.join(os.path.dirname(view), "bin")
+shim = os.path.join(pwd.getpwnam(pool).pw_dir, "actions-runner-glaeda", "glaeda-hooks", "glaeda-canonical-root")
+link = os.path.join(bin_dir, "glaeda-canonical-root")
+if os.path.isdir(bin_dir) and not (os.path.islink(link) and os.readlink(link) == shim):
+    tmp = os.path.join(bin_dir, ".glaeda-canonical-root.%d" % os.getpid())
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(shim, tmp)
+    os.replace(tmp, link)
+print("published " + fresh + " generation " + (generation or "none"))
+"""
+
+
+def retire_own_pool(member: str, pool_user: str) -> list[dict[str, Any]]:
+    """POOL_USER: retire every pool instance the member user itself still has (an admin account's PR runner), each only
+    while idle, once the pool account's instances applied. A busy one is deferred (retire when idle), and a listing
+    that cannot be read retires nothing and says why; neither fails the apply."""
+    installed, why = installed_pool_instances(member, "")
+    if installed is None:
+        return [{"instance": None, "exit": None, "ownAccount": True, "deferred": True,
+                 "state": f"the member user's own pool instances not checked: {why}"}]
+    results = []
+    for k in installed:
+        result = retire_instance(member, k, held=f"its pool runs as {pool_user} now", user="")
+        result["ownAccount"] = True
+        if result["exit"] != 0 and SURPLUS_BUSY in str(result.get("state")):
+            result["deferred"] = True
+            result["state"] = f"retire when idle (its pool runs as {pool_user} now): {result['state']}"
+        results.append(result)
+    return results
+
+
+def member_instance_count(row: dict[str, Any]) -> int:
+    """A member row's instances: its pool runners, then its gateway, sim-first and small runners."""
+    return (row["runners"] + row["gatewayRunners"] + row["simRunners"] + int(row.get("smallRunners") or 0))
+
+
 def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, manifest: dict[str, Any],
                scratch: Path) -> dict[str, Any]:
     started = time.monotonic()
-    eligible, why = check(member, summary)
+    pool_user = summary.get("poolUser") or None
+    set_pool_user(member, pool_user)
+    # POOL_USER: the node view the pool account's gate reads is published before that gate is asked (apply only)
+    unpublished = publish_node_view(member, summary) if pool_user and args.apply else None
+    # a view that failed to publish fails the member before its gate is asked (that gate would read a stale view)
+    eligible, why = (False, "node view not published") if unpublished else check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
+                           "gatewayRunners": summary.get("gatewayRunners") or 0,
+                           "simRunners": summary.get("simRunners") or 0,
+                           "smallRunners": summary.get("smallRunners") or 0,
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
+    if pool_user:
+        row["poolUser"] = pool_user
+    if unpublished:
+        row["eligible"], row["action"] = False, f"node view failed: {unpublished}"
+        return row
+    dedicated, bad = load_labels().dedicated_runners(manifest, member)
+    row["dedicated"] = [d["name"] for d in dedicated]
+    # DEDICATED_USER: the entries that run as their own macOS account, shown by the plan and applied as that user
+    row["dedicatedUsers"] = {d["name"]: d["user"] for d in dedicated if d.get("user")}
+    if bad:
+        row["eligible"], row["action"] = False, f"bad runner.dedicated: {bad}"
+        return row
+    if not args.scope_flags:
+        _, bad = load_labels().pool_scope(manifest, member)
+        if bad:
+            row["eligible"], row["action"] = False, f"bad runner scope: {bad}"
+            return row
     if eligible is None:
         row["eligible"], row["action"] = False, "unreachable"
         return row
     if args.org and summary.get("trustedRepo"):
         row["action"] = f"skip (trusted-only runner stays on {summary['trustedRepo']})"
         return row
+    if summary.get("dedicatedOnly"):
+        row["runners"], row["gatewayRunners"], row["simRunners"], row["smallRunners"] = 0, 0, 0, 0
+        installed, why = installed_pool_instances(member)
+        row["retire"] = installed if installed is not None else why
+    # GATE_IS_THE_POOLS: check() is the pool's job-started gate (toolchain, Xcode, enrollment); a dedicatedOnly member
+    # runs no pool job, and each dedicated runner admits by its own `admit`, so a refusal there holds back nothing it
+    # serves. Until 2026-11-25 a gate refusal (cmux24: diffRustcVersion '' after a toolchain drift) skipped the whole
+    # member, so hq-fleet-route-lan and hq-ci-overflow were never installed while HQ's runners.json sent jobs to them:
+    # ws-check and the other fleet_route_lan jobs queued 5 h on a label no runner carried.
+    gate_ok = bool(eligible or args.include_ineligible or summary.get("dedicatedOnly"))
     if not args.apply:
-        row["action"] = "would apply" if eligible or args.include_ineligible else "skip (not eligible)"
+        row["action"] = "would apply" if gate_ok else "skip (not eligible)"
+        if not summary.get("dedicatedOnly"):
+            disk_listener_row(row, member, summary, manifest)
+        if summary.get("dedicatedOnly"):
+            row["action"] += (f"; dedicated only, retire pool instances {row['retire'] or 'none'}"
+                              if isinstance(row["retire"], list) else f"; dedicated only, {row['retire']}")
+        elif gate_ok:
+            # SURPLUS: the plan names the instances an apply would retire (read-only listing)
+            installed, _ = installed_pool_instances(member)
+            surplus = surplus_instances(installed or [], member_instance_count(row))
+            if surplus:
+                row["retire"] = surplus
+                count = member_instance_count(row)
+                row["action"] += (f"; retire surplus instances {surplus} when idle, once instances "
+                                  f"{_instance_span(count)} apply")
         return row
-    if not (eligible or args.include_ineligible):
+    if not gate_ok:
         row["action"] = "skipped (not eligible)"
         return row
     override = None
@@ -572,6 +1320,17 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
+    if pool_user:
+        failed = stage(member, manifest, scratch, override, args.guard.get("head"), user=pool_user)
+        if failed and failed.startswith("ssh:"):
+            row["missing"] = USER_SSH_MISSING
+            row["action"] = (f"cannot ssh as {pool_user} ({failed.removeprefix('ssh:').strip()[-160:] or 'no output'}):"
+                             f" {pool_user} needs the operator's key in its ~/.ssh/authorized_keys and Remote Login "
+                             "access (com.apple.access_ssh), a root step on the host outside glaeda; nothing changed")
+            return row
+        if failed:
+            row["action"] = f"stage as {pool_user} failed: {failed}"
+            return row
     prepared = prepare_headless(member, summary, manifest)
     if prepared:
         row["action"] = f"prepare failed: {prepared}"
@@ -579,11 +1338,51 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     extra = ["--headless"] if ((manifest.get("hosts") or {}).get(member) or {}).get("gui") is False else []
     if args.skip_launchctl:
         extra.append("--skip-launchctl")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
-        results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
-                                                         args.migrate_from_repo), range(row["runners"])))
+    repo, org, group = member_scope(args, manifest, member)
+    row["scope"] = f"{org}/{group}" if org and group else org or repo
+    if summary.get("dedicatedOnly"):
+        # DEDICATED_ONLY: no pool instance; each installed one is deregistered and removed, only while it is idle
+        retire = row["retire"] if isinstance(row["retire"], list) else []
+        results = [retire_instance(member, k) for k in retire]
+        if not isinstance(row["retire"], list):
+            results.append({"instance": None, "exit": None, "state": f"retire: {row['retire']}"})
+    else:
+        # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on), then the
+        # sim-first runner (simRunners), then the small runners (smallRunners)
+        instances = member_instance_count(row)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
+            results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
+                                                             args.migrate_from_repo), range(instances)))
+        if all(r["exit"] == 0 for r in results):
+            results += retire_surplus(member, instances)
+            if pool_user:
+                results += retire_own_pool(member, pool_user)
+        else:
+            # SURPLUS_AFTER_DECLARED: a surplus instance may be the member's only live listener (a light mini, 2026-11-16:
+            # 12 and 13 of 0-13); retiring it while a declared instance failed leaves fewer listeners than either
+            results += keep_surplus(member, instances)
+    held = None
+    if summary.get("dedicatedOnly") and not all(r["exit"] == 0 for r in results):
+        held = "held: pool instances are not all retired; drain the mini and re-run"
+    elif summary.get("dedicatedOnly"):
+        # re-list the whole pool set right before the dedicated runners: the snapshot above is not the mini now (a
+        # concurrent or stale apply may have installed another pool instance since; review of 8c6009cd)
+        left, why = installed_pool_instances(member)
+        if left is None or left:
+            held = f"held: the mini still has pool instances ({why or left}); drain the mini and re-run"
+    if held:
+        # DEDICATED_ONLY: a pool instance still installed (busy, or unreadable) can take a signing job whose whole-mini
+        # claim the dedicated runners never join, so no dedicated runner is (re)applied until every one is retired
+        results.append({"dedicated": "*", "exit": None, "state": held})
+    else:
+        # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels; one with a user
+        # is staged and applied over ssh as that user (DEDICATED_USER), and a failure there fails that entry alone
+        for entry in dedicated:
+            failed_stage = user_stage(member, entry, manifest, scratch, override, args.guard.get("head")) \
+                if entry.get("user") else None
+            results.append(failed_stage or apply_dedicated(member, entry, extra))
     row["instances"] = results
-    row["action"] = "applied" if all(r["exit"] == 0 for r in results) else "failed"
+    row["action"] = "applied" if all(r["exit"] == 0 or r.get("deferred") for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)
     return row
 
@@ -592,12 +1391,30 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
     lines = [f"glaeda-cmux-runner-fleet: {'APPLY' if applied else 'PLAN (nothing changed; add --apply to act)'}"]
     lines.extend(guard_lines(guard, applied))
     for row in rows:
-        units = f"{row['runners']} runners/{row['capacityUnits']} units"
+        units = f"{row['runners']} runners/{row['capacityUnits']} units" + (
+            f"+{row['gatewayRunners']}gw" if row.get("gatewayRunners") else "") + (
+            f"+{row['simRunners']}sim" if row.get("simRunners") else "") + (
+            f"+{row['smallRunners']}small" if row.get("smallRunners") else "")
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
+        if row.get("disk"):
+            disk = row["disk"]
+            over = " (declared runners exceed it)" if row["listeners"] < row["runners"] else ""
+            lines.append(f"      listeners {row['listeners']}{over}: cores/RAM {row['listenersNoDisk']}, disk "
+                         f"({disk['free_gib']:g} free + {disk['runners_gib']:g} in runners' _work - "
+                         f"{row['diskFloorGib']:g} floor) / {disk['per_runner_gib']:g} GiB per runner "
+                         f"({disk['per_runner_source']})")
+        elif row.get("diskError"):
+            lines.append(f"      listeners: no disk term ({row['diskError']})")
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
+        if row.get("dedicated") and not row.get("instances"):
+            users = row.get("dedicatedUsers") or {}
+            lines.append("      dedicated: " + ", ".join(f"{n} (as {users[n]})" if n in users else n
+                                                         for n in row["dedicated"]))
         for inst in row.get("instances", []):
-            lines.append(f"      {inst['instance']}: exit={inst['exit']} {inst['state']}  {inst.get('name') or ''}")
+            who = f" (as {inst['user']})" if inst.get("user") else ""
+            lines.append(f"      {inst.get('instance', inst.get('dedicated'))}{who}: exit={inst['exit']} {inst['state']}  "
+                         f"{inst.get('name') or ''}")
     for member, why in sorted(skipped.items()):
         lines.append(f"  {member:<22} not a runner member: {why}")
     total = sum(r["runners"] for r in rows if r.get("eligible"))
@@ -611,8 +1428,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--apply", action="store_true", help="stage and apply (default: plan, read-only)")
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     scope = p.add_mutually_exclusive_group()
-    scope.add_argument("--repo", help=f"register to OWNER/REPO (default {DEFAULT_REPO})")
-    scope.add_argument("--org", help="register to this organization instead (needs gh as an org admin)")
+    scope.add_argument("--repo", help=("register every member to OWNER/REPO (default: the manifest's "
+                                        f"runner.org/group, else {DEFAULT_REPO})"))
+    scope.add_argument("--org", help="register every member to this organization instead (needs gh as an org admin)")
     p.add_argument("--group", help="org runner group (with --org)")
     p.add_argument("--migrate-from-repo", metavar="OWNER/REPO",
                    help="with --org: deregister each instance from this repository first; one member at a time")
@@ -625,15 +1443,27 @@ def main(argv: list[str] | None = None) -> int:
                    help="deploy although HEAD is not origin/main or a member's stamp is not an ancestor of HEAD; "
                         "the reason is printed and recorded in the stamp")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
+    p.add_argument("--max-procs", type=int, default=None,
+                   help=f"ssh/scp/gh children at once across the run (default: ${MAX_PROCS_ENV}, else the open-file "
+                        f"limit / 8, clamped to {MAX_PROCS_RANGE[0]}-{MAX_PROCS_RANGE[1]})")
     p.add_argument("--output", choices=("human", "json"), default="human")
     args = p.parse_args(argv)
+    if args.max_procs is None and os.environ.get(MAX_PROCS_ENV, "").strip():
+        try:
+            args.max_procs = int(os.environ[MAX_PROCS_ENV])
+        except ValueError:
+            print(f"glaeda-cmux-runner-fleet: ${MAX_PROCS_ENV} must be a whole number", file=sys.stderr)
+            return 2
+    if args.max_procs is not None and args.max_procs < 1:
+        print("glaeda-cmux-runner-fleet: --max-procs must be at least 1", file=sys.stderr)
+        return 2
+    set_max_procs(max_procs(raise_nofile(), args.max_procs))
+    args.scope_flags = bool(args.org or args.repo)  # else each member's scope comes from the manifest (member_scope)
     try:
         manifest = json.loads(args.manifest.expanduser().read_text())
     except (OSError, ValueError) as error:
         print(f"glaeda-cmux-runner-fleet: cannot read the manifest: {type(error).__name__}", file=sys.stderr)
         return 2
-    if not args.org:
-        args.repo = args.repo or DEFAULT_REPO
     if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
         print("glaeda-cmux-runner-fleet: --repo must be OWNER/REPO", file=sys.stderr)
         return 2
@@ -660,6 +1490,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
                   file=sys.stderr)
             return 2
+    try:  # its release parsing and pin: a broken copy fails here, before any token is minted
+        load_runner()
+    except Exception as error:  # noqa: BLE001
+        print(f"glaeda-cmux-runner-fleet: cannot load glaeda-cmux-runner beside this script "
+              f"({type(error).__name__})", file=sys.stderr)
+        return 2
     if args.migrate_from_repo:
         args.jobs = 1  # one member at a time, so the rest keep serving the old scope
     only = [h for h in (args.hosts or "").split(",") if h] or None
@@ -678,19 +1514,25 @@ def main(argv: list[str] | None = None) -> int:
             print("glaeda-cmux-runner-fleet: nothing changed; pass --allow-downgrade REASON to deploy anyway",
                   file=sys.stderr)
             return 2
-    if args.org and args.group and args.apply:
-        why = group_refusal(args.org, args.group, args.migrate_from_repo)
-        if why:
-            print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
-            return 2
+    if args.apply:  # every org group a member would register into, checked before any member is touched
+        # REPO_DEDICATED_ONLY: a member the apply touches only through repository-scoped dedicated runners registers
+        # nothing in the org group, so the group is not its to check (and listing it needs an org admin it never uses)
+        groups = {member_scope(args, manifest, m)[1:] for m, s in chosen.items()
+                  if args.migrate_from_repo or not repo_dedicated_only(m, s, manifest)}
+        for org, group in sorted((o, g) for o, g in groups if o and g):
+            why = group_refusal(org, group, args.migrate_from_repo)
+            if why:
+                print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
+                return 2
     with tempfile.TemporaryDirectory(prefix="glaeda-runner-fleet-") as tmp, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = {pool.submit(one_member, m, s, args, manifest, Path(tmp)): m for m, s in chosen.items()}
         rows = [f.result() for f in concurrent.futures.as_completed(futures)]
     rows.sort(key=lambda r: r["member"])
     if args.output == "json":
-        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard}, indent=2,
-                         sort_keys=True))
+        release = dict(zip(("version", "sha256", "from"), _RELEASE[0])) if _RELEASE else None
+        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard,
+                          "runnerRelease": release}, indent=2, sort_keys=True))
     else:
         print(render(rows, skipped, args.apply, guard))
     failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed")

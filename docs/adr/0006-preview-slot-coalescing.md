@@ -4,6 +4,8 @@
 
 Accepted for the exploratory preview layer.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 Agents may push many verified commits during one task. Creating a new external deployment for every push consumes deployment quotas and keeps services alive that nobody needs to inspect.

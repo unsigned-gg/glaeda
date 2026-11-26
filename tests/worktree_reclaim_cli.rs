@@ -452,6 +452,32 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     assert!(dirty.join("scratch.txt").exists());
 }
 
+/// The observation pool is a declared setting: two by default (a Mac that hosts agent sessions
+/// must not see eight `git status` at once), one to eight when asked, recorded in the receipt.
+#[test]
+fn git_workers_is_declared_bounded_and_recorded() {
+    let fixture = Fixture::new();
+    fixture.add("one");
+    fixture.add("two");
+    fixture.add("three");
+    let default = document(&fixture.plan(&fixture.main));
+    assert_eq!(default["git_workers"], 2);
+    let single = document(&fixture.run(&fixture.main, &["--git-workers", "1"]));
+    assert_eq!(single["git_workers"], 1);
+    assert_eq!(
+        single["repositories"][0]["summary"], default["repositories"][0]["summary"],
+        "the pool size changes how fast, never what is decided"
+    );
+    for refused in ["0", "9", "many"] {
+        let output = fixture.run(&fixture.main, &["--git-workers", refused]);
+        assert_eq!(output.status.code(), Some(2), "--git-workers {refused}");
+        assert!(
+            output.stdout.is_empty(),
+            "--git-workers {refused} ran anyway"
+        );
+    }
+}
+
 #[test]
 fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let fixture = Fixture::new();
@@ -465,6 +491,87 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(document["repositories"][0]["result"], "unlisted");
     assert_eq!(document["repositories"][0]["code"], "not_main_worktree");
+}
+
+/// The hourly sweep passes every checkout it found, and one broken checkout (cosmic-gray,
+/// 2026-10-22: a clone whose alternate's commit-graph chain was gone, so every Git command warned)
+/// made each run exit 2. With --skip-unlisted that checkout is named with its error on stderr and in
+/// the report, the others are still swept, and the run exits 0.
+#[test]
+fn skip_unlisted_names_a_broken_checkout_and_sweeps_the_rest() {
+    let fixture = Fixture::new();
+    fixture.add("linked");
+    let broken = fixture.root.join("broken");
+    fs::create_dir_all(&broken).expect("create broken checkout");
+    git(&broken, &["init", "-b", "main"]);
+    commit(&broken, "fixture");
+    git(&broken, &["branch", "lane"]);
+    let graphs = broken.join(".git/objects/info/commit-graphs");
+    fs::create_dir_all(&graphs).expect("create commit-graph folder");
+    fs::write(
+        graphs.join("commit-graph-chain"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .expect("write a chain naming a missing graph");
+    let missing = fixture.root.join("missing");
+    let arguments = |extra: &[&str]| {
+        let mut command = Command::new(BINARY);
+        for repository in [&broken, &fixture.main, &missing] {
+            command.arg("--repository").arg(repository);
+        }
+        command
+            .args(["--branches", "--output", "json"])
+            .args(extra)
+            .output()
+            .expect("run worktree reclaim")
+    };
+
+    let strict = arguments(&[]);
+    assert_eq!(
+        strict.status.code(),
+        Some(2),
+        "without --skip-unlisted an unlisted repository still fails the run"
+    );
+
+    let output = arguments(&["--skip-unlisted"]);
+    let document = document(&output);
+    let repositories = document["repositories"].as_array().expect("repositories");
+    assert_eq!(repositories.len(), 3);
+    assert_eq!(
+        repositories[1]["result"], "listed",
+        "the good checkout is swept"
+    );
+    assert_eq!(
+        repositories[1]["path"],
+        fixture.main.to_str().expect("UTF-8")
+    );
+    assert_eq!(repositories[1]["summary"]["linked"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Git reads the commit-graph only where it reads commits, so the broken checkout may fail at
+    // its listing or at its branches; either way it is named, with its error.
+    for (index, path) in [(0, &broken), (2, &missing)] {
+        let entry = &repositories[index];
+        let path = path.to_str().expect("UTF-8 fixture path");
+        assert_eq!(entry["path"], path);
+        let failed = if entry["result"] == "unlisted" {
+            entry
+        } else {
+            &entry["branches"]
+        };
+        assert_eq!(failed["result"], "unlisted", "{path}: {entry}");
+        assert!(failed["code"].as_str().is_some_and(|code| !code.is_empty()));
+        assert!(
+            failed["problem"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("skipped") && line.contains(&format!(" {path}: "))),
+            "stderr names {path}: {stderr}"
+        );
+    }
 }
 
 fn git_as_user(checkout: &Path, arguments: &[&str]) {
@@ -1173,6 +1280,12 @@ fn branch_entry(report: &serde_json::Value, name: &str) -> serde_json::Value {
 /// `--branches` deletes only finished, idle, unprotected branches no worktree has checked out.
 #[test]
 fn branches_mode_deletes_only_finished_idle_branches() {
+    for mode in ["--branches", "--branches-only"] {
+        assert_branches_mode(mode);
+    }
+}
+
+fn assert_branches_mode(mode: &str) {
     let fixture = Fixture::new();
     let hours = 60 * 60;
     branch_with_work(&fixture, "landed", "landed.txt", true, 2 * hours);
@@ -1230,7 +1343,7 @@ fn branches_mode_deletes_only_finished_idle_branches() {
         ],
     );
 
-    let plan = report(&fixture.run(&fixture.main, &["--branches", "--no-github", "--all"]));
+    let plan = report(&fixture.run(&fixture.main, &[mode, "--no-github", "--all"]));
     assert_eq!(plan["branches"]["result"], "listed");
     assert_eq!(plan["branches"]["eligible"], 1, "{plan:#}");
     let landed = branch_entry(&plan, "landed");
@@ -1253,7 +1366,7 @@ fn branches_mode_deletes_only_finished_idle_branches() {
         "a plan deletes nothing"
     );
 
-    let applied = report(&fixture.run(&fixture.main, &["--branches", "--no-github", "--apply"]));
+    let applied = report(&fixture.run(&fixture.main, &[mode, "--no-github", "--apply"]));
     assert_eq!(applied["branches"]["deleted"], 1, "{applied:#}");
     assert_eq!(branch_entry(&applied, "landed")["outcome"], "deleted");
     assert!(!ref_exists(&fixture.main, "refs/heads/landed"));
@@ -1414,5 +1527,81 @@ printf '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}}%s}}}}}}' 
     assert_eq!(
         entry_by_name(&fixture, &without, "squashed")["facts"]["work_state"],
         "in_progress"
+    );
+}
+
+/// A branch-only sweep skips worktree contents entirely and cannot delete a checkout, even
+/// when --apply is set and its idle window elapsed. Invalid indexes remain untouched too.
+#[test]
+fn branches_only_skips_worktree_scans_and_preserves_local_files() {
+    let fixture = Fixture::new();
+    let checkout = fixture.add("linked");
+    fixture.age("linked");
+    let scratch = checkout.join("scratch.txt");
+    fs::write(&scratch, "uncommitted\n").expect("write local work");
+    let index = fixture.main.join(".git/worktrees/linked/index");
+    fs::write(&index, "not an index").expect("invalidate worktree index");
+
+    for apply in [false, true] {
+        let mut arguments = vec!["--branches-only", "--no-github", "--all"];
+        if apply {
+            arguments.push("--apply");
+        }
+        let receipt = document(&fixture.run(&fixture.main, &arguments));
+        assert_eq!(receipt["mutation_performed"], false);
+        let repository = &receipt["repositories"][0];
+        assert_eq!(repository["summary"]["linked"], 1);
+        assert_eq!(repository["summary"]["skipped"], 1);
+        assert_eq!(repository["summary"]["unobservable"], 0);
+        assert_eq!(repository["summary"]["reclaimed"], 0);
+        assert_eq!(repository["worktrees"], serde_json::json!([]));
+        assert_eq!(branch_entry(repository, "linked")["reason"], "checked_out");
+        assert_eq!(
+            fs::read_to_string(&scratch).expect("scratch retained"),
+            "uncommitted\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&index).expect("index retained"),
+            "not an index"
+        );
+        assert!(checkout.exists());
+    }
+}
+
+#[test]
+fn branches_only_honors_the_branch_deletion_budget() {
+    let fixture = Fixture::new();
+    for name in ["first", "second"] {
+        branch_with_work(&fixture, name, &format!("{name}.txt"), true, 2 * 60 * 60);
+    }
+    git(
+        &fixture.main,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(
+        &fixture.main,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let receipt = document(&fixture.run(
+        &fixture.main,
+        &[
+            "--branches-only",
+            "--no-github",
+            "--apply",
+            "--max-branch-deletions",
+            "1",
+        ],
+    ));
+    assert_eq!(receipt["budget_exhausted"], true);
+    assert_eq!(receipt["repositories"][0]["branches"]["eligible"], 2);
+    assert_eq!(receipt["repositories"][0]["branches"]["deleted"], 1);
+    assert_eq!(
+        usize::from(ref_exists(&fixture.main, "refs/heads/first"))
+            + usize::from(ref_exists(&fixture.main, "refs/heads/second")),
+        1,
     );
 }

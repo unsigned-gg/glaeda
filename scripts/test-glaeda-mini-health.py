@@ -3,14 +3,23 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
+import plistlib
+import re
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,6 +35,8 @@ def load(name: str, path: Path):
 health = load("glaeda_mini_health", ROOT / "scripts" / "glaeda-mini-health")
 NOW = 1_790_500_000.0
 TM = health.TESTMANAGERD
+ROUTES = json.loads((ROOT / "config" / "claude-routes.json").read_text())
+SR2, POOL = ROUTES["routes"]
 
 
 class FakeMini(health.Mini):
@@ -39,8 +50,10 @@ class FakeMini(health.Mini):
         self.lw: dict = {}
         self.pm = " displaysleep         0\n"
         self.procs = [(10, 501, "S", TM)]
+        self.load = {"cores": 8, "load5": 0.5, "processes": []}
         self.lines = [(NOW - 600, "Created session with socket 3"), (NOW - 590, "Tearing down <XCIDESession>")]
         self.ts: tuple[str, str | None, str] | None = ("app", "Running", "")
+        self.route: str | None = "utun4"
         self.ts_after: list[str] = []
         self.agents = [("com.teamleaderleo.glaeda.cmux-runner", True, True, "(never exited)"),
                        ("com.teamleaderleo.glaeda.cmux-runner.1", True, True, "(never exited)")]
@@ -48,7 +61,98 @@ class FakeMini(health.Mini):
         self.did: list[str] = []
         self.leaks: list[tuple[int, str]] = []
         self.disk: dict = {}
+        self.pass_facts: dict | None = None  # no glaeda-disk agent or snapshots here: no disk pass to judge
+        self.mirror_facts: dict | None = None  # no mirror source here: no runner mirror to judge
         self.refusal: str | None = None
+        self.toolchain_installs: list[str] = []
+        self.claude: str | None = None  # no Claude Code here: no route to check
+        self.claude_env: dict = {}
+        self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
+        self.daemons_dir = Path("/nonexistent")
+        self.global_agents_dir = Path("/nonexistent")
+        self.probe_memory: dict = {}
+        self.fleet = True  # a fleet mini, not a personal Mac (--hygiene-only)
+        # the tailscale_no_route restart's gates: an idle CI runner mini unless a test says otherwise
+        self.names: list[str] | None = ["cmux9s-mac-mini"]
+        self.opt_in: tuple[dict | None, str] = ({"schema": "glaeda-tailscale-self-heal/v1", "host": "cmux9s-mac-mini",
+                                                 "source": "fleet-registry.json"}, "")
+        self.restart_ran = True  # every restart command exited 0
+        self.slept = 0.0
+        self.facts = {"platform": "darwin", "runners": 2, "setup_args": ["--role=fleet-mini"], "role": "fleet-mini"}
+        self.restart_off = ""
+        self.busy = ""
+        self.lock_why = ""
+        self.jobs = ""
+        self.sudo_allowed = False
+        self.restart_state: Path | None = None  # the restart state file, read when the restart runs
+        self.state_at_restart: list[dict] = []
+        self.after_restart: tuple[str | None, str | None] = ("Running", "utun4")
+        self.restart_cmds: list[list[str]] = []
+        # the drain: no reservation marker, the fleet list holds nothing, nothing left once drained
+        self.marker: tuple[str, dict | None] = ("none", None)
+        self.fleet_res = ""
+        self.drain_jobs = ""
+        self.drain_write = ""  # why start_drain fails, "" when it writes
+
+    def host_reservation(self):
+        return self.marker
+
+    def fleet_reservation(self):
+        return self.fleet_res
+
+    def start_drain(self, now, purpose):
+        if self.drain_write:
+            return self.drain_write
+        self.did.append("drain")
+        doc = {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER, "purpose": purpose,
+               "since": int(now), "until": int(now + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S)}
+        self.marker = ("ours", {**doc, "raw": json.dumps(doc).encode()})
+        return ""
+
+    def end_drain(self, seen):
+        if self.marker[0] != "ours" or not seen or seen.get("raw") != self.marker[1]["raw"]:
+            return False
+        self.did.append("undrain")
+        self.marker = ("none", None)
+        return True
+
+    def drain_busy(self):
+        return self.drain_jobs
+
+    def host_names(self):
+        return self.names
+
+    def ci_mini_facts(self):
+        return self.facts
+
+    def tailscale_opt_in(self):
+        return self.opt_in
+
+    def tailscale_restart_off(self):
+        return self.restart_off
+
+    def host_busy(self):
+        return self.busy
+
+    @contextlib.contextmanager
+    def hold_host_lock(self):
+        if not self.lock_why:
+            self.did.append("lock")
+        yield self.lock_why
+
+    def jobs_running(self):
+        return self.jobs
+
+    def sudo_allows(self, argv):
+        return self.sudo_allowed
+
+    def run_restart(self, commands):
+        self.state_at_restart.append(health.load_json(self.restart_state) if self.restart_state else {})
+        self.restart_cmds.extend(commands)
+        self.did.append("restart " + self.ts[0])
+        state, self.route = self.after_restart
+        self.ts = (self.ts[0], state, "")
+        return self.restart_ran, " ; ".join(" ".join(c) for c in commands)
 
     def console(self):
         return self.console_state
@@ -62,6 +166,9 @@ class FakeMini(health.Mini):
     def processes(self):
         return self.procs
 
+    def load_facts(self):
+        return self.load
+
     def elapsed_s(self, pid):
         return 3600
 
@@ -72,6 +179,9 @@ class FakeMini(health.Mini):
         if self.ts_after and self.did and self.did[-1].startswith(("up", "vpn")):
             self.ts = (self.ts[0], self.ts_after.pop(0), "")
         return self.ts
+
+    def tailnet_route(self):
+        return self.route
 
     def vpn_service(self):
         return "C7E1635B-DD04-49D8-A16F-FB4E34804764"
@@ -94,7 +204,10 @@ class FakeMini(health.Mini):
         self.agents = [(l, lo, True if l == label else r, x) for l, lo, r, x in self.agents]
 
     def sleep(self, seconds):
-        pass
+        self.slept += seconds
+
+    def clock(self):
+        return self.slept  # only differences are read: the time the sleeps took
 
     def leaked_test_apps(self):
         return self.leaks
@@ -107,8 +220,87 @@ class FakeMini(health.Mini):
     def disk_summary(self):
         return self.disk
 
+    def disk_pass(self):
+        return self.pass_facts
+
+    def git_mirror(self):
+        return self.mirror_facts
+
     def node_refusal(self):
         return self.refusal
+
+    toolchain: str | None = None
+    toolchain_gone: str | None = None
+
+    def toolchain_mismatch(self):
+        return self.toolchain
+
+    def toolchain_missing(self):
+        return self.toolchain_gone
+
+    def install_rust_toolchain(self, toolchain):
+        self.toolchain_installs.append(toolchain)
+        return True, f"installed Rust toolchain {toolchain}"
+
+    heal_status: dict | None = None
+    sudo = False
+
+    def daemon_heal_status(self):
+        return self.heal_status
+
+    def daemon_policy(self):
+        return Path("/p/macos-daemons.json")
+
+    def sudo_ok(self):
+        return self.sudo
+
+    def fleet_host(self):
+        return self.fleet
+
+    def claude_bin(self):
+        return Path(self.claude) if self.claude else None
+
+    # The config's claude_code source: off unless a test is about Claude Code, so a fake without Claude is not a
+    # claude_missing finding in every other test.
+    claude_source = False
+
+    def claude_routes(self):
+        return ROUTES if self.claude_source else {k: v for k, v in ROUTES.items() if k != "claude_code"}
+
+    install_ok = True
+
+    def install_claude(self, source):
+        self.did.append("install claude " + source.get("channel", "?"))
+        if self.install_ok:
+            self.claude = "/Users/cmux/.local/bin/claude"
+            return True, "installed Claude Code 2.1.308 (darwin-arm64, sha256 checked) at ~/.local/bin/claude"
+        return False, "Claude Code download failed: timed out"
+
+    def claude_settings(self):
+        return {"env": dict(self.claude_env)}
+
+    def claude_probe(self, url, token):
+        self.did.append("probe " + url)
+        ok = self.answers.get(url, False)
+        return ok, "PONG" if ok else "no answer in 60 s"
+
+    def set_claude_route(self, url, token):
+        self.did.append("route " + url)
+        self.claude_env = {k: v for k, v in self.claude_env.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+        self.claude_env.update(ANTHROPIC_BASE_URL=url, ANTHROPIC_AUTH_TOKEN=token)
+        return f"~/.claude/settings.json routes Claude to {url}"
+
+    def claude_probe_last(self):
+        return self.probe_memory
+
+    def save_claude_probe(self, doc):
+        self.probe_memory = dict(doc)
+
+    def install_daemon_heal(self):
+        self.did.append("install daemon-heal")
+        self.heal_status = {**(self.heal_status or {}), "installed": True, "current": True, "loaded": True,
+                            "reportFresh": True}
+        return True, "sudo -n glaeda-daemon-heal --install --apply: applied"
 
 
 class NodeEligibility(unittest.TestCase):
@@ -143,6 +335,137 @@ class NodeEligibility(unittest.TestCase):
         self.assertEqual(mini.node_refusal(), "node not eligible (no node status from generation 3809eed51fdd)")
         self.assertEqual(asked, ["m4-16"])
 
+    def test_the_toolchain_is_checked_against_the_job_started_hooks_xcode_in_a_clean_env(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai "
+                            "--require-eligible --fleet-class m4-16 --toolchain-xcode /Applications/Xcode_26.6.app")
+        probed: list[tuple[str, dict]] = []
+        why = ("toolchain: xcrun resolves /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk outside Xcode_26.6; "
+               "xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3")
+
+        def xcode_refusal(xcode_app, env):
+            probed.append((xcode_app, env))
+            return why
+
+        mini._hook.xcode_refusal = xcode_refusal
+        mini._hook.listener_env = lambda environ, xcode: {"DEVELOPER_DIR": xcode + "/Contents/Developer"}
+        self.assertEqual(mini.toolchain_mismatch(), why)
+        self.assertEqual(probed, [("/Applications/Xcode_26.6.app",
+                                   {"DEVELOPER_DIR": "/Applications/Xcode_26.6.app/Contents/Developer"})])
+        mini._hook.xcode_refusal = lambda xcode_app, env: 1 / 0
+        self.assertIsNone(mini.toolchain_mismatch(), "a hook that cannot answer is no finding")
+
+    def test_a_missing_rust_toolchain_is_read_from_the_hook_for_a_fleet_node(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        why = "node not eligible (Rust toolchain missing: rustc is not on the job PATH /usr/bin:/bin (...))"
+        homes: list[Path] = []
+
+        def fleet_toolchain_missing(home=None):
+            homes.append(home)
+            return why
+
+        mini._hook.fleet_toolchain_missing = fleet_toolchain_missing
+        self.assertEqual(mini.toolchain_missing(), why)
+        self.assertEqual(homes, [self.home], "the runner user's own runners and ~/.cargo/bin")
+        mini._hook.fleet_toolchain_missing = lambda home=None: 1 / 0
+        self.assertIsNone(mini.toolchain_missing(), "a hook that cannot answer is no finding")
+        del mini._hook.fleet_toolchain_missing
+        self.assertIsNone(mini.toolchain_missing(), "an older hook without the check is no finding")
+
+    def test_the_real_hook_reads_the_runners_workload_path(self) -> None:
+        """Against the real hook: the runners' WORKLOAD_PATH decides, never this agent's launchd PATH nor the runner's
+        .path (which drifted to /usr/bin:/bin:... on every re-registered mini while its jobs ran on WORKLOAD_PATH)."""
+        spec = importlib.util.spec_from_loader("hook_for_health_test", importlib.machinery.SourceFileLoader(
+            "hook_for_health_test", os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook")))
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        real.TOOLCHAIN_GATE = True
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        mini._hook = real
+        brew = self.home / "brew" / "bin"
+        brew.mkdir(parents=True)
+        for tool in ("rustup", "rustc", "cargo"):
+            (brew / tool).write_text("#!/bin/sh\n")
+            (brew / tool).chmod(0o755)
+        (self.home / "actions-runner-glaeda" / ".path").write_text("/usr/bin:/bin:/usr/sbin:/sbin\n")
+        real.WORKLOAD_PATH = f"{brew}:/usr/bin:/bin"
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            self.assertIsNone(mini.toolchain_missing(), "a .path without rust, a workload PATH with it: healthy")
+            (brew / "rustup").unlink()
+            self.assertIn("rustup is not installed", mini.toolchain_missing() or "")
+            (self.home / "actions-runner-glaeda" / "glaeda-hooks" / "job-started.sh").write_text(
+                "exec /usr/bin/python3 hook job-started\n")
+            self.assertIsNone(mini.toolchain_missing(), "a mini with no fleet build runner needs no Rust")
+
+    def test_the_remedy_follows_the_cause(self) -> None:
+        mini = FakeMini()
+        mini.toolchain_gone = f"node not eligible (Rust toolchain missing: rustc {health.TOOLCHAIN_OFF_PATH} /usr/bin)"
+        self.assertIn("WORKLOAD_PATH", health.check_toolchain_missing(mini)[0]["note"])
+        mini.toolchain_gone = "node not eligible (Rust toolchain missing: rustup is not installed (...))"
+        self.assertIn("reinstall rustup", health.check_toolchain_missing(mini)[0]["note"])
+
+    def test_a_runner_without_a_pool_xcode_has_no_toolchain_to_check(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
+        mini._hook.xcode_refusal = lambda xcode_app, env: "toolchain: x"
+        self.assertIsNone(mini.toolchain_mismatch())
+
+    def test_a_timed_out_eligibility_probe_is_no_finding(self) -> None:
+        """The hook's node_answer flags a probe that ran out of time (a mini at load 275 cannot start Python in
+        20 s): no node_ineligible, whose remedy restages a generation that is fine. A real refusal still reports."""
+        started = ("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai "
+                   "--require-eligible --fleet-class m4pro-48")
+        mini, asked = self.mini(started)
+        timeout = "node not eligible (the m4pro-48 class receipt validator timed out after 20 s; no answer)"
+        mini._hook.node_answer = lambda fleet_class: (asked.append(fleet_class), (timeout, {}, True))[1]
+        self.assertIsNone(mini.node_refusal())
+        self.assertEqual(asked, ["m4pro-48"])
+        mini._hook.node_answer = lambda fleet_class: ("node not eligible (state enrolling, x: y)", {}, False)
+        self.assertEqual(mini.node_refusal(), "node not eligible (state enrolling, x: y)")
+        self.assertEqual(health.check_node_eligibility(mini)[0]["id"], "node_ineligible")
+        mini._hook.node_answer = lambda fleet_class: 1 / 0
+        self.assertIsNone(mini.node_refusal(), "a hook that cannot answer is no finding")
+
+    def test_a_launchctl_that_does_not_answer_is_not_an_unloaded_runner(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.9"):
+            (agents / f"{label}.plist").write_text("")
+        answers = {"com.teamleaderleo.glaeda.cmux-runner": (127, ""),  # timed out at load 275
+                   "com.teamleaderleo.glaeda.cmux-runner.9": (113, "Could not find service")}
+        with mock.patch.object(health, "AGENTS", agents), mock.patch.object(health, "DAEMONS", self.home / "none"), \
+                mock.patch.object(health, "sh", lambda argv, **_: answers[argv[-1].rsplit("/", 1)[1]]):
+            got = health.Mini(self.home).runner_agents()
+        self.assertEqual(got, [("com.teamleaderleo.glaeda.cmux-runner.9", False, False, "?")])
+
+    def test_a_runner_launchdaemon_of_this_user_is_read_in_the_system_domain_and_kickstarted_with_sudo_n(self) -> None:
+        """ROLE_DAEMON (glaeda-cmux-runner): a gateway or small runner is system/<label>. Its LaunchAgent plist, left
+        until the runner is idle, is not reported; another user's daemon is not this user's runner."""
+        agents, daemons = self.home / "Library/LaunchAgents", self.home / "LaunchDaemons"
+        agents.mkdir(parents=True)
+        daemons.mkdir()
+        base = "com.teamleaderleo.glaeda.cmux-runner"
+        for label in (base, f"{base}.7"):
+            (agents / f"{label}.plist").write_text("")
+        me = health.pwd.getpwuid(os.getuid()).pw_name
+        for label, user in ((f"{base}.7", me), (f"{base}.8", "someone-else")):
+            (daemons / f"{label}.plist").write_bytes(plistlib.dumps({"Label": label, "UserName": user}))
+        asked = []
+
+        def sh(argv, **_):
+            asked.append(argv)
+            return 0, "\tstate = running\n\tpid = 42\n"
+        with mock.patch.object(health, "AGENTS", agents), mock.patch.object(health, "DAEMONS", daemons), \
+                mock.patch.object(health, "sh", sh):
+            mini = health.Mini(self.home)
+            got = mini.runner_agents()
+            mini.kickstart(f"{base}.7")
+            mini.kickstart(base)
+        self.assertEqual([g[0] for g in got], [base, f"{base}.7"])
+        self.assertIn(["/bin/launchctl", "print", f"system/{base}.7"], asked)
+        self.assertIn(["/bin/launchctl", "print", f"gui/{os.getuid()}/{base}"], asked)
+        self.assertNotIn(["/bin/launchctl", "print", f"gui/{os.getuid()}/{base}.7"], asked)
+        self.assertIn(["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", f"system/{base}.7"], asked)
+        self.assertIn(["/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{base}"], asked)
+
     def test_a_runner_that_does_not_require_eligibility_is_not_checked(self) -> None:
         mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
         self.assertIsNone(mini.node_refusal())
@@ -155,6 +478,7 @@ class Base(unittest.TestCase):
         self.dir = Path(self.tmp.name)
         self.state, self.report = self.dir / "state.json", self.dir / "health.json"
         self.mini = FakeMini()
+        self.mini.restart_state = health.restart_state_path(self.state)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -172,6 +496,37 @@ class Detection(Base):
         self.assertEqual(report["findings"], [])
         self.assertEqual(json.loads(self.report.read_text())["schema"], "glaeda-mini-health/v1")
 
+    def test_load_high_requires_twice_cores_and_five_minutes(self) -> None:
+        self.mini.load = {"cores": 8, "load5": 16.0,
+                          "processes": [{"command": "swift-frontend", "count": 12}]}
+        self.assertEqual(health.check_load_high(self.mini), [], "the 2x boundary is healthy")
+        self.mini.load["load5"] = 16.1
+        self.assertEqual(self.ids(self.run_once(NOW)), [], "one high sample is only a spike")
+        sustained_window = 5 * 60
+        self.assertEqual(self.ids(self.run_once(NOW + sustained_window - 1)), [],
+                         "the finding stays hidden before five minutes")
+        report = self.run_once(NOW + sustained_window)
+        self.assertEqual(self.ids(report), ["load_high"])
+        self.assertIn("swift-frontend (12)", report["findings"][0]["evidence"])
+
+    def test_the_report_carries_what_the_updater_says_this_host_runs(self) -> None:
+        doc = {"schema": "glaeda-ota-converge/v1", "at": "2026-09-25T00:00:00Z", "converged": False,
+               "staleAfter": "2099-01-01T00:00:00Z", "alertAfter": "2000-01-01T00:00:00Z", "blocking": False,
+               "since": "2026-09-24T00:00:00Z", "attempts": 4, "why": ["inconclusive: offline"],
+               "running": {"tag": "r-20260924-aaaaaaaaaaaa", "tools": {"drift": []},
+                           "hooks": [{"runnerDir": "/x/actions-runner-glaeda-1", "glaeda-cmux-runner-hook": "ab",
+                                      "current": True}]},
+               "wants": {"tag": "r-20260925-bbbbbbbbbbbb"}}
+        self.mini.ota_converge = lambda: doc
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["ota_not_converging"])
+        self.assertEqual(report["findings"][0]["evidence"], "running r-20260924-aaaaaaaaaaaa, wants "
+                         "r-20260925-bbbbbbbbbbbb, because inconclusive: offline")
+        self.assertEqual(report["ota"]["hooks"], [{"runner": "actions-runner-glaeda-1", "sha256": "ab", "current": True}])
+        self.assertEqual(json.loads(self.report.read_text())["ota"]["wants"], "r-20260925-bbbbbbbbbbbb")
+        doc["converged"] = True
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_an_ineligible_node_is_an_error_this_user_cannot_heal(self) -> None:
         # cmux-austin-mini-0/-1 refused every job for days on 10-08..12: their staged generation was gone.
         self.mini.refusal = "node not eligible (no node status from generation 3809eed51fdd)"
@@ -180,6 +535,46 @@ class Detection(Base):
         f = report["findings"][0]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_a_missing_rust_toolchain_is_a_named_error(self) -> None:
+        # 2026-10-26: ~/.cargo/bin/rustup was deleted on the runner minis and health said nothing
+        self.mini.toolchain_gone = ("node not eligible (Rust toolchain missing: /Users/cmux/.cargo/bin/rustup, "
+                                    "/Users/cmux/.cargo/bin/rustc (a link to rustup, which is gone))")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["toolchain_missing"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("/Users/cmux/.cargo/bin/rustup", f["evidence"])
+        self.assertIn("rustup", f["note"])
+
+    def test_a_toolchain_outside_the_pool_xcode_is_an_error_this_user_cannot_heal(self) -> None:
+        # cmux21, 2026-10-21: Command Line Tools 27 made xcrun resolve their SDK and Swift 6.4 past Xcode_26.6
+        self.mini.toolchain = ("toolchain: xcrun resolves /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk "
+                               "outside Xcode_26.6; xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["toolchain_mismatch"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("CommandLineTools", f["evidence"])
+        self.assertIn("CommandLineTools", f["note"])
+        self.mini.toolchain = None
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_missing_exact_rust_toolchain_is_self_healed(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.toolchain_installs, ["1.98.1-aarch64-apple-darwin"])
+        self.assertEqual(report["heals"][0]["id"], "node_toolchain_missing:1.98.1-aarch64-apple-darwin")
+
+    def test_missing_toolchain_refusal_is_pending_when_install_fails(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        self.mini.install_rust_toolchain = lambda toolchain: (False, "network unavailable")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["node_toolchain_missing:1.98.1-aarch64-apple-darwin"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "pending"))
+        self.assertIn("network unavailable", f["note"])
 
     def test_locked_console_autologin_key_and_display_sleep_need_root(self) -> None:
         self.mini.console_state = ("locked", "cmux")
@@ -256,6 +651,216 @@ class DiskAndLeaks(Base):
         self.assertIn("du timed out after 45s", stuck["evidence"])
         self.assertIn("6 path(s)", stuck["evidence"])
 
+    def disk_pass(self, sizes_at: float | None, accounting_at: float | None, header_at: float | None = None,
+                  agent: str = "loaded", last_exit: str | None = "0") -> dict:
+        sizes = {} if sizes_at is None else {"at": header_at or sizes_at, "sizes": {"/a": 1, "/b": 2},
+                                             "measured_at": {"/a": sizes_at - 600, "/b": sizes_at}}
+        accounting = {} if accounting_at is None else {"16777230": {"at": accounting_at}}
+        agent = agent if agent == "not installed" else f"gui/501/com.teamleaderleo.glaeda.disk-pressure {agent}"
+        return {"sizes": sizes, "accounting": accounting, "agent": agent, "last_exit": last_exit}
+
+    def stamp(self, at: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+    def test_a_runner_mirror_fetched_within_30_minutes_is_healthy(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 60), "fetched_at": self.stamp(NOW - 29 * 60),
+                                             "fetch": {"ok": False}, "state": "fetch-failed"}, "running": False}
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_runner_mirror_stalled_past_30_minutes_is_a_finding(self) -> None:
+        # cmux14, 2026-10-27: a reseed held the pass for 40 min while feat-cmux-next moved on
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 46 * 60), "fetch": {"ok": True},
+                                             "state": "applied"}, "running": True}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["git_mirror_stale"])
+        f = report["findings"][0]
+        self.assertIn("last good fetch 46 min ago (fresh within 30)", f["evidence"])
+        self.assertIn("a pass is running", f["evidence"])
+        self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "pending"))
+
+    def test_a_runner_mirror_whose_passes_keep_failing_is_a_finding(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 60), "fetched_at": self.stamp(NOW - 3 * 3600),
+                                             "fetch": {"ok": False}, "state": "fetch-failed"}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("last good fetch 180 min ago", f["evidence"])
+        self.assertEqual(f["auto_fix"], "impossible")
+
+    def test_a_repair_that_stopped_part_way_is_a_finding_however_fresh(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 120), "fetched_at": self.stamp(NOW - 120),
+                                             "fetch": {"ok": True}, "state": "repairing"}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("a repair stopped part way", f["evidence"])
+        self.mini.mirror_facts["running"] = True  # still repairing: the fresh tips are enough
+        self.assertEqual(self.run_once(NOW + 1)["findings"], [])
+
+    def test_only_a_source_glaeda_git_mirror_acts_on_turns_the_check_on(self) -> None:
+        home = self.dir / "home"
+        config = home / health.GIT_MIRROR_SOURCE
+        config.parent.mkdir(parents=True)
+        with mock.patch.object(health.sys, "platform", "darwin"):
+            for doc, on in (({"schema": 1, "source": "direct"}, True), ({"schema": 1, "source": "lan"}, True), ({"schema": 1, "source": "nfs"}, False),
+                            ({"source": "direct"}, False)):
+                config.write_text(json.dumps(doc))
+                self.assertEqual(health.Mini(home).git_mirror() is not None, on, doc)
+
+    def test_a_runner_mirror_with_no_record_is_a_finding(self) -> None:
+        self.mini.mirror_facts = {"record": {}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("no good fetch on record", f["evidence"])
+
+    def test_a_disk_pass_within_a_day_is_healthy_even_with_an_old_snapshot_header(self) -> None:
+        # sizes.json's `at` is the oldest measurement; a pass that re-measures every item minutes ago is fresh
+        self.mini.pass_facts = self.disk_pass(NOW - 900, NOW - 900, header_at=NOW - 8 * 86400)
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_disk_pass_that_stopped_running_is_a_finding(self) -> None:
+        self.mini.pass_facts = self.disk_pass(NOW - 8 * 86400, NOW - 6 * 86400)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        f = report["findings"][0]
+        self.assertIn("sizes.json last pass 192 h ago", f["evidence"])
+        self.assertIn("accounting.json last pass 144 h ago", f["evidence"])
+        self.assertIn("disk pass job gui/501/com.teamleaderleo.glaeda.disk-pressure loaded, last exit 0", f["evidence"])
+        self.assertEqual(f["auto_fix"], "impossible")
+
+    def test_one_stale_snapshot_is_enough(self) -> None:
+        self.mini.pass_facts = self.disk_pass(NOW - 900, NOW - 27 * 3600)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        self.assertNotIn("sizes.json", report["findings"][0]["evidence"])
+
+    def test_missing_snapshots_and_an_unloaded_agent_are_a_finding(self) -> None:
+        self.mini.pass_facts = self.disk_pass(None, None, agent="not loaded", last_exit=None)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        self.assertIn("sizes.json missing; accounting.json missing", report["findings"][0]["evidence"])
+        self.assertIn("disk-pressure not loaded", report["findings"][0]["evidence"])
+
+    def test_a_lone_accounting_snapshot_still_reports_the_missing_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            cache = Path(tmp) / ".cache/glaeda-disk"
+            cache.mkdir(parents=True)
+            (cache / "accounting.json").write_text(json.dumps({"1": {"at": NOW - 60}}))
+            found = health.check_disk_pass(health.Mini(Path(tmp)), NOW)
+            self.assertEqual([f["code"] for f in found], ["disk_pass_stale"])
+            self.assertIn("sizes.json missing", found[0]["evidence"])
+            self.assertNotIn("accounting.json", found[0]["evidence"])
+
+    def test_an_overridden_home_never_reads_the_system_daemons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"), \
+                unittest.mock.patch.object(health, "HOME", Path(tmp)), \
+                unittest.mock.patch.object(health, "SYSTEM_DAEMONS", Path(tmp) / "system"):
+            system = Path(tmp) / "system"
+            system.mkdir()
+            (system / f"{health.DISK_AGENT}.plist").write_text("")
+            self.assertIsNone(health.Mini(Path(tmp)).disk_pass())  # $HOME=tmp is not this account's home
+        self.assertEqual(health.newest_stamp([10**1000, True, float("nan"), "1", 5.0]), 5.0)
+
+    def headless(self, tmp: str, user: str) -> None:
+        system = Path(tmp) / "system"
+        system.mkdir(exist_ok=True)
+        (system / f"{health.DISK_AGENT}.plist").write_bytes(
+            health.plistlib.dumps({"Label": health.DISK_AGENT, "UserName": user}))
+
+    def test_a_headless_daemon_run_as_this_account_is_its_pass_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(health.sys, "platform", "darwin"))
+            stack.enter_context(unittest.mock.patch.object(health, "sh", lambda argv, **_k: (0, "\tlast exit code = 0\n")))
+            stack.enter_context(unittest.mock.patch.object(health, "account_home", lambda: Path(tmp)))
+            stack.enter_context(unittest.mock.patch.object(health, "account_name", lambda: "cmux"))
+            stack.enter_context(unittest.mock.patch.object(health, "SYSTEM_DAEMONS", Path(tmp) / "system"))
+            self.headless(tmp, "cmux")
+            facts = health.Mini(Path(tmp)).disk_pass()  # no snapshot yet: the installed job alone makes a disk host
+            self.assertEqual(facts["agent"], f"system/{health.DISK_AGENT} loaded")
+            self.assertIn("sizes.json missing", health.check_disk_pass(health.Mini(Path(tmp)), NOW)[0]["evidence"])
+            self.headless(tmp, "someone-else")  # another account's daemon is not this account's pass
+            self.assertIsNone(health.Mini(Path(tmp)).disk_pass())
+            mini = health.Mini(Path(tmp))
+            (Path(tmp) / "system" / f"{health.RUNNER_HYGIENE}.{mini.uid}.plist").write_bytes(
+                health.plistlib.dumps({"Label": f"{health.RUNNER_HYGIENE}.{mini.uid}", "UserName": "cmux"}))
+            facts = mini.disk_pass()  # glaeda-runner-hygiene --user cmux: the runner-cache profile's pass job
+            self.assertEqual(facts["agent"], f"system/{health.RUNNER_HYGIENE}.{mini.uid} loaded")
+            self.assertIsNone(facts["accounting"])  # that profile writes no accounting.json
+            cache = Path(tmp) / ".cache/glaeda-disk"
+            cache.mkdir(parents=True)
+            (cache / "sizes.json").write_text(json.dumps({"at": 1.0, "sizes": {}}))
+            os.utime(cache / "sizes.json", (1.0, 1.0))
+            (cache / health.PROFILE_SNAPSHOT).write_text(json.dumps({"at": NOW - 60, "sizes": {}}))
+            os.utime(cache / health.PROFILE_SNAPSHOT, (NOW - 120, NOW - 120))
+            self.assertEqual(health.disk_pass_times(mini.disk_pass()), {health.PROFILE_SNAPSHOT: NOW - 60})
+            self.headless(tmp, "cmux")  # with this account's disk-pressure job too, it is a primary account
+            facts = mini.disk_pass()
+            self.assertEqual(facts["sizes_name"], "sizes.json")
+            self.assertIsNotNone(facts["accounting"])  # the profile beside it does not exempt accounting.json
+            self.assertIn("accounting.json missing", health.check_disk_pass(mini, NOW)[0]["evidence"])
+
+    def test_a_malformed_snapshot_is_missing_whenever_it_was_written(self) -> None:
+        for sizes, accounting in (({"junk": 1}, {"1": "x"}), ({"sizes": {}, "at": "bad"}, {"1": {"at": "bad"}}),
+                                  ({"sizes": {"/a": "bad"}, "at": NOW}, {"1": {"at": NOW}, "2": {}})):
+            self.mini.pass_facts = {"sizes": sizes, "accounting": accounting, "agent": "loaded", "last_exit": "0",
+                                    "written": {"sizes.json": NOW - 60, "accounting.json": NOW - 60}}
+            self.assertIn("sizes.json missing; accounting.json missing",
+                          self.run_once()["findings"][0]["evidence"])
+
+    def test_an_idle_pass_that_re_measured_nothing_still_counts(self) -> None:
+        facts = self.disk_pass(NOW - 8 * 86400, NOW - 8 * 86400)
+        facts["written"] = {"sizes.json": NOW - 900, "accounting.json": NOW - 900}  # --apply rewrote both
+        self.mini.pass_facts = facts
+        self.assertEqual(self.run_once()["findings"], [])
+        facts["accounting"] = {"1": {"at": 0}}  # an epoch stamp is a stamp: the write time decides
+        self.assertEqual(self.run_once()["findings"], [])
+        facts["sizes"] = {}  # a file that does not parse is missing, whenever it was written
+        self.assertIn("sizes.json missing", self.run_once()["findings"][0]["evidence"])
+
+    def test_a_host_without_glaeda_disk_is_not_judged(self) -> None:
+        self.mini.pass_facts = None
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_one_item_measured_in_the_window_means_the_pass_ran(self) -> None:
+        facts = self.disk_pass(NOW - 900, NOW - 900, header_at=NOW - 8 * 86400)
+        facts["sizes"]["sizes"]["/never-timed"] = 3  # an item with no time of its own keeps `at` old
+        self.mini.pass_facts = facts
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def real_mini(self, home: Path, summary: dict | None = None) -> health.Mini:
+        mini = health.Mini(home)
+        if summary is not None:
+            path = home / ".local/state/glaeda/disk/summary.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(summary))
+        cache = home / ".cache/glaeda-disk"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "sizes.json").write_text(json.dumps({"at": 1.0, "sizes": {"/a": 1}, "measured_at": {"/a": NOW - 60}}))
+        os.utime(cache / "sizes.json", (NOW - 3600, NOW - 3600))  # written before its newest measurement
+        return mini
+
+    def test_disk_pass_reads_glaeda_disks_own_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            home = Path(tmp)
+            self.assertIsNone(health.Mini(home).disk_pass())  # no agent, no snapshot: not a glaeda-disk host
+            mini = self.real_mini(home)
+            facts = mini.disk_pass()
+            self.assertEqual(health.disk_pass_times(facts), {"sizes.json": NOW - 60, "accounting.json": None})
+            self.assertEqual(facts["agent"], "not installed")
+            self.assertIn("accounting.json missing", health.check_disk_pass(mini, NOW)[0]["evidence"])
+
+    def test_the_runner_cache_profile_needs_no_accounting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            mini = self.real_mini(Path(tmp), {"schema": "glaeda-disk/v1",
+                                              "accounting": [{"scope": "runner-cache-profile"}]})
+            self.assertEqual(health.disk_pass_times(mini.disk_pass()), {"sizes.json": NOW - 60})
+            self.assertEqual(health.check_disk_pass(mini, NOW), [])
+            self.assertEqual(health.check_disk_pass(mini, NOW + 2 * 86400)[0]["code"], "disk_pass_stale")
+
+    def test_a_linux_host_is_not_judged_by_the_launch_agent_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "linux"):
+            mini = self.real_mini(Path(tmp))
+            self.assertIsNone(mini.disk_pass())
+            self.assertEqual(health.check_disk_pass(mini, NOW + 9 * 86400), [])
+
     def test_unmeasured_space_is_a_health_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,
                                                                    "top_level": [{"path": "/Users/Shared", "bytes": 8 * 1024**3}]}]}
@@ -263,6 +868,15 @@ class DiskAndLeaks(Base):
         self.assertEqual(self.ids(report), ["disk_unmeasured"])
         self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
         self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
+
+    def test_a_census_residual_is_named_not_pending(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
+            "accounting_gap": 40 * 1024**3,
+            "residual": {"category": "apfs-invisible (open-deleted/purgeable)", "bytes": 40 * 1024**3}}]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_unmeasured"])
+        self.assertIn("apfs-invisible", report["findings"][0]["evidence"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
 
     def test_runner_profile_unmeasured_remainder_is_not_a_volume_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
@@ -275,6 +889,22 @@ class DiskAndLeaks(Base):
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": "unknown"},
                                                                        {"unmeasured": None}]}
         self.assertEqual(self.run_once()["findings"], [])
+
+    def test_gate_restarts_of_a_stuck_listener_are_healed_for_a_day(self) -> None:
+        # glaeda-cmux-runner-hook stuck_acquire writes one line per restart; ci-dash shows them under healed
+        self.mini.home = self.dir
+        path = self.dir / ".local/state/glaeda/cmux-runner" / health.GATE_RESTARTS
+        path.parent.mkdir(parents=True)
+        line = {"cause": "listener_acquire_stuck", "runner": "actions-runner-glaeda-12", "request": "f233fe94",
+                "acknowledged": "2026-11-17 08:02:33Z", "held_s": 901, "bound_s": 900.0}
+        path.write_text(json.dumps({**line, "t": NOW - 2 * health.HEALED_KEEP_S}) + "\nnot json\n" +
+                        json.dumps({**line, "t": NOW - 60, "at": "then"}) + "\n")
+        healed = self.run_once()["healed"]
+        self.assertEqual([(h["id"], h["code"], h["auto_fix"]) for h in healed],
+                         [("listener_acquire_stuck:actions-runner-glaeda-12:f233fe94", "listener_acquire_stuck",
+                           "done")])
+        self.assertIn("started no Worker in 901 s", healed[0]["evidence"])
+        self.assertEqual(health.gate_restarts_healed(Path("/nonexistent"), NOW), [])
 
     def test_orphaned_apps_are_healed_by_the_backstop(self) -> None:
         self.mini.leaks = [(99, "/tmp/cmux DEV.app")]
@@ -367,6 +997,63 @@ class Tailscale(Base):
         self.run_once(NOW + 120)
         self.assertEqual(self.mini.did, ["vpn C7E1635B-DD04-49D8-A16F-FB4E34804764"])
 
+    def test_running_without_a_tunnel_route_off_a_ci_mini_is_reported_on_the_second_run_never_healed(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-21: Running, but 100.64/10 gone, so tailnet ssh timed out all afternoon.
+        self.mini.route = "en0"
+        self.mini.names = ["cosmic-gray"]
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        first = self.run_once()
+        self.assertEqual(first["findings"], [], "one sighting can be a reconnect's gap")
+        second = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(second), ["tailscale_no_route"])
+        self.assertIn("(app)", second["findings"][0]["evidence"])
+        self.assertIn("out of en0", second["findings"][0]["evidence"])
+        self.assertIn("scutil --nc", second["findings"][0]["note"])
+        self.assertEqual(second["findings"][0]["auto_fix"], "impossible")
+        self.run_once(NOW + 240)
+        self.assertEqual(self.mini.did, [], "only a CI runner mini restarts its own Tailscale")
+
+    def test_a_route_gap_that_heals_by_the_next_run_is_never_reported(self) -> None:
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once()["findings"], [])
+        self.mini.route = "utun4"
+        self.assertEqual(self.run_once(NOW + 120)["findings"], [])
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once(NOW + 240)["findings"], [], "the count starts again")
+
+    def test_a_standalone_tailscaled_without_a_route_names_its_own_fix(self) -> None:
+        self.mini.ts, self.mini.route = ("standalone", "Running", ""), "en0"
+        self.run_once()
+        note = self.run_once(NOW + 120)["findings"][0]["note"]
+        self.assertIn("kickstart -k system/com.tailscale.tailscaled", note)
+
+    def test_by_hand_it_reports_at_once(self) -> None:
+        self.mini.route = "en0"
+        self.assertEqual(self.ids(self.run_once(apply=False)), ["tailscale_no_route"])
+
+    def test_a_route_it_cannot_read_is_a_probe_error_never_a_heal(self) -> None:
+        self.mini.route = None
+        self.run_once()
+        report = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertEqual((report["findings"][0]["severity"], report["findings"][0]["auto_fix"]), ("warn", "impossible"))
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_runner_host_without_any_tailscale_cli_is_a_warning_not_healthy(self) -> None:
+        self.mini.ts = None  # neither /usr/local/bin/tailscale nor the app bundle's CLI
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["tailscale_cli_missing"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "impossible"))
+        self.assertIn(health.TAILSCALE_STANDALONE, f["evidence"])
+        self.assertIn(health.TAILSCALE_APP, f["evidence"])
+        self.run_once(NOW + 120)
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_host_without_runners_or_tailscale_reports_nothing(self) -> None:
+        self.mini.ts, self.mini.agents = None, []
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_no_backend_state_is_a_probe_error_never_a_heal(self) -> None:
         self.mini.ts = ("app", None, "Tailscale status --json exited 0 without a BackendState: The Tailscale GUI "
                         "failed to start")
@@ -384,6 +1071,1142 @@ class Tailscale(Base):
         self.assertEqual(self.run_once(NOW + 120)["findings"][0]["auto_fix"], "impossible")
         self.run_once(NOW + 240)
         self.assertEqual(self.mini.did, [])
+
+
+SERVICE = "C7E1635B-DD04-49D8-A16F-FB4E34804764"
+SIX_H = 6 * 3600
+
+
+class TailscaleRouteRestart(Base):
+    """tailscale_no_route restarts Tailscale itself, only on an idle CI runner mini, at most once per 6 h."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.route = "en0"
+
+    def broken_twice(self, at: float = NOW, **kw) -> dict:
+        self.run_once(at, **kw)
+        return self.run_once(at + 120, **kw)
+
+    def restarts(self) -> int:
+        return sum(1 for d in self.mini.did if d.startswith("restart"))
+
+    def test_an_idle_ci_mini_restarts_once_and_reports_it_healed(self) -> None:
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, ["lock", "restart app"])
+        self.assertEqual(self.mini.restart_cmds, [["/usr/sbin/scutil", "--nc", "stop", SERVICE],
+                                                  ["/usr/sbin/scutil", "--nc", "start", SERVICE]])
+        self.assertEqual(report["findings"], [])
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertTrue(report["heals"][0]["ok"])
+        healed = report["healed"][0]
+        self.assertEqual((healed["code"], healed["auto_fix"]), ("tailscale_no_route", "done"))
+        self.assertIn("restarted", healed["action"])
+        self.assertIn("utun4", healed["action"])
+
+    def test_a_cli_that_did_not_answer_with_the_route_off_the_tunnel_still_counts(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: `status --json` timed out every other run under load, which masked the
+        # finding; the route lookup is its own look, so en0 there is tailscale_no_route whatever the CLI said
+        self.run_once()
+        self.mini.ts = ("app", None, "status --json timed out after 15 s")
+        report = self.run_once(NOW + 120)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"], "the second run in a row")
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(report["findings"], [], "after the restart the route is on the tunnel")
+
+    def test_a_cli_timeout_alone_reports_the_route_it_saw(self) -> None:
+        self.mini.ts = ("app", None, "status --json timed out after 15 s")
+        report = self.run_once(apply=False)
+        self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertIn("gave no BackendState", report["findings"][0]["evidence"])
+        self.assertIn("out of en0", report["findings"][0]["evidence"])
+
+    def test_a_cli_that_did_not_answer_with_the_route_on_the_tunnel_is_a_probe_error(self) -> None:
+        self.run_once()
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, [], "a run that could not judge the tunnel restarts nothing")
+
+    def test_a_restart_rechecked_by_a_cli_that_times_out_is_judged_on_the_route(self) -> None:
+        self.mini.after_restart = (None, "utun4")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.assertTrue(report["heals"][0]["ok"])
+        self.assertEqual(report["findings"], [])
+
+    def test_a_run_whose_route_lookup_named_no_interface_keeps_the_count_too(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: under load, runs that read no route reported nothing and started the count again
+        self.run_once()
+        self.mini.route = None
+        report = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertIn("named no interface", report["findings"][0]["evidence"])
+        self.assertEqual(self.mini.did, [], "a run that could not look restarts nothing")
+        self.mini.route = "en0"
+        report = self.run_once(NOW + 240)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertEqual(self.restarts(), 1)
+
+    def test_a_route_seen_on_the_tunnel_still_starts_the_count_again(self) -> None:
+        self.run_once()
+        self.mini.route = "utun4"
+        self.run_once(NOW + 120)
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once(NOW + 240)["findings"], [])
+        self.assertEqual(self.restarts(), 0)
+
+    def test_the_attempt_is_written_before_the_restart_runs(self) -> None:
+        self.broken_twice()
+        self.assertEqual(len(self.mini.state_at_restart), 1)
+        self.assertEqual(self.mini.state_at_restart[0]["last_attempt_at"], NOW + 120)
+        doc = json.loads(self.mini.restart_state.read_text())
+        self.assertEqual(doc["last_attempt_at"], NOW + 120)
+        self.assertTrue(doc["ok"])
+        self.assertEqual(doc["checked_at"], health.iso(NOW + 120 + health.TAILSCALE_RESTART_SETTLE_S),
+                         "the re-check's time, after the settle wait")
+
+    def test_an_unwritable_restart_state_is_no_restart_and_alerts(self) -> None:
+        real = health.write_json
+
+        def write_json(path, doc):
+            if path == self.mini.restart_state:
+                raise PermissionError(path)
+            real(path, doc)
+
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("cannot write the restart state", f["note"])
+
+    def test_a_bad_last_attempt_time_is_unreadable_state_never_a_crash(self) -> None:
+        for at in (float("nan"), float("inf"), float("-inf"), 1e300, -1.0, NOW + 10 * SIX_H):
+            for failures in (0, 1, 3):
+                self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+                self.mini.restart_state.write_text(json.dumps({"last_attempt_at": at, "ok": False,
+                                                               "result": "still Running", "failures": failures}))
+                report = self.broken_twice()
+                self.assertEqual(self.restarts(), 0, (at, failures))
+                f = report["findings"][0]
+                self.assertEqual(f["auto_fix"], "impossible", (at, failures))
+                self.assertIn("unreadable", f["note"], (at, failures))
+
+    def test_still_broken_after_the_restart_is_reported_and_not_retried_within_6_h(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertFalse(report["heals"][0]["ok"])
+        f = report["findings"][0]
+        self.assertIn("still", f["note"])
+        self.assertIn("en0", f["note"])
+        self.assertIn(health.iso(NOW + 120 + SIX_H), f["note"], "names when the next try is allowed")
+        self.assertEqual(f["auto_fix"], "impossible", "a restart that did not fix it alerts (ci-dash health_alerts)")
+        for i in range(1, 20):  # every two minutes for the next 40 minutes, then hours later
+            report = self.run_once(NOW + 120 + i * 120)
+            self.assertEqual(report["findings"][0]["auto_fix"], "impossible", i)
+        report = self.run_once(NOW + 120 + SIX_H - 60)
+        self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn(f"Tailscale restart at {health.iso(NOW + 120)} did not restore the route", f["note"])
+        self.assertIn(f"next try after {health.iso(NOW + 120 + SIX_H)}", f["note"])
+
+    def test_a_restart_command_that_failed_alerts(self) -> None:
+        self.mini.restart_ran = False
+        self.mini.after_restart = ("Running", "en0")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("a command failed", f["note"])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 1)
+
+    def test_after_a_failed_restart_every_wait_still_alerts(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken_twice()
+        self.mini.busy = "a CI job is running (Runner.Worker)"  # the window is over, but the mini is busy
+        report = self.run_once(NOW + 120 + SIX_H)
+        self.assertEqual(self.restarts(), 1)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible", "pending only while no restart has failed")
+        self.assertIn("did not restore the route", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+
+    def test_a_crash_mid_restart_counts_as_a_failed_restart(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"schema": health.TAILSCALE_RESTART_SCHEMA,
+                                                       "last_attempt_at": NOW - 60, "result": "started",
+                                                       "ok": False, "failures": 1}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("did not restore the route", report["findings"][0]["note"])
+
+    def test_three_failed_restarts_in_a_row_stop_restarting_until_the_route_is_seen_clear(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken_twice()
+        for i in range(1, 6):  # every 6 h: the second and third restarts, then no more
+            report = self.run_once(NOW + 120 + i * SIX_H)
+        self.assertEqual(self.restarts(), health.TAILSCALE_RESTART_GIVE_UP)
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 3)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("3 Tailscale restarts in a row", f["note"])
+        # the route comes back (an operator fixed it): the count resets, and a later break is restarted again
+        self.mini.ts, self.mini.route = ("app", "Running", ""), "utun4"
+        self.assertEqual(self.run_once(NOW + 120 + 6 * SIX_H)["findings"], [])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 0)
+        self.mini.route = "en0"
+        self.broken_twice(NOW + 120 + 7 * SIX_H)
+        self.assertEqual(self.restarts(), health.TAILSCALE_RESTART_GIVE_UP + 1)
+
+    def test_a_restart_that_worked_resets_the_failure_count(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"last_attempt_at": NOW - 2 * SIX_H, "ok": False,
+                                                       "result": "still Running, 100.100.100.100 via en0",
+                                                       "failures": 2}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(json.loads(self.mini.restart_state.read_text())["failures"], 0)
+
+    def test_an_unreadable_failure_count_gives_up(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text(json.dumps({"last_attempt_at": NOW - 2 * SIX_H, "failures": "many"}))
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+
+    def test_a_second_sighting_within_6_h_does_not_restart_again(self) -> None:
+        self.broken_twice()
+        self.assertEqual(self.restarts(), 1)
+        self.mini.ts, self.mini.route = ("app", "Running", ""), "en0"  # it broke again an hour later
+        report = self.broken_twice(NOW + 3600)
+        self.assertEqual(self.restarts(), 1)
+        self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming for hours: alert")
+        self.assertIn("6 h", report["findings"][0]["note"])
+        self.assertIn(f"next after {health.iso(NOW + 120 + SIX_H)}", report["findings"][0]["note"])
+
+    def test_after_6_h_a_restart_is_allowed_again(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken_twice()
+        self.run_once(NOW + 120 + SIX_H)
+        self.assertEqual(self.restarts(), 2)
+
+    def test_a_busy_mini_is_not_restarted(self) -> None:
+        self.mini.busy = "a CI job is running (/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2)"
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "pending")
+        self.assertIn("Runner.Worker", f["note"])
+        self.assertFalse(self.mini.restart_state.exists(), "a refused attempt is no attempt")
+        self.mini.busy = ""
+        self.run_once(NOW + 240)
+        self.assertEqual(self.restarts(), 1, "restarted once the mini went idle")
+
+    def test_an_unreadable_busy_state_is_busy(self) -> None:
+        self.mini.busy = "cannot list processes"
+        self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_wait_older_than_6_h_alerts(self) -> None:
+        # a stranded host lock or a stuck jobs/ entry looks busy forever: past 6 h it is no short wait (on a host
+        # that cannot drain, here a reserved one; a drainable one drains after an hour, TailscaleRouteDrain)
+        self.mini.fleet_res = "reserved for someone"
+        self.mini.busy = "a dev-build worker job is in /Users/Shared/cmux-build-fleet/jobs"
+        report = self.broken_twice()
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(NOW + SIX_H - 1)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(NOW + SIX_H)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn(f"waiting for an idle mini since {health.iso(NOW)}", f["note"])
+        self.assertIn("jobs", f["note"])
+        self.assertEqual(self.restarts(), 0)
+
+    def test_a_held_lock_older_than_6_h_alerts(self) -> None:
+        self.mini.lock_why = "a job or a fleet build holds the fleet host lock"
+        self.broken_twice()
+        report = self.run_once(NOW + SIX_H + 600)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("host lock", report["findings"][0]["note"])
+
+    def test_a_host_gate_that_cannot_answer_alerts(self) -> None:
+        self.mini.busy = health.NoAnswer("glaeda-disk's host gate could not answer (RuntimeError)")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("could not answer", report["findings"][0]["note"])
+
+    def test_a_held_host_lock_is_not_idle(self) -> None:
+        self.mini.lock_why = "the fleet host lock is held"
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertIn("host lock", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending", "a short wait")
+
+    def test_no_fleet_dir_alerts(self) -> None:
+        self.mini.lock_why = health.NoAnswer("no fleet dir /Users/Shared/cmux-build-fleet")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("no fleet dir", report["findings"][0]["note"])
+
+    def test_job_patterns_that_cannot_be_read_alert(self) -> None:
+        self.mini.jobs = health.NoAnswer("glaeda-disk's job patterns could not be read (AttributeError)")
+        report = self.broken_twice()
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+
+    def test_a_job_that_started_before_the_lock_was_taken_stops_the_restart(self) -> None:
+        self.mini.jobs = "a CI job is running (Runner.Worker)"
+        self.broken_twice()
+        self.assertEqual(self.mini.did, ["lock"])
+        self.assertFalse(self.mini.restart_state.exists())
+
+    def test_cmux_lawrence_is_never_restarted_even_opted_in(self) -> None:
+        for names in (["cmux-lawrence"], ["Cmux Lawrence’s Mac mini"], ["cmux9s-mac-mini", "cmux-lawrences-mac-mini"]):
+            self.mini.names = names
+            self.mini.opt_in = ({"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": names[0]}, "")
+            report = self.broken_twice()
+            self.assertEqual(self.mini.did, [], names)
+            self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+            self.assertIn("never", report["findings"][0]["note"])
+
+    def test_a_host_without_the_opt_in_is_never_restarted(self) -> None:
+        # which hosts restart is declared in leo-workspace's fleet-registry.json and arrives as the opt-in file
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("tailscale-self-heal.json", f["note"])
+
+    def test_an_opt_in_for_another_host_or_of_another_schema_is_no_opt_in(self) -> None:
+        for doc in ({"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": "cmuxs-mac-mini-5"},
+                    {"schema": "glaeda-tailscale-self-heal/v2", "host": "cmux9s-mac-mini"},
+                    {"host": "cmux9s-mac-mini"},
+                    {"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": ["cmux9s-mac-mini"]},
+                    {"schema": health.TAILSCALE_OPT_IN_SCHEMA, "host": ""}):
+            self.mini.opt_in = (doc, "")
+            report = self.broken_twice()
+            self.assertEqual(self.mini.did, [], doc)
+            self.assertEqual(report["findings"][0]["auto_fix"], "impossible", doc)
+
+    def test_an_unreadable_tailnet_name_is_no_restart(self) -> None:
+        self.mini.names = None
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("tailnet name", report["findings"][0]["note"])
+
+    def test_an_unknown_role_is_never_restarted(self) -> None:
+        for facts in ({"platform": "darwin", "runners": 2, "setup_args": None, "role": "fleet-mini"},
+                      {"platform": "darwin", "runners": 2, "setup_args": [], "role": None},
+                      {"platform": "darwin", "runners": None, "setup_args": [], "role": "fleet-mini"}):
+            self.mini.facts = facts
+            self.broken_twice()
+            self.assertEqual(self.mini.did, [], facts)
+        self.mini.facts = self.mini.facts | {"runners": 2, "setup_args": [], "role": "fleet-mini"}
+        self.mini.names = []
+        self.broken_twice()
+        self.assertEqual(self.mini.did, [], "a host that cannot be named is not restarted")
+
+    def test_the_first_sighting_never_restarts(self) -> None:
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.did, [])
+
+    def test_report_mode_never_restarts(self) -> None:
+        report = self.run_once(apply=False)
+        self.assertEqual(self.ids(report), ["tailscale_no_route"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending", "the LaunchAgent's --apply run restarts it")
+        self.run_once(NOW + 120, apply=False)
+        self.assertEqual(self.mini.did, [])
+        self.assertFalse(self.mini.restart_state.exists())
+
+    def test_the_kill_switch_stops_the_restart(self) -> None:
+        self.mini.restart_off = "GLAEDA_TAILSCALE_RESTART=off"
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertIn("GLAEDA_TAILSCALE_RESTART=off", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming: alert")
+
+    def test_mini_health_s_own_kill_switch_stops_it_too(self) -> None:
+        report = self.broken_twice(heal_ok=False)
+        self.assertEqual(self.mini.did, [])
+        self.assertIn("healing is off", report["findings"][0]["note"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no restart is coming: alert")
+
+    def test_an_unreadable_restart_state_is_no_restart(self) -> None:
+        self.mini.restart_state.parent.mkdir(parents=True, exist_ok=True)
+        self.mini.restart_state.write_text("{not json")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertIn("unreadable", report["findings"][0]["note"])
+
+    def test_a_standalone_tailscaled_is_kickstarted_with_its_sudo_rule(self) -> None:
+        self.mini.ts = ("standalone", "Running", "")
+        self.mini.sudo_allowed = True
+        self.broken_twice()
+        self.assertEqual(self.mini.restart_cmds, [["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", "-k",
+                                                   "system/com.tailscale.tailscaled"]])
+
+    def test_a_standalone_tailscaled_without_the_sudo_rule_is_reported_only(self) -> None:
+        self.mini.ts = ("standalone", "Running", "")
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible")
+        self.assertIn("NOPASSWD", f["note"])
+
+    def test_an_app_without_a_vpn_service_is_reported_only(self) -> None:
+        self.mini.vpn_service = lambda: None
+        report = self.broken_twice()
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+
+
+class TailscaleRouteDrain(Base):
+    """A mini that is never idle (cmuxs-mac-mini-5: 12 runners) drains after TAILSCALE_DRAIN_AFTER_S, restarts once
+    the jobs are done, and ends the drain; the drain is capped and skips reserved hosts."""
+
+    BUSY = "a CI job is running (/Users/cmux/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 1 2)"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.route = "en0"
+        self.mini.busy = self.BUSY
+        self.after = health.TAILSCALE_DRAIN_AFTER_S
+
+    def restarts(self) -> int:
+        return sum(1 for d in self.mini.did if d.startswith("restart"))
+
+    def broken(self, until: float, step: float = 120) -> dict:
+        t, report = NOW, {}
+        while t <= until:
+            report = self.run_once(t)
+            t += step
+        return report
+
+    def test_it_waits_an_hour_before_draining(self) -> None:
+        report = self.broken(NOW + self.after - 1)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+
+    def test_a_busy_mini_drains_restarts_when_the_jobs_finish_and_ends_the_drain(self) -> None:
+        report = self.run_once(NOW)
+        report = self.run_once(NOW + self.after)
+        self.assertEqual(self.mini.did, ["drain"])
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "pending")
+        self.assertIn("draining from now", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+        # jobs still run: the drain holds, no restart
+        self.mini.drain_jobs = self.BUSY
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+        self.assertEqual(self.mini.marker[0], "ours")
+        self.assertIn("draining since", report["findings"][0]["note"])
+        self.assertIn("Runner.Worker", report["findings"][0]["note"])
+        # the last job finished: the restart runs under the host lock, then the marker goes
+        self.mini.drain_jobs = ""
+        report = self.run_once(NOW + self.after + 240)
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.marker, ("none", None))
+
+    def test_a_restart_that_did_not_fix_it_still_ends_the_drain(self) -> None:
+        self.mini.after_restart = ("Running", "en0")
+        self.broken(NOW + self.after)
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(self.mini.marker, ("none", None))
+
+    def test_the_drain_is_capped_and_alerts(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        cap = NOW + self.after + health.TAILSCALE_DRAIN_MAX_S
+        report = self.run_once(cap - 1)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        report = self.run_once(cap)
+        f = report["findings"][0]
+        self.assertEqual(f["auto_fix"], "impossible", "past the cap: an alert")
+        self.assertIn("cap", f["note"])
+        self.assertIn("Runner.Worker", f["note"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "the cap ends the drain, never a restart under a job")
+        # no new drain for 6 h, and the finding keeps alerting
+        report = self.run_once(cap + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("no drain before", report["findings"][0]["note"])
+        self.run_once(cap + health.TAILSCALE_RESTART_EVERY_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain", "drain"], "after 6 h it may drain again")
+
+    def test_a_host_lock_held_through_the_drain_is_capped_too(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.lock_why = "a job or a fleet build holds the fleet host lock"
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(report["findings"][0]["auto_fix"], "pending")
+        self.assertEqual(self.mini.marker[0], "ours", "a short wait keeps the drain")
+        report = self.run_once(NOW + self.after + health.TAILSCALE_DRAIN_MAX_S)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("drain cap", report["findings"][0]["note"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_pass_that_lost_the_race_leaves_the_winner_s_drain(self) -> None:
+        # review P2: two passes both saw no marker; the loser's start_drain fails and it must not end the winner's
+        self.broken(NOW + self.after - 120)
+        winner = {"schema": health.RESERVATION_SCHEMA, "owner": health.TAILSCALE_DRAIN_OWNER, "purpose": "x",
+                  "since": int(NOW + self.after), "until": int(NOW + self.after + 7800)}
+        self.mini.drain_write = "another reservation appeared"
+        real = self.mini.start_drain
+
+        def lose(now, purpose):
+            self.mini.marker = ("ours", {**winner, "raw": b"winner"})
+            return real(now, purpose)
+        self.mini.start_drain = lose
+        self.run_once(NOW + self.after)
+        self.assertEqual(self.mini.marker[1]["raw"], b"winner")
+        self.assertNotIn("undrain", self.mini.did)
+
+    def test_a_refusal_under_the_lock_ends_the_drain(self) -> None:
+        # review P2: an idle drained host whose restart is refused (state unwritable) must not stay closed to jobs
+        self.broken(NOW + self.after)
+        real = health.write_json
+
+        def write_json(path, doc):
+            if path == self.mini.restart_state:
+                raise PermissionError(path)
+            real(path, doc)
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.restarts(), 0)
+        self.assertEqual(self.mini.did, ["drain", "lock", "undrain"])
+        self.assertIn("cannot write the restart state", report["findings"][0]["note"])
+
+    def test_an_unwritable_drain_record_is_no_drain(self) -> None:
+        # review P2: without the cooldown record a capped drain could start again at once, so none starts
+        real = health.write_json
+        drain_record = health.drain_state_path(self.state)
+
+        def write_json(path, doc):
+            if path == drain_record:
+                raise PermissionError(path)
+            real(path, doc)
+        self.addCleanup(setattr, health, "write_json", real)
+        health.write_json = write_json
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn(health.TAILSCALE_DRAIN_STATE, report["findings"][0]["note"])
+
+    def test_probe_errors_do_not_strand_a_drain(self) -> None:
+        # review P2: runs that cannot judge the route keep the drain, but the cap and kill switches still end it
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+        report = self.run_once(NOW + self.after + health.TAILSCALE_DRAIN_MAX_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "the cap ends it")
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+        self.assertIn("drain cap", report["findings"][0]["note"])
+        self.assertIn("no drain before", health.drain_gave_up(health.drain_state_path(self.state),
+                                                              NOW + self.after + health.TAILSCALE_DRAIN_MAX_S + 60))
+
+    def test_a_cap_whose_record_failed_still_blocks_a_new_drain(self) -> None:
+        # re-review P2: gave_up_at could not be written; the started record must still keep the 6 h cooldown
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        real = health.write_json
+        drain_record = health.drain_state_path(self.state)
+        cap = NOW + self.after + health.TAILSCALE_DRAIN_MAX_S
+
+        def write_json(path, doc):
+            if path == drain_record and "gave_up_at" in doc:
+                raise PermissionError(path)
+            real(path, doc)
+        with mock.patch.object(health, "write_json", write_json):
+            report = self.run_once(cap)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        self.assertIn("could not be written", report["findings"][0]["note"])
+        report = self.run_once(cap + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "no redrain 120 s after the cap")
+        self.assertIn("did not record its end", report["findings"][0]["note"])
+        self.run_once(cap + health.TAILSCALE_RESTART_EVERY_S)
+        self.assertEqual(self.mini.did, ["drain", "undrain", "drain"])
+
+    def test_a_drain_that_ended_early_does_not_block_the_next_one(self) -> None:
+        self.broken(NOW + self.after)
+        self.run_once(NOW + self.after + 120)  # idle: restart, undrain
+        self.assertEqual(self.mini.did, ["drain", "lock", "restart app", "undrain"])
+        self.assertEqual(health.drain_gave_up(health.drain_state_path(self.state), NOW + 4 * 3600), "")
+
+    def test_a_utun_route_ends_the_drain_even_when_the_cli_times_out(self) -> None:
+        # re-review P2: the route is back but the CLI timed out: the drain must not hold jobs off until the cap
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        report = self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_utun_route_under_a_cli_timeout_starts_the_count_again(self) -> None:
+        # re-review P2: after the route was seen on utun, one en0 sighting must not drain again at once
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), "utun4"
+        self.run_once(NOW + self.after + 120)
+        self.mini.ts, self.mini.route = ("app", "Running", ""), "en0"
+        report = self.run_once(NOW + self.after + 240)
+        self.assertEqual(report["findings"], [], "one sighting after a clear route is no finding")
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+        report = self.run_once(NOW + self.after + 360)
+        self.assertEqual(report["findings"][0]["since"], health.iso(NOW + self.after + 240), "a fresh since")
+        self.assertEqual(self.mini.did, ["drain", "undrain"], "and a fresh hour before any drain")
+
+    def test_a_kill_switch_during_probe_errors_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.ts, self.mini.route = ("app", None, "status --json timed out after 15 s"), None
+        self.mini.restart_off = "GLAEDA_TAILSCALE_RESTART=off"
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_reserved_host_is_never_drained(self) -> None:
+        # cmux16-24 are opted in (ci-runner) but Lawrence's until 2026-10-28: the fleet list holds them
+        self.mini.fleet_res = "reserved for lawrencecchen until 2026-10-28T23:59:59Z (lawrence-2026-10-25)"
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertIn("no drain: reserved for lawrencecchen", report["findings"][0]["note"])
+
+    def test_no_answer_on_the_fleet_reservations_is_no_drain(self) -> None:
+        self.mini.fleet_res = health.NoAnswer("glaeda-disk cannot say whether the fleet reserved this host (AttributeError)")
+        report = self.broken(NOW + self.after + 600)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible", "no answer alerts")
+
+    def test_someone_else_s_reservation_is_never_replaced(self) -> None:
+        self.mini.marker = ("other", {"schema": health.RESERVATION_SCHEMA, "owner": "leo", "purpose": "soak",
+                                      "since": int(NOW), "until": int(NOW + 86400)})
+        self.mini.busy = "the host is reserved"
+        report = self.broken(NOW + self.after + 600)
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(self.mini.marker[1]["owner"], "leo")
+        self.assertIn("someone else's reservation", report["findings"][0]["note"])
+
+    def test_a_marker_that_cannot_be_written_is_no_drain(self) -> None:
+        self.mini.drain_write = "another reservation appeared"
+        report = self.broken(NOW + self.after)
+        self.assertNotIn("drain", self.mini.did)
+        self.assertIn("another reservation appeared", report["findings"][0]["note"])
+
+    def test_the_route_coming_back_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.route = "utun4"
+        self.assertEqual(self.run_once(NOW + self.after + 120)["findings"], [])
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_a_run_that_could_not_look_keeps_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.route = None
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain"])
+
+    def test_a_kill_switch_ends_the_drain(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.mini.restart_off = "GLAEDA_TAILSCALE_RESTART=off"
+        self.run_once(NOW + self.after + 120)
+        self.assertEqual(self.mini.did, ["drain", "undrain"])
+
+    def test_report_mode_never_drains_or_ends_one(self) -> None:
+        self.broken(NOW + self.after)
+        self.mini.drain_jobs = self.BUSY
+        self.run_once(NOW + self.after + 120, apply=False)
+        self.assertEqual(self.mini.did, ["drain"])
+        self.assertEqual(self.mini.marker[0], "ours")
+
+
+class DrainMarkerOnDisk(unittest.TestCase):
+    """The real Mini's marker writes against a temporary fleet dir, read back by the runner hook's parser."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fleet = Path(self.tmp.name) / "fleet"
+        self.fleet.mkdir()
+        patch = mock.patch.object(health, "FLEET_DIR", self.fleet)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.mini = health.Mini(Path(self.tmp.name))
+        self.rules = load("glaeda_reservation_for_health", ROOT / "scripts" / "glaeda_reservation.py")
+
+    def test_the_marker_is_a_reservation_the_runner_hook_honours(self) -> None:
+        self.assertEqual(self.mini.start_drain(NOW, "drain for a Tailscale restart"), "")
+        marker, why = self.rules.parse((self.fleet / "reservation.json").read_text())
+        self.assertIsNone(why)
+        self.assertTrue(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S))
+        self.assertFalse(self.rules.active(marker, NOW + health.TAILSCALE_DRAIN_MAX_S + health.TAILSCALE_DRAIN_LAPSE_S),
+                         "it lapses by itself if mini-health stops")
+        kind, seen = self.mini.host_reservation()
+        self.assertEqual(kind, "ours")
+        self.assertTrue(self.mini.end_drain(seen))
+        self.assertFalse((self.fleet / "reservation.json").exists())
+        self.assertEqual(sorted(p.name for p in self.fleet.iterdir()), [".reservation.lock"], "no temp file left")
+
+    def test_a_marker_replaced_since_it_was_read_is_never_removed(self) -> None:
+        # review P1: a glaeda-mini-fleet reserve between the read and the unlink must survive
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        theirs = json.dumps({"schema": "glaeda-reservation/v1", "owner": "lawrence", "purpose": "x",
+                             "since": int(NOW), "until": int(NOW + 3600)})
+        (self.fleet / "reservation.json").write_text(theirs)
+        self.assertFalse(self.mini.end_drain(seen))
+        self.assertEqual((self.fleet / "reservation.json").read_text(), theirs)
+
+    def test_another_pass_s_drain_is_not_removed_by_a_stale_read(self) -> None:
+        # review P2: a second drain marker (a later pass) differs in bytes from the one first read
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        (self.fleet / "reservation.json").unlink()
+        self.assertEqual(self.mini.start_drain(NOW + 120, "drain"), "")
+        self.assertFalse(self.mini.end_drain(seen))
+        self.assertTrue((self.fleet / "reservation.json").exists())
+
+    def test_removal_waits_for_mini_fleet_s_writer_lock(self) -> None:
+        self.assertEqual(self.mini.start_drain(NOW, "drain"), "")
+        _, seen = self.mini.host_reservation()
+        fd = os.open(self.fleet / ".reservation.lock", os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        clock = iter(range(0, 1000, 30))
+        with mock.patch.object(health.time, "monotonic", lambda: next(clock)), \
+                mock.patch.object(health.time, "sleep", lambda s: None):
+            self.assertFalse(self.mini.end_drain(seen), "a held writer lock is no removal")
+            self.assertIn("another reserve or release", self.mini.start_drain(NOW, "drain"))
+        self.assertTrue((self.fleet / "reservation.json").exists())
+
+    def test_another_reservation_is_never_overwritten_or_removed(self) -> None:
+        theirs = json.dumps({"schema": "glaeda-reservation/v1", "owner": "lawrence", "purpose": "x",
+                             "since": int(NOW), "until": int(NOW + 3600)})
+        (self.fleet / "reservation.json").write_text(theirs)
+        self.assertEqual(self.mini.host_reservation()[0], "other")
+        self.assertIn("another reservation", self.mini.start_drain(NOW, "drain"))
+        self.assertFalse(self.mini.end_drain(None))
+        self.assertFalse(self.mini.end_drain({"raw": theirs.encode() + b" "}))
+        self.assertEqual((self.fleet / "reservation.json").read_text(), theirs)
+
+    def test_an_unreadable_marker_is_someone_else_s(self) -> None:
+        (self.fleet / "reservation.json").write_text("{not json")
+        self.assertEqual(self.mini.host_reservation(), ("other", None))
+        self.assertFalse(self.mini.end_drain(None))
+        self.assertTrue((self.fleet / "reservation.json").exists())
+
+    def test_drain_busy_sees_dev_build_jobs(self) -> None:
+        self.mini.jobs_running = lambda: ""
+        self.assertEqual(self.mini.drain_busy(), "")
+        (self.fleet / "jobs").mkdir()
+        (self.fleet / "jobs" / "job-1").write_text("")
+        self.assertIn("dev-build worker job", self.mini.drain_busy())
+
+    def test_fleet_reservation_asks_glaeda_disk_without_the_host_local_file(self) -> None:
+        seen = {}
+
+        class Disk:
+            @staticmethod
+            def host_reservation(local=None):
+                seen["local"] = local
+                return "reserved for lawrencecchen until 2026-10-28T23:59:59Z (lawrence-2026-10-25)"
+
+        self.mini.disk_module = lambda: Disk
+        self.assertIn("lawrencecchen", self.mini.fleet_reservation())
+        self.assertEqual(seen["local"], health.NO_LOCAL_RESERVATION)
+
+    def test_a_glaeda_disk_without_host_reservation_is_no_answer(self) -> None:
+        self.mini.disk_module = lambda: object()
+        self.assertIsInstance(self.mini.fleet_reservation(), health.NoAnswer)
+
+
+class TailscaleRestartGates(unittest.TestCase):
+    """The restart's gates as pure functions, and the real Mini's reads against stand-ins (never the host)."""
+
+    CI = {"platform": "darwin", "runners": 3, "setup_args": ["--role=fleet-mini"], "role": "fleet-mini"}
+
+    def test_ci_mini_refusal(self) -> None:
+        self.assertEqual(health.ci_mini_refusal(["cmux9s-mac-mini"], self.CI), "")
+        self.assertEqual(health.ci_mini_refusal(["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5"], self.CI), "")
+        self.assertIn("tailnet name", health.ci_mini_refusal(None, self.CI))
+        refused = {
+            "no names": ([], self.CI),
+            "tailnet name unreadable": (None, self.CI),
+            "lawrence": (["cmux-lawrence"], self.CI),
+            "lawrence word": (["Cmux Lawrence's Mac mini"], self.CI),
+            "linux": (["cmux9s-mac-mini"], self.CI | {"platform": "linux"}),
+            "no runner": (["cmux9s-mac-mini"], self.CI | {"runners": 0}),
+            "runners unreadable": (["cmux9s-mac-mini"], self.CI | {"runners": None}),
+            "setup unreadable": (["cmux9s-mac-mini"], self.CI | {"setup_args": None}),
+            "hygiene": (["cmux9s-mac-mini"], self.CI | {"setup_args": ["--hygiene-only"]}),
+            "gh only": (["cmux9s-mac-mini"], self.CI | {"setup_args": ["--gh-only"]}),
+            "headless": (["cmux9s-mac-mini"], self.CI | {"setup_args": ["--role=fleet-mini", "--headless"]}),
+            "devbox": (["cmux9s-mac-mini"], self.CI | {"setup_args": ["--role=devbox"], "role": "devbox"}),
+            "args say devbox": (["cmux9s-mac-mini"], self.CI | {"setup_args": ["--role=devbox"]}),
+            "role unknown": (["cmux9s-mac-mini"], self.CI | {"role": None}),
+        }
+        for what, (names, facts) in refused.items():
+            self.assertNotEqual(health.ci_mini_refusal(names, facts), "", what)
+
+    def test_opt_in_refusal(self) -> None:
+        doc = {"schema": "glaeda-tailscale-self-heal/v1", "host": "cmuxs-mac-mini-5", "source": "fleet-registry.json"}
+        names = ["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5.local", "cmuxs-mac-mini-5"]
+        self.assertEqual(health.opt_in_refusal((doc, ""), names), "")
+        self.assertEqual(health.opt_in_refusal(({**doc, "host": "CMUXS-MAC-MINI-5"}, ""), names), "")
+        refused = {
+            "missing": ((None, "no ~/.config/glaeda/tailscale-self-heal.json"), names),
+            "another host": (({**doc, "host": "cmux9s-mac-mini"}, ""), names),
+            "no schema": (({"host": "cmuxs-mac-mini-5"}, ""), names),
+            "another schema": (({**doc, "schema": "glaeda-tailscale-self-heal/v0"}, ""), names),
+            "host not a string": (({**doc, "host": {"name": "cmuxs-mac-mini-5"}}, ""), names),
+            "empty host": (({**doc, "host": " "}, ""), names),
+            "no names": ((doc, ""), []),
+        }
+        for what, (opt_in, host_names) in refused.items():
+            self.assertNotEqual(health.opt_in_refusal(opt_in, host_names), "", what)
+        self.assertIn("no ~/.config", health.opt_in_refusal((None, "no ~/.config/glaeda/tailscale-self-heal.json"), names))
+
+    def test_sudo_nopasswd(self) -> None:
+        kick = "/bin/launchctl kickstart -k system/com.tailscale.tailscaled"
+        head = ("Matching Defaults entries for cmux on cmuxs-mac-mini-5:\n    env_reset, env_keep+=BLOCKSIZE\n\n"
+                "User cmux may run the following commands on cmuxs-mac-mini-5:\n")
+        allowed = {
+            "exact": f"    (root) NOPASSWD: {kick}\n",
+            "ALL under NOPASSWD": "    (ALL) NOPASSWD: ALL\n",
+            "ALL : ALL runas": f"    (ALL : ALL) NOPASSWD: {kick}\n",
+            "listed among others": f"    (root) NOPASSWD: /usr/bin/true, {kick}\n",
+            "the later rule wins": f"    (ALL) ALL\n    (root) NOPASSWD: {kick}\n",
+            "tags carry": f"    (root) NOPASSWD: SETENV: /usr/bin/true, {kick}\n",
+        }
+        for what, rules in allowed.items():
+            self.assertTrue(health.sudo_nopasswd(head + rules, kick), what)
+        refused = {
+            "password needed": "    (ALL) ALL\n",
+            "a later password rule wins": f"    (root) NOPASSWD: {kick}\n    (ALL) ALL\n",
+            "another command": "    (root) NOPASSWD: /bin/launchctl kickstart -k system/com.example\n",
+            "another runas user": f"    (_tailscale) NOPASSWD: {kick}\n",
+            "PASSWD after NOPASSWD": f"    (root) NOPASSWD: /usr/bin/true, PASSWD: {kick}\n",
+            "negated": f"    (root) NOPASSWD: ALL, !{kick}\n",
+            "a prefix only": "    (root) NOPASSWD: /bin/launchctl kickstart\n",
+        }
+        for what, rules in refused.items():
+            self.assertFalse(health.sudo_nopasswd(head + rules, kick), what)
+        self.assertFalse(health.sudo_nopasswd("", kick))
+        self.assertFalse(health.sudo_nopasswd(f"    (root) NOPASSWD: {kick}\n", kick), "no rules header: no answer")
+
+    def test_restart_window(self) -> None:
+        self.assertEqual(health.restart_window_refusal({}, NOW), "")
+        self.assertEqual(health.restart_window_refusal({"last_attempt_at": NOW - SIX_H}, NOW), "")
+        self.assertIn("6 h", health.restart_window_refusal({"last_attempt_at": NOW - SIX_H + 1}, NOW))
+        self.assertNotEqual(health.restart_window_refusal(None, NOW), "", "unreadable state fails closed")
+        self.assertNotEqual(health.restart_window_refusal({"last_attempt_at": "x"}, NOW), "")
+        self.assertNotEqual(health.restart_window_refusal({"last_attempt_at": NOW + 600}, NOW), "",
+                            "a stamp from the future (a clock step) still counts")
+        for at in (float("nan"), float("inf"), float("-inf"), 1e300, -1.0, NOW + 10 * SIX_H, True):
+            self.assertIn("unreadable", health.restart_window_refusal({"last_attempt_at": at}, NOW), at)
+            self.assertIsNone(health.restart_failures({"last_attempt_at": at, "failures": 0}, NOW), at)
+            self.assertIn("did not restore", health.restart_failed_note({"last_attempt_at": at}, 1, NOW))
+
+    def test_load_restart_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.json"
+            self.assertEqual(health.load_restart_state(path), {}, "never attempted")
+            path.write_text("[1]")
+            self.assertIsNone(health.load_restart_state(path))
+            path.write_text("garbage")
+            self.assertIsNone(health.load_restart_state(path))
+            path.write_text(json.dumps({"last_attempt_at": NOW}))
+            self.assertEqual(health.load_restart_state(path)["last_attempt_at"], NOW)
+            path.unlink()
+            path.mkdir()
+            self.assertIsNone(health.load_restart_state(path))
+
+    def test_restart_switch(self) -> None:
+        self.assertEqual(health.restart_switch_off({}, False), "")
+        self.assertEqual(health.restart_switch_off({"GLAEDA_TAILSCALE_RESTART": "on"}, False), "")
+        for value in ("0", "off", "OFF", "false", "no"):
+            self.assertIn("GLAEDA_TAILSCALE_RESTART", health.restart_switch_off({"GLAEDA_TAILSCALE_RESTART": value}, False))
+        self.assertIn("tailscale-restart-off", health.restart_switch_off({}, True))
+
+    def test_restart_commands_per_flavor(self) -> None:
+        self.assertEqual(health.restart_commands("standalone", None),
+                         [["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", "-k", "system/com.tailscale.tailscaled"]])
+        self.assertEqual(health.restart_commands("app", SERVICE),
+                         [["/usr/sbin/scutil", "--nc", "stop", SERVICE], ["/usr/sbin/scutil", "--nc", "start", SERVICE]])
+        self.assertEqual(health.restart_commands("app", None), [])
+        for argv in health.restart_commands("standalone", None) + health.restart_commands("app", SERVICE):
+            self.assertFalse({"up", "down", "set", "login", "logout", "--reset"} & set(argv), "restart only")
+
+    def test_route_ok(self) -> None:
+        self.assertTrue(health.route_ok("Running", "utun3"))
+        self.assertFalse(health.route_ok("Running", "en0"))
+        self.assertFalse(health.route_ok("Running", None))
+        self.assertFalse(health.route_ok("Starting", "utun3"))
+        self.assertTrue(health.route_ok(None, "utun3"), "a CLI that timed out after the restart: judged on the route")
+        self.assertFalse(health.route_ok(None, "en0"))
+        self.assertFalse(health.route_ok(None, None))
+
+
+class TailscaleRestartReads(unittest.TestCase):
+    """The real Mini's gate reads, against a temporary home, fleet dir and glaeda-disk stand-in."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.home = self.dir / "home"
+        self.home.mkdir()
+        saved = health.FLEET_DIR
+        self.addCleanup(setattr, health, "FLEET_DIR", saved)
+        health.FLEET_DIR = self.dir / "fleet"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def disk(self, body: str) -> health.Mini:
+        path = self.dir / "glaeda-disk"
+        path.write_text(body + "\ndef host_busy_unreadable(reason):\n    return reason == 'cannot list processes'\n")
+        mini = health.Mini(self.home)
+        mini.disk_path = lambda: path
+        return mini
+
+    def test_host_busy_is_glaeda_disk_s(self) -> None:
+        mini = self.disk("def host_busy(fleet=None, now=None):\n    return 'a CI job is running (x)'\n")
+        self.assertEqual(mini.host_busy(), "a CI job is running (x)")
+        mini = self.disk("def host_busy(fleet=None, now=None):\n    return ''\n")
+        self.assertEqual(mini.host_busy(), "")
+
+    def test_host_busy_fails_closed(self) -> None:
+        self.assertNotEqual(self.disk("raise RuntimeError('broken')\n").host_busy(), "")
+        self.assertNotEqual(self.disk("def host_busy(fleet=None, now=None):\n    raise OSError('x')\n").host_busy(), "")
+        self.assertNotEqual(self.disk("X = 1\n").host_busy(), "", "a glaeda-disk without host_busy")
+        mini = health.Mini(self.home)
+        mini.disk_path = lambda: self.dir / "missing"
+        self.assertNotEqual(mini.host_busy(), "")
+        self.assertIsInstance(mini.host_busy(), health.NoAnswer, "no answer, not a short wait")
+        self.assertIsInstance(self.disk("X = 1\n").host_busy(), health.NoAnswer)
+        busy = self.disk("def host_busy(fleet=None, now=None):\n    return 'a CI job is running (x)'\n").host_busy()
+        self.assertNotIsInstance(busy, health.NoAnswer)
+        (self.dir / "old-disk").write_text("def host_busy(fleet=None, now=None):\n    return 'the host lock is unreadable'\n")
+        mini = health.Mini(self.home)
+        mini.disk_path = lambda: self.dir / "old-disk"
+        self.assertIsInstance(mini.host_busy(), health.NoAnswer, "a glaeda-disk without host_busy_unreadable")
+
+    def test_the_real_glaeda_disk_loads(self) -> None:
+        # its dataclasses need it in sys.modules while it loads; without that every restart read "could not answer"
+        disk = health.Mini(self.home).disk_module()
+        self.assertTrue(callable(disk.host_busy) and callable(disk.host_busy_unreadable))
+
+    def glaeda_disk_says(self, reason: str) -> str:
+        """Mini.host_busy over the real glaeda-disk, its host_busy answering reason."""
+        mini = health.Mini(self.home)
+        disk = mini.disk_module()
+        disk.host_busy = lambda fleet=None, now=None: reason
+        return mini.host_busy()
+
+    def test_glaeda_disk_cannot_list_processes_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("cannot list processes"), health.NoAnswer)
+
+    def test_glaeda_disk_cannot_read_jobs_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("cannot read /Users/Shared/cmux-build-fleet/jobs"), health.NoAnswer)
+
+    def test_glaeda_disk_unreadable_reservation_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("the host reservation is unreadable"), health.NoAnswer)
+
+    def test_glaeda_disk_unreadable_host_lock_is_no_answer(self) -> None:
+        self.assertIsInstance(self.glaeda_disk_says("the host lock is unreadable"), health.NoAnswer)
+
+    def test_glaeda_disk_busy_reasons_are_a_wait(self) -> None:
+        for reason in ("a CI job is running (Runner.Worker)", "a build is running (xcodebuild)", "the host is reserved",
+                       "a dev-build worker job is in /Users/Shared/cmux-build-fleet/jobs",
+                       "a fleet build holds the host lock"):
+            got = self.glaeda_disk_says(reason)
+            self.assertEqual(got, reason)
+            self.assertNotIsInstance(got, health.NoAnswer, reason)
+
+    def test_the_host_lock_is_taken_exclusively_and_refused_while_a_job_holds_it(self) -> None:
+        mini = health.Mini(self.home)
+        with mini.hold_host_lock() as why:
+            self.assertIn("no fleet dir", why, "fails closed without the fleet dir jobs lock")
+            self.assertIsInstance(why, health.NoAnswer)
+        health.FLEET_DIR.mkdir()
+        with mini.hold_host_lock() as why:
+            self.assertEqual(why, "")
+            fd = os.open(health.FLEET_DIR / "host.lock", os.O_RDONLY)
+            with self.assertRaises(OSError, msg="a job's shared take fails while it is held"):
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            os.close(fd)
+        job = os.open(health.FLEET_DIR / "host.lock", os.O_RDONLY)
+        fcntl.flock(job, fcntl.LOCK_SH | fcntl.LOCK_NB)  # a PR job's holder
+        try:
+            with mini.hold_host_lock() as why:
+                self.assertIn("host lock", why)
+                self.assertNotIsInstance(why, health.NoAnswer, "held is a short wait")
+        finally:
+            os.close(job)
+
+    def test_jobs_running_uses_glaeda_disk_s_patterns(self) -> None:
+        mini = self.disk("import re\nCI_WORKER = re.compile(r'Runner\\.Worker')\n"
+                         "BUILD_PROCESS = re.compile(r'xcodebuild')\n")
+        mini.processes = lambda: [(1, 501, "S", "/bin/zsh")]
+        self.assertEqual(mini.jobs_running(), "")
+        mini.processes = lambda: [(1, 501, "S", "/x/actions-runner-glaeda/bin/Runner.Worker spawnclient")]
+        self.assertIn("Runner.Worker", mini.jobs_running())
+        mini.processes = lambda: []
+        self.assertNotEqual(mini.jobs_running(), "", "an empty process list is unreadable")
+
+    def test_jobs_running_sees_a_job_the_listener_took_before_its_worker(self) -> None:
+        mini = self.disk("import re\nCI_WORKER = re.compile(r'Runner\\.Worker')\n"
+                         "BUILD_PROCESS = re.compile(r'xcodebuild')\n")
+        mini.processes = lambda: [(1, 501, "S", "/bin/zsh")]
+        a, b = self.home / "actions-runner-glaeda", self.home / "actions-runner-glaeda-1"
+        mini.runner_dirs = lambda: [a, b]
+        taken: dict = {}
+
+        class Hook:
+            @staticmethod
+            def listener_request(d):
+                if isinstance(taken.get(d), Exception):
+                    raise taken[d]
+                return taken.get(d)
+        mini.hook = lambda: Hook
+        self.assertEqual(mini.jobs_running(), "")
+        taken[b] = "req-1"
+        why = mini.jobs_running()
+        self.assertIn("actions-runner-glaeda-1's listener took job req-1", why)
+        self.assertNotIsInstance(why, health.NoAnswer)
+        taken[b] = OSError("gone")
+        self.assertIsInstance(mini.jobs_running(), health.NoAnswer)
+        mini.hook = lambda: None
+        self.assertIsInstance(mini.jobs_running(), health.NoAnswer, "no hook is no answer")
+
+    def test_ci_mini_facts(self) -> None:
+        mini = health.Mini(self.home)
+        facts = mini.ci_mini_facts()
+        self.assertEqual((facts["runners"], facts["setup_args"], facts["role"]), (0, None, None))
+        runner = self.home / "actions-runner-glaeda-1"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (self.home / "actions-runner-glaeda" / "glaeda-hooks").mkdir(parents=True)  # not registered
+        (self.home / ".config/glaeda").mkdir(parents=True)
+        (self.home / ".config/glaeda/update.json").write_text(json.dumps({"setupArgs": ["--role=fleet-mini"]}))
+        (self.home / ".local/state/glaeda/mini-setup").mkdir(parents=True)
+        (self.home / ".local/state/glaeda/mini-setup/receipt.json").write_text(json.dumps({"role": "fleet-mini"}))
+        facts = mini.ci_mini_facts()
+        self.assertEqual((facts["runners"], facts["setup_args"], facts["role"]), (1, ["--role=fleet-mini"], "fleet-mini"))
+        (self.home / ".local/state/glaeda/mini-setup/receipt.json").write_text(json.dumps({"profile": "build-host"}))
+        self.assertEqual(mini.ci_mini_facts()["role"], "fleet-mini", "mini-setup's own reading of an older receipt")
+        (self.home / ".config/glaeda/update.json").write_text("{bad")
+        self.assertIsNone(mini.ci_mini_facts()["setup_args"])
+        for receipt in ({"role": ["fleet-mini"]}, {"role": {"fleet-mini": 1}, "profile": "build-host"}):
+            (self.home / ".local/state/glaeda/mini-setup/receipt.json").write_text(json.dumps(receipt))
+            self.assertIsNone(mini.ci_mini_facts()["role"], f"{receipt} is no role, and no crash")
+
+    def test_the_opt_in_file(self) -> None:
+        mini = health.Mini(self.home)
+        doc, why = mini.tailscale_opt_in()
+        self.assertIsNone(doc)
+        self.assertIn("tailscale-self-heal.json", why)
+        path = self.home / ".config/glaeda/tailscale-self-heal.json"
+        path.parent.mkdir(parents=True)
+        for body in ("{not json", "[1]", ""):
+            path.write_text(body)
+            doc, why = mini.tailscale_opt_in()
+            self.assertIsNone(doc, body)
+            self.assertIn("unreadable", why, body)
+        want = {"schema": "glaeda-tailscale-self-heal/v1", "host": "cmuxs-mac-mini-5", "source": "fleet-registry.json"}
+        path.write_text(json.dumps(want))
+        self.assertEqual(mini.tailscale_opt_in(), (want, ""))
+
+    def test_sudo_allows_reads_the_rules_not_the_exit_code(self) -> None:
+        # `sudo -n -l <cmd>` exits 0 for a rule that still asks for a password; the listing says which it is
+        mini = health.Mini(self.home)
+        argv = health.restart_commands("standalone", None)[0]
+        kick = " ".join(argv[2:])
+        calls = []
+
+        def fake_sh(cmd, timeout=15, env=None):
+            calls.append(cmd)
+            return self.sudo
+
+        saved = health.sh
+        self.addCleanup(setattr, health, "sh", saved)
+        health.sh = fake_sh
+        header = "User cmux may run the following commands on cmux9s-mac-mini:\n"
+        self.sudo = (0, header + "    (ALL) ALL\n")
+        self.assertFalse(mini.sudo_allows(argv))
+        self.sudo = (0, header + f"    (root) NOPASSWD: {kick}\n")
+        self.assertTrue(mini.sudo_allows(argv))
+        self.sudo = (1, header + f"    (root) NOPASSWD: {kick}\n")
+        self.assertFalse(mini.sudo_allows(argv), "a listing sudo refused is no answer")
+        self.assertTrue(all(c[:3] == ["/usr/bin/sudo", "-n", "-l"] for c in calls), calls)
+
+    def test_the_switch_reads_the_environment_and_the_file(self) -> None:
+        mini = health.Mini(self.home)
+        saved = os.environ.pop("GLAEDA_TAILSCALE_RESTART", None)
+        self.addCleanup(lambda: saved is None or os.environ.__setitem__("GLAEDA_TAILSCALE_RESTART", saved))
+        switch = self.home / ".config/glaeda/tailscale-restart-off"
+        prior = health.TAILSCALE_RESTART_OFF
+        self.addCleanup(setattr, health, "TAILSCALE_RESTART_OFF", prior)
+        health.TAILSCALE_RESTART_OFF = switch
+        self.assertEqual(mini.tailscale_restart_off(), "")
+        switch.parent.mkdir(parents=True)
+        switch.touch()
+        self.assertNotEqual(mini.tailscale_restart_off(), "")
+
+
+class TailnetNames(unittest.TestCase):
+    """Mini.tailnet_names and host_names against a stand-in Tailscale CLI: no Self name is no answer."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.saved = (health.TAILSCALE_APP, health.TAILSCALE_STANDALONE)
+        health.TAILSCALE_APP, health.TAILSCALE_STANDALONE = str(self.dir / "app"), str(self.dir / "standalone")
+
+    def tearDown(self) -> None:
+        health.TAILSCALE_APP, health.TAILSCALE_STANDALONE = self.saved
+        self.tmp.cleanup()
+
+    def cli(self, body: str) -> None:
+        Path(health.TAILSCALE_APP).write_text("#!/bin/sh\n" + body + "\n")
+        os.chmod(health.TAILSCALE_APP, 0o755)
+
+    def test_the_self_names(self) -> None:
+        self.cli("echo '{\"Self\": {\"HostName\": \"cmuxs-Mac-mini-5\", \"DNSName\": \"cmuxs-mac-mini-5.tail1.ts.net.\"}}'")
+        self.assertEqual(health.Mini(self.dir).tailnet_names(), ["cmuxs-Mac-mini-5", "cmuxs-mac-mini-5"])
+
+    def test_no_self_name_is_no_answer(self) -> None:
+        for body in ("exit 1", "echo 'not json'", "echo '{}'", "echo '{\"Self\": []}'",
+                     "echo '{\"Self\": {\"HostName\": \"\", \"DNSName\": \"\"}}'",
+                     "echo '{\"Self\": {\"HostName\": \"cmux9s-mac-mini\"}}'; exit 1"):
+            self.cli(body)
+            self.assertIsNone(health.Mini(self.dir).tailnet_names(), body)
+        os.unlink(health.TAILSCALE_APP)
+        self.assertIsNone(health.Mini(self.dir).tailnet_names(), "no CLI")
+
+    def test_host_names_refuses_without_the_tailnet_name(self) -> None:
+        mini = health.Mini(self.dir)
+        mini.tailnet_names = lambda: None
+        self.assertIsNone(mini.host_names())
+        mini.tailnet_names = lambda: ["cmuxs-mac-mini-5"]
+        self.assertIn("cmuxs-mac-mini-5", mini.host_names())
 
 
 class TailscaleCli(unittest.TestCase):
@@ -431,6 +2254,25 @@ class TailscaleCli(unittest.TestCase):
 
 
 class Runners(Base):
+    def test_a_deleted_registration_is_its_own_finding(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        state = home / ".local/state/glaeda/cmux-runner"
+        state.mkdir(parents=True)
+        (state / "registration-actions-runner-glaeda-2.json").write_text(json.dumps(
+            {"cause": "registration_deleted", "runner": "mini-a-glaeda-2", "exits": 3, "first_seen": 1}))
+        (state / "registration-actions-runner-glaeda.json").write_text("{}")  # cleared or foreign: ignored
+        (state / "registration-actions-runner-glaeda-3.json").write_text(json.dumps(
+            {"cause": "registration_deleted", "runner": "mini-a-glaeda-3"}))  # uninstalled: no runner dir
+        (home / "actions-runner-glaeda-2/glaeda-hooks").mkdir(parents=True)  # runner_dirs() finds it
+        (home / "actions-runner-glaeda-2/.runner").write_text("{}")
+        self.mini.home = home
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["registration_deleted:2"])
+        [f] = report["findings"]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("mini-a-glaeda-2", f["evidence"])
+
     def test_stopped_agent_is_kickstarted_after_two_runs(self) -> None:
         self.mini.agents[1] = ("com.teamleaderleo.glaeda.cmux-runner.1", True, False, "0")
         first = self.run_once()
@@ -474,6 +2316,1110 @@ class Runners(Base):
         self.assertEqual(self.mini.did, [])
 
 
+class RunnerBelowPin(Base):
+    OLD = "2.300.0"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.mini.home = self.home
+
+    def runner(self, name: str, version: str, updated: bool) -> Path:
+        """A runner dir: updated is the self-updater's layout (bin -> bin.X), else a fresh unpack with a receipt."""
+        d = self.home / name
+        (d / "glaeda-hooks").mkdir(parents=True)
+        (d / "config.sh").write_text("#!/bin/sh\n")
+        if updated:
+            (d / f"bin.{version}").mkdir()
+            (d / "bin").symlink_to(d / f"bin.{version}")
+        else:
+            (d / "bin").mkdir()
+        receipts = self.home / health.RUNNER_RECEIPTS / f"instance-{name}"
+        receipts.mkdir(parents=True)
+        (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerDirOwned": True,
+                                                           "runnerVersion": "2.200.0" if updated else version}))
+        return d
+
+    def test_the_pin_is_glaeda_cmux_runners(self) -> None:
+        runner = load("glaeda_cmux_runner_pin", ROOT / "scripts" / "glaeda-cmux-runner")
+        self.assertEqual(health.RUNNER_PIN, runner.PINNED_RUNNER_VERSION)
+
+    def test_runners_below_the_pin_are_warned_about_and_never_touched(self) -> None:
+        a = self.runner("actions-runner-glaeda", self.OLD, updated=False)
+        b = self.runner("actions-runner-glaeda-1", self.OLD, updated=True)
+        self.runner("actions-runner-glaeda-2", health.RUNNER_PIN, updated=True)
+        self.runner("actions-runner-glaeda-3", "9.0.0", updated=False)
+        report = self.run_once()
+        self.assertEqual([(f["id"], f["severity"], f["auto_fix"]) for f in report["findings"]],
+                         [("runner_below_pin:0", "warn", "impossible"), ("runner_below_pin:1", "warn", "impossible")])
+        self.assertIn(self.OLD, report["findings"][0]["evidence"])
+        self.assertTrue((a / "bin").is_dir() and not (a / "bin").is_symlink())
+        self.assertEqual(os.readlink(b / "bin"), os.fspath(b / f"bin.{self.OLD}"))
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_receipt_glaeda_cmux_runner_would_not_count_is_no_finding(self) -> None:
+        for broken, updated in [(b, u) for b in ("unowned", "no config.sh") for u in (False, True)]:
+            with self.subTest(broken, updated=updated):
+                d = self.runner("actions-runner-glaeda", self.OLD, updated=updated)
+                if broken == "unowned":
+                    receipt = self.home / health.RUNNER_RECEIPTS / "instance-actions-runner-glaeda" / "receipt.json"
+                    receipt.write_text(json.dumps({"runnerDir": os.fspath(d), "runnerVersion": self.OLD}))
+                else:
+                    (d / "config.sh").unlink()
+                self.assertEqual(self.run_once()["findings"], [])
+                shutil.rmtree(d)
+                shutil.rmtree(self.home / health.RUNNER_RECEIPTS)
+
+    def test_an_unknown_version_is_no_finding(self) -> None:
+        d = self.home / "actions-runner-glaeda"
+        (d / "glaeda-hooks").mkdir(parents=True)
+        (d / "bin").mkdir()
+        self.assertEqual(self.run_once()["findings"], [])
+
+
+def worker_log(steps: list[tuple[str, int, int | None]], start: float) -> str:
+    """A worker log's StepsRunner lines: (display name, seconds after start, seconds it took or None for skipped)."""
+    def at(t: float) -> str:
+        return health.datetime.datetime.fromtimestamp(t, health.datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    lines = []
+    for name, offset, took in steps:
+        t = start + offset
+        lines += [f"[{at(t)}Z INFO StepsRunner] Processing step: DisplayName='{name}'",
+                  f"[{at(t)}Z INFO StepsRunner] Evaluating: success()"]
+        if took is None:
+            lines.append(f"[{at(t)}Z INFO StepsRunner] Skipping step due to condition evaluation.")
+        else:
+            lines += [f"[{at(t + took)}Z INFO ProcessInvokerWrapper] Finished process 1 with exit code 0",
+                      f"[{at(t + took)}Z INFO StepsRunner] Step result: "]
+    return "\n".join(lines) + "\n"
+
+
+class CheckoutSlow(Base):
+    """checkout_slow: the median checkout step from the runners' own worker logs, over the last three days."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.mini.home = self.home
+        self.n = 0
+
+    def job(self, checkout_s: int, age_s: float = 3600, runner: str = "actions-runner-glaeda") -> Path:
+        diag = self.home / runner / "_diag"
+        (self.home / runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        diag.mkdir(exist_ok=True)
+        self.n += 1
+        start = NOW - age_s - 2000
+        path = diag / f"Worker_20261027-{self.n:06d}-utc.log"
+        path.write_text(worker_log([("Set up runner", 0, 1), ("Checkout", 5, checkout_s),
+                                    ("Discard the git object seed after a failed checkout", 1200, None),
+                                    ("Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd", 1201, None),
+                                    ("Build", 1210, 300), ("Post Checkout", 1700, 290)], start))
+        os.utime(path, (NOW - age_s, NOW - age_s))
+        return path
+
+    def test_the_parser_times_checkout_steps_only(self) -> None:
+        text = worker_log([("Checkout", 0, 700), ("Skipped", 800, None), ("Checkout the script", 900, 12),
+                           ("Run actions/checkout@abc", 1000, None), ("Post Checkout", 1100, 290),
+                           ("Retry checkout after transient network failure", 1500, 40),
+                           ("Run actions/checkout@abc", 1600, 9)], NOW)
+        self.assertEqual([sec for _, sec in health.checkout_durations(text)], [700.0, 12.0, 9.0])
+
+    def test_a_slow_median_is_a_warning_and_never_healed(self) -> None:
+        for i in range(12):
+            self.job(690 + i)
+        report = self.run_once()
+        self.assertEqual([(f["id"], f["severity"], f["auto_fix"]) for f in report["findings"]],
+                         [("checkout_slow", "warn", "impossible")])
+        self.assertIn("median 696 s", report["findings"][0]["evidence"])
+        self.assertIn("over 12 steps", report["findings"][0]["evidence"])
+        self.assertNotIn(str(self.home), json.dumps(report))
+        self.assertEqual(self.mini.did, [])
+
+    def test_the_finding_says_whether_the_time_is_local_or_network(self) -> None:
+        for i in range(12):
+            self.job(690 + i)
+        probes: list[float | None] = []
+        self.mini.checkout_probe = lambda: probes.pop(0)  # type: ignore[method-assign]
+        probes.append(9.0)
+        def slow(at: float = NOW) -> dict:
+            return next(f for f in self.run_once(at=at)["findings"] if f["id"] == "checkout_slow")
+        local = slow()
+        self.assertIn("where: local (git submodule status took 9 s here", local["evidence"])
+        self.assertIn("Full Disk Access", local["note"])
+        # Reused for an hour: no second probe (the list is empty, so a probe would raise and drop the finding).
+        self.assertIn("where: local", slow(NOW + 600)["evidence"])
+        # A fast pass inside the hour keeps the probe: the next slow pass reuses it, no second probe.
+        fast_log = [self.job(8, age_s=10) for _ in range(40)]
+        self.assertEqual([f for f in self.run_once(at=NOW + 900)["findings"] if f["id"] == "checkout_slow"], [])
+        for path in fast_log:
+            path.unlink()
+        self.assertIn("where: local", slow(NOW + 1200)["evidence"])
+        probes.append(0.3)
+        net = slow(NOW + health.CHECKOUT_PROBE_TTL_S + 60)
+        self.assertIn("where: network (local git is fast: git submodule status took 0.3 s)", net["evidence"])
+        self.assertIn("uplink", net["note"])
+        probes.append(float(health.CHECKOUT_PROBE_S))
+        killed = slow(NOW + 2 * health.CHECKOUT_PROBE_TTL_S + 120)
+        self.assertIn(f"took over {health.CHECKOUT_PROBE_S} s", killed["evidence"])
+        probes.append(None)
+        unknown = slow(NOW + 3 * health.CHECKOUT_PROBE_TTL_S + 180)
+        self.assertIn("where: unknown", unknown["evidence"])
+        def broken() -> float:
+            raise TypeError("an older Python")
+        self.mini.checkout_probe = broken  # type: ignore[method-assign]
+        self.assertIn("where: unknown", slow(NOW + 4 * health.CHECKOUT_PROBE_TTL_S + 240)["evidence"])
+        self.assertNotIn(str(self.home), json.dumps(unknown))
+
+    def test_a_fast_mini_is_never_probed(self) -> None:
+        for _ in range(12):
+            self.job(8)
+        self.mini.checkout_probe = lambda: self.fail("probed a fast mini")  # type: ignore[method-assign]
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_the_probe_times_and_kills_a_slow_git(self) -> None:
+        work = self.home / "actions-runner-glaeda" / "_work" / "cmux" / "cmux"
+        (work / ".git").mkdir(parents=True)
+        (self.home / "actions-runner-glaeda" / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "git"
+        fake.write_text("#!/bin/sh\n/bin/sleep 30\n")
+        fake.chmod(0o755)
+        with mock.patch.object(health, "CHECKOUT_PROBE_PATH", os.fspath(bin_dir)), \
+                mock.patch.object(health, "CHECKOUT_PROBE_S", 1):
+            start = time.monotonic()
+            self.assertEqual(self.mini.checkout_probe(), 1.0)
+            self.assertLess(time.monotonic() - start, 10)
+            fake.write_text("#!/bin/sh\nexit 0\n")
+            self.assertLess(self.mini.checkout_probe(), 1.0)
+            fake.write_text("#!/bin/sh\nexit 128\n")
+            self.assertIsNone(self.mini.checkout_probe())  # a failed git timed nothing
+        shutil.rmtree(work)
+        with mock.patch.object(health, "CHECKOUT_PROBE_PATH", os.fspath(bin_dir)):
+            self.assertIsNone(self.mini.checkout_probe())  # no checkout to time
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_the_probe_never_runs_a_configured_fsmonitor(self) -> None:
+        work = self.home / "actions-runner-glaeda" / "_work" / "cmux" / "cmux"
+        work.mkdir(parents=True)
+        (self.home / "actions-runner-glaeda" / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        git = shutil.which("git")
+        subprocess.run([git, "init", "-q", os.fspath(work)], check=True)
+        ran = self.home / "fsmonitor-ran"
+        hook = self.home / "fsmonitor.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {ran}\n")
+        hook.chmod(0o755)
+        subprocess.run([git, "-C", os.fspath(work), "config", "core.fsmonitor", os.fspath(hook)], check=True)
+        with mock.patch.object(health, "CHECKOUT_PROBE_PATH", f"{os.path.dirname(git)}:/usr/bin:/bin"):
+            self.assertIsNotNone(self.mini.checkout_probe())
+        self.assertFalse(ran.exists())
+
+    def test_the_probe_looks_at_a_bounded_number_of_entries(self) -> None:
+        work = self.home / "actions-runner-glaeda" / "_work"
+        (self.home / "actions-runner-glaeda" / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        for i in range(health.CHECKOUT_PROBE_MAX_ENTRIES + 50):
+            (work / f"r{i:04d}").mkdir(parents=True)
+        calls: list[str] = []
+        real = os.scandir
+        with mock.patch.object(health.os, "scandir", side_effect=lambda p: calls.append(os.fspath(p)) or real(p)):
+            self.assertIsNone(self.mini.checkout_probe())
+        self.assertLessEqual(len(calls), health.CHECKOUT_PROBE_MAX_ENTRIES + 1)
+
+    def test_a_fast_mini_or_too_few_samples_is_no_finding(self) -> None:
+        for i in range(30):
+            self.job(8 if i % 3 else 900)  # a third of the jobs slow: the median is still fast
+        self.assertEqual(self.run_once()["findings"], [])
+        shutil.rmtree(self.home / "actions-runner-glaeda")
+        for _ in range(health.CHECKOUT_MIN_SAMPLES - 1):
+            self.job(700)
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_old_logs_are_not_counted(self) -> None:
+        for _ in range(12):
+            self.job(700, age_s=health.CHECKOUT_WINDOW_S + 3600)
+        for _ in range(12):
+            self.job(8, runner="actions-runner-glaeda-1")
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_each_log_is_parsed_once_and_the_cache_follows_the_logs(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        reads: list[Path] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: reads.append(path) or real(path, limit)
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+        self.assertEqual(len(reads), 12)
+        cache = json.loads((self.dir / health.CHECKOUT_CACHE).read_text())
+        self.assertEqual(cache["schema"], health.CHECKOUT_CACHE_SCHEMA)
+        self.assertEqual(len(cache["logs"]), 12)
+        self.assertEqual(self.ids(self.run_once(at=NOW + 120)), ["checkout_slow"])
+        self.assertEqual(len(reads), 12)  # nothing changed: nothing read again
+        for p in paths:
+            p.unlink()
+        self.assertEqual(self.run_once(at=NOW + 240)["findings"], [])
+        self.assertEqual(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"], {})
+
+    def test_a_check_only_run_writes_no_cache(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        self.assertEqual(self.ids(self.run_once(apply=False)), ["checkout_slow"])
+        self.assertFalse((self.dir / health.CHECKOUT_CACHE).exists())
+
+    def test_only_the_newest_logs_are_read(self) -> None:
+        for i in range(health.CHECKOUT_MAX_LOGS + 20):
+            self.job(8 if i < health.CHECKOUT_MAX_LOGS else 700, age_s=600 + i * 10)  # the 20 oldest are slow
+        reads: list[Path] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: reads.append(path) or real(path, limit)
+        self.assertEqual(self.run_once()["findings"], [])
+        self.assertEqual(len(reads), health.CHECKOUT_MAX_LOGS)
+        self.assertEqual(len(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]),
+                         health.CHECKOUT_MAX_LOGS)
+
+    def test_the_pass_byte_budget_leaves_the_rest_for_a_later_pass(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        size = (self.home / "actions-runner-glaeda" / "_diag" / "Worker_20261027-000001-utc.log").stat().st_size
+        with mock.patch.object(health, "CHECKOUT_PASS_BYTES", size * 5 + size // 2):
+            self.assertEqual(self.run_once()["findings"], [])  # 5 read, the 6th cut short is not kept
+            self.assertEqual(len(json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]), 5)
+            self.run_once(at=NOW + 120)
+            self.assertEqual(self.ids(self.run_once(at=NOW + 240)), ["checkout_slow"])
+
+    def test_a_log_past_the_per_log_cap_keeps_its_prefix_and_says_so(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        limits: list[int] = []
+        real = self.mini.read_log
+        self.mini.read_log = lambda path, limit: limits.append(limit) or real(path, limit)
+        with mock.patch.object(health, "CHECKOUT_MAX_LOG_BYTES", 400):
+            self.run_once()
+        self.assertEqual(set(limits), {400})
+        self.assertEqual(len(real(next(iter(self.home.glob("*/_diag/Worker_*"))), 400)), 400)
+        logs = json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"]
+        self.assertTrue(all(e.get("truncated") for e in logs.values()))
+
+    def test_only_regular_files_are_read(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        diag = self.home / "actions-runner-glaeda" / "_diag"
+        os.mkfifo(diag / "Worker_20991231-000000-utc.log")
+        (diag / "Worker_20991231-000001-utc.log").symlink_to(diag / "Worker_20261027-000001-utc.log")
+        self.assertEqual(len(self.mini.worker_logs()), 12)
+        self.assertIsNone(self.mini.read_log(diag / "Worker_20991231-000000-utc.log", 100))
+        self.assertIsNone(self.mini.read_log(diag / "Worker_20991231-000001-utc.log", 100))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+
+    def test_a_huge_cached_number_is_reread_not_fatal(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        logs = {f"actions-runner-glaeda/{p.name}": {"size": p.stat().st_size, "mtime": p.stat().st_mtime,
+                                                    "steps": [[10 ** 400, 5]]} for p in paths}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])
+        logs = {k: {**v, "steps": [[NOW - 600, -1]]} for k, v in logs.items()}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])  # a negative duration is re-read too
+
+    def test_a_corrupt_cache_or_a_future_step_is_ignored(self) -> None:
+        paths = [self.job(700) for _ in range(12)]
+        logs = {}
+        for p in paths:
+            st = p.stat()
+            logs[f"actions-runner-glaeda/{p.name}"] = {"size": st.st_size, "mtime": st.st_mtime, "steps": [[1]]}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": logs}))
+        self.assertEqual(self.ids(self.run_once()), ["checkout_slow"])  # re-read, not crashed
+        future = {k: {**v, "steps": [[NOW + 86400, 900.0]]} for k, v in
+                  json.loads((self.dir / health.CHECKOUT_CACHE).read_text())["logs"].items()}
+        (self.dir / health.CHECKOUT_CACHE).write_text(json.dumps({"schema": health.CHECKOUT_CACHE_SCHEMA, "logs": future}))
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_cache_that_cannot_be_written_still_reports(self) -> None:
+        for _ in range(12):
+            self.job(700)
+        with mock.patch.object(health, "write_json", side_effect=OSError("disk full")):
+            self.assertEqual(self.ids(health.run(self.mini, False, now=NOW)), ["checkout_slow"])
+            self.assertEqual(health.check_checkout_steps(self.mini, NOW, self.dir / "c.json")[0]["id"], "checkout_slow")
+
+    def test_a_failure_in_the_check_is_no_finding_and_spares_the_pass(self) -> None:
+        self.mini.worker_logs = mock.Mock(side_effect=RuntimeError("boom"))
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_p90_is_the_nearest_rank(self) -> None:
+        for i in range(10):
+            self.job(100 + i)
+        self.assertIn("p90 108 s", self.run_once()["findings"][0]["evidence"])
+
+
+class DaemonHeal(Base):
+    """The root daemon-heal LaunchDaemon is kept installed; its hot daemons show up in the report."""
+
+    def test_no_healer_on_this_host_is_no_finding(self) -> None:
+        self.mini.heal_status = None
+        self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_stale_healer_is_reinstalled_where_sudo_n_works(self) -> None:
+        self.mini.sudo = True
+        self.mini.heal_status = {"installed": False, "current": False, "stale": ["/x"], "report": "/none"}
+        r = self.run_once()
+        self.assertEqual(self.mini.did, ["install daemon-heal"])
+        self.assertEqual(self.ids(r), [])
+        self.assertEqual([h["id"] for h in r["healed"]], ["daemon_heal_stale"])
+
+    def test_stale_healer_without_sudo_names_the_root_command(self) -> None:
+        self.mini.heal_status = {"installed": True, "current": False, "stale": ["/x"], "report": "/none"}
+        r = self.run_once()
+        f = r["findings"][0]
+        self.assertEqual((f["id"], f["auto_fix"]), ("daemon_heal_stale", "impossible"))
+        self.assertIn("--install --policy /p/macos-daemons.json --apply", f["note"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_hot_daemons_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"hot": [{"name": "fseventsd", "pid": 421, "cores": 1.02, "since": "x",
+                                             "hot_for_s": 5400, "waiting": "restarts at 2 h"}],
+                                    "healed": [{"name": "audiomxd", "t": NOW - 60, "at": "a", "since": "s",
+                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"},
+                                               {"name": "sandboxd", "t": NOW - 30, "at": "b", "since": "b",
+                                                "probe_s": 5.0, "action": "launchctl kickstart"}]}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        r = self.run_once()
+        f = r["findings"]
+        self.assertEqual([x["id"] for x in f], ["daemon_hot:fseventsd"])
+        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]],
+                         [("daemon_hot:audiomxd", "done"), ("sandboxd_wedged:sandboxd", "done")])
+        self.assertEqual(r["healed"][1]["evidence"], "sandbox probe took 5.0 s")
+        self.assertIn("1.5 h", f[0]["evidence"])
+        self.assertIn("restarts at 2 h", f[0]["note"])
+
+    def test_a_wedged_sandboxd_the_root_heal_will_not_reboot_again_is_an_error_for_a_person(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {
+            "probe_s": 5.0, "needs_operator": "sandboxd is wedged again ... needs a person"}}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        f = [x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"]
+        self.assertEqual([(x["id"], x["severity"], x["auto_fix"]) for x in f],
+                         [("sandboxd_wedged", "error", "impossible")])
+        self.assertIn("needs a person", f[0]["evidence"])
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {"probe_s": 0.1}}))
+        self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"], [])
+
+    def test_a_runner_accounts_stale_root_copy_is_reported_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"runnerHygiene": {"accounts": {
+            "501": {"user": "cmux", "state": "stale", "sha256": "ca7d" * 16, "wants": "fb3e" * 16,
+                    "why": "snapshot is not this source", "action": "reinstall"},
+            "502": {"user": "ci", "state": "error", "why": "glaeda-runner-hygiene: install manifest is bound"},
+            "503": {"user": "ok", "state": "current"}}}}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        f = {x["id"]: x for x in self.run_once()["findings"]}
+        self.assertEqual(sorted(f), ["disk_root_copy_stale:501", "disk_root_copy_stale:502"])
+        self.assertEqual((f["disk_root_copy_stale:501"]["auto_fix"], f["disk_root_copy_stale:501"]["severity"]),
+                         ("pending", "warn"))
+        self.assertIn("ca7dca7dca7d", f["disk_root_copy_stale:501"]["evidence"])
+        self.assertEqual((f["disk_root_copy_stale:502"]["auto_fix"], f["disk_root_copy_stale:502"]["severity"]),
+                         ("impossible", "error"))
+        self.assertIn("--user ci --apply", f["disk_root_copy_stale:502"]["note"])
+        root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "error": "cannot list /x: EIO"}}))
+        f = self.run_once()["findings"]
+        self.assertEqual([(x["id"], x["severity"]) for x in f], [("disk_root_copy_stale:all", "error")])
+
+    def test_an_unenrolled_ci_minis_root_census_is_reported_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        for state, severity, fix in (("stale", "warn", "pending"), ("error", "error", "impossible")):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": {
+                "state": state, "why": "root census plist missing", "action": "reinstall"}}}))
+            f = [x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"]
+            self.assertEqual([(x["severity"], x["auto_fix"]) for x in f], [(severity, fix)])
+            self.assertIn("root census plist missing", f[0]["evidence"])
+        for census in ({"state": "current"}, {"state": "skipped", "why": "not a CI mini"}):
+            root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "rootCensus": census}}))
+            self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "disk_root_census_stale"], [])
+
+
+class DaemonHealLiveness(Base):
+    """An installed copy that is unloaded, or whose passes stopped, is no healthy healer."""
+
+    def status(self, **kw) -> dict:
+        return {"installed": True, "current": True, "loaded": True, "reportFresh": True, "report": "/none", **kw}
+
+    def test_unloaded_healer_is_stale(self) -> None:
+        self.mini.heal_status = self.status(loaded=False)
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertIn("not loaded", f["evidence"])
+
+    def test_old_report_means_passes_stopped(self) -> None:
+        self.mini.heal_status = self.status(reportFresh=False, reportAgeS=900)
+        self.assertIn("900 s old", self.run_once()["findings"][0]["evidence"])
+
+    def test_healthy_healer_is_no_finding(self) -> None:
+        self.mini.heal_status = self.status()
+        self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_operator_command_pins_release_hashes(self) -> None:
+        self.mini.heal_status = self.status(loaded=False)
+        self.assertIn("--expect-sha256", self.run_once()["findings"][0]["note"])
+
+    def test_a_self_updating_healer_is_judged_by_its_own_report_not_this_users_bytes(self) -> None:
+        # It follows stable; this user may run a newer canary release, whose bytes differ.
+        self.mini.heal_status = self.status(current=False, stale=["/x"], verdict={"state": "current", "why": "runs r"})
+        self.assertEqual(self.ids(self.run_once()), [])
+        self.mini.sudo = True
+        self.mini.heal_status = self.status(verdict={"state": "stale", "reinstall": False,
+                                                     "why": "has not read its release channel"})
+        f = self.run_once(NOW + 120)["findings"][0]
+        self.assertEqual((f["id"], f["auto_fix"]), ("daemon_heal_stale", "impossible"))
+        self.assertIn("has not read its release channel", f["evidence"])
+        self.assertEqual(self.mini.did, [], "a reinstall cannot fix its channel: no sudo for it")
+
+    def test_a_current_report_from_an_unloaded_healer_is_stale(self) -> None:
+        self.mini.heal_status = self.status(loaded=False, verdict={"state": "current", "why": "runs r"})
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertIn("not loaded", f["evidence"])
+
+    def test_a_reinstall_is_healed_only_when_its_report_says_current(self) -> None:
+        self.mini.sudo = True
+        self.mini.heal_status = self.status(verdict={"state": "missing", "reinstall": True, "why": "not installed"})
+        r = self.run_once()
+        self.assertEqual(self.mini.did, ["install daemon-heal"])
+        self.assertEqual(r["healed"], [], "the bytes are in place, but its report is not current yet")
+
+
+class ClaudeRoute(Base):
+    """Claude Code on a fleet mini goes through a fleet route that answers, or capture-host admits no lease here."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.answers = {SR2: True, POOL: True}
+
+    def claude(self, report: dict) -> list[dict]:
+        return [f for f in report["findings"] if f["code"] == "claude_route"]
+
+    def test_the_config_names_routes_and_a_placeholder(self) -> None:
+        self.assertEqual(ROUTES["schema"], "glaeda-claude-routes/v1")
+        self.assertTrue(all(r.startswith("http://") for r in ROUTES["routes"]))
+        self.assertTrue(ROUTES["placeholder"])
+        self.assertGreaterEqual(ROUTES["probe_every_s"], 600)
+
+    def test_a_mini_without_claude_has_no_route_to_check(self) -> None:
+        # Its claude_missing heal installs Claude Code first (ClaudeMissing); no route is probed before that.
+        self.mini.claude = None
+        self.mini.claude_env = {}
+        self.mini.claude_source = True
+        self.mini.install_ok = False
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("probe ", "route "))])
+
+    def test_a_route_that_answers_is_probed_once_per_window(self) -> None:
+        every = ROUTES["probe_every_s"]
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.assertEqual(self.claude(self.run_once(at=NOW + every + 1)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2] * 2)
+
+    def test_a_personal_login_is_rerouted_on_the_first_run(self) -> None:
+        self.mini.claude_env = {}  # ~/.claude/.credentials.json only: it expires (cmux-mac-mini, 2026-10-21)
+        report = self.run_once()
+        self.assertEqual(self.claude(report), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2, "route " + SR2])
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual([h["code"] for h in report["healed"]], ["claude_route"])
+
+    def test_check_only_reports_a_personal_login_and_changes_nothing(self) -> None:
+        self.mini.claude_env = {}
+        found = self.claude(self.run_once(apply=False))
+        self.assertEqual([(f["severity"], f["auto_fix"]) for f in found], [("error", "pending")])
+        self.assertIn("personal login", found[0]["evidence"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_check_only_probes_but_keeps_nothing(self) -> None:
+        self.assertEqual(self.claude(self.run_once(apply=False)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.assertEqual(self.mini.probe_memory, {})
+
+    def test_a_route_that_hangs_fails_over_to_one_that_answers(self) -> None:
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": POOL, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.answers = {SR2: True, POOL: False}  # :31415 hung cmux11s and cmux7s, 2026-10-21
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, ["probe " + POOL, "probe " + SR2, "route " + SR2])
+        self.assertEqual((self.mini.probe_memory["route"], self.mini.probe_memory["ok"]), (SR2, True),
+                         "the heal's own probe stands for the window")
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+
+    def test_a_route_that_answers_again_during_the_heal_is_kept(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        self.run_once(heal_ok=False)
+        self.mini.answers = {SR2: True, POOL: False}  # a hiccup: the route in use answers again
+        self.assertEqual(self.claude(self.run_once(at=NOW + health.HEAL_EVERY_S)), [])
+        self.assertEqual(self.mini.did[-3:], ["probe " + POOL, "probe " + SR2, "route " + SR2])
+        self.assertEqual((self.mini.probe_memory["route"], self.mini.probe_memory["ok"]), (SR2, True),
+                         "the old failure no longer stands for the window")
+
+    def test_a_tunnel_off_its_route_holds_the_claude_reroute(self) -> None:
+        # tailscale_no_route: no fleet route over the tailnet answers, but rerouting Claude would only churn
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")  # no restart: only the hold
+        self.mini.answers = {SR2: False, POOL: False}
+        for at in (NOW, NOW + 120):
+            found = self.claude(self.run_once(at=at))
+            self.assertEqual(len(found), 1)
+            self.assertIn("tunnel is down", found[0]["note"])
+        self.assertFalse([d for d in self.mini.did if d.startswith("route ")], "no reroute on a broken tunnel")
+        self.assertEqual(self.mini.probe_memory, {}, "a probe through a broken tunnel stands for nothing")
+        self.mini.route = "utun4"  # the tunnel is back: the route in use answers again and is kept
+        self.mini.answers = {SR2: True, POOL: True}
+        self.assertEqual(self.claude(self.run_once(at=NOW + 240)), [])
+        self.assertEqual(self.mini.claude_env["ANTHROPIC_BASE_URL"], SR2)
+
+    def test_a_tunnel_that_is_down_is_never_probed_through(self) -> None:
+        # a `claude -p` through a broken tunnel hangs up to 60 s every 2-minute run and delays the heals after it
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        for at in (NOW, NOW + 120):
+            found = self.claude(self.run_once(at=at))
+            self.assertEqual([f["evidence"] for f in found], ["not probed: the Tailscale tunnel is down"],
+                             "the finding stays, so capture-host stays closed")
+        self.assertFalse([d for d in self.mini.did if d.startswith("probe ")], "zero claude_probe calls")
+        self.assertEqual(self.mini.probe_memory, {}, "nothing written to the probe cache")
+        self.mini.route = "utun4"
+        self.assertEqual(self.claude(self.run_once(at=NOW + 240)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2], "the first run after recovery probes at once")
+
+    def test_a_fresh_cached_answer_stands_while_the_tunnel_is_down(self) -> None:
+        self.run_once()
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2], "the window's answer stands; no new probe")
+
+    def test_a_tailscale_restart_and_a_claude_reroute_never_share_a_run(self) -> None:
+        self.mini.route = "en0"
+        self.mini.answers = {SR2: False, POOL: False}
+        self.run_once()
+        report = self.run_once(at=NOW + 120)  # the second sighting restarts Tailscale, which fixes the route
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertFalse([d for d in self.mini.did if d.startswith("route ")])
+        self.mini.answers = {SR2: True, POOL: True}
+        self.assertEqual(self.claude(self.run_once(at=NOW + 240)), [], "re-probed once the tunnel is back")
+        self.assertEqual(self.mini.claude_env["ANTHROPIC_BASE_URL"], SR2)
+
+    def test_the_other_routes_are_tried_before_the_one_that_just_failed(self) -> None:
+        self.mini.answers = {SR2: False, POOL: True}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2, "probe " + POOL, "route " + POOL])
+
+    def test_a_personal_mac_is_never_checked_or_rerouted(self) -> None:
+        self.mini.fleet = False  # mini-setup --hygiene-only: Leo's Macs, a teammate's laptop
+        self.mini.claude_env = {}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(self.mini.claude_env, {})
+
+    def test_the_token_is_kept_on_a_fleet_route_and_else_the_placeholder(self) -> None:
+        self.mini.answers = {SR2: False, POOL: True}
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "fleet-token"}
+        self.run_once()
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": POOL, "ANTHROPIC_AUTH_TOKEN": "fleet-token"})
+        for n, env in enumerate(({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "meant-for-elsewhere"},
+                                 {"ANTHROPIC_BASE_URL": "http://elsewhere:1"}), 1):
+            with self.subTest(env=env):
+                self.mini.claude_env = dict(env)
+                self.run_once(at=NOW + 3600 * n)
+                self.assertEqual(self.mini.claude_env["ANTHROPIC_AUTH_TOKEN"], ROUTES["placeholder"])
+
+    def test_a_settings_finding_reroutes_in_the_config_order(self) -> None:
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2}  # no placeholder: the route itself did not fail
+        self.run_once()
+        self.assertEqual(self.mini.did, ["probe " + SR2, "route " + SR2], "never drifts to a later route")
+
+    def test_a_route_outside_the_config_or_a_personal_token_is_a_finding(self) -> None:
+        for env, why in (({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "x"}, "elsewhere"),
+                         ({"ANTHROPIC_BASE_URL": SR2}, "no ANTHROPIC_AUTH_TOKEN"),
+                         ({"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "x",
+                           "CLAUDE_CODE_OAUTH_TOKEN": "sk-personal-value"}, "CLAUDE_CODE_OAUTH_TOKEN")):
+            with self.subTest(why=why):
+                self.mini.claude_env = env
+                found = self.claude(self.run_once(apply=False))
+                self.assertEqual(len(found), 1)
+                self.assertIn(why, found[0]["evidence"])
+                self.assertNotIn("sk-personal-value", json.dumps(found), "a token value is never reported")
+
+    def test_when_no_route_answers_the_finding_stays_and_the_heals_stop(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        at = NOW
+        for n in range(1, 4):
+            found = self.claude(self.run_once(at=at))
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["severity"], "error")
+            at += health.HEAL_EVERY_S
+        self.assertEqual(found[0]["auto_fix"], "pending")
+        self.assertIn("no fleet route answered", found[0]["note"])
+        found = self.claude(self.run_once(at=at))
+        self.assertEqual(found[0]["auto_fix"], "impossible")
+        on_disk = [f for f in json.loads(self.report.read_text())["findings"] if f["code"] == "claude_route"]
+        self.assertEqual(len(on_disk), 1, "capture-host reads health.json")
+
+    def test_a_failed_probe_is_remembered_within_the_window(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        self.run_once(heal_ok=False)
+        self.run_once(at=NOW + 120, heal_ok=False)
+        self.assertEqual(self.mini.did, ["probe " + SR2], "a dead route costs one hung probe per window, not per run")
+        self.mini.answers = {SR2: True}
+        self.assertEqual(self.claude(self.run_once(at=NOW + ROUTES["probe_every_s"] + 1, heal_ok=False)), [])
+
+    def test_a_host_without_runners_checks_only_claude(self) -> None:
+        self.mini.console_state = ("locked", "cmux")  # a runner finding: not this host's
+        self.mini.claude_env = {}
+        self.mini.answers = {SR2: False, POOL: False}
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        self.assertEqual([f["code"] for f in report["findings"]], ["claude_route"])
+        # a hand-made runner on a host with no glaeda runner is still a fault
+        hand = [("/x/ai.manaflow.builder.runner.plist", "ai.manaflow.builder.runner starts a GitHub runner")]
+        with mock.patch.object(self.mini, "foreign_runners", return_value=hand, create=True):
+            report = health.run(self.mini, True, now=NOW + 1, state_path=self.state, report_path=self.report,
+                                runner=False)
+        self.assertIn("runner_unmanaged:ai.manaflow.builder.runner.plist", [f["id"] for f in report["findings"]])
+
+
+class ClaudeMissing(Base):
+    """A fleet mini without Claude Code gets it, so every capture mini can run a real-agent capture."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.claude = None
+        self.mini.claude_env = {}
+        self.mini.claude_source = True
+        self.mini.answers = {SR2: True, POOL: True}
+
+    def codes(self, report: dict) -> list[str]:
+        return [f["code"] for f in report["findings"] if f["code"].startswith("claude_")]
+
+    def test_the_config_names_a_verified_source(self) -> None:
+        source = ROUTES["claude_code"]
+        self.assertTrue(source["downloads"].startswith("https://"))
+        self.assertIn(source["channel"], ("stable", "latest"))
+
+    def test_a_fleet_mini_without_claude_installs_it_and_routes_it_in_one_heal(self) -> None:
+        # Healed only once the new Claude goes through a fleet route: a clean report never means unrouted.
+        report = self.run_once()
+        self.assertEqual(self.codes(report), [])
+        self.assertEqual([h["code"] for h in report["healed"]], ["claude_missing"])
+        self.assertEqual(self.mini.did, ["install claude stable", "probe " + SR2, "route " + SR2])
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual(self.codes(self.run_once(at=NOW + 120)), [])
+
+    def test_an_install_whose_route_does_not_answer_stays_a_finding(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        report = self.run_once()
+        self.assertIn("claude_missing", self.codes(report))
+        self.assertNotIn("claude_missing", [h["code"] for h in report["healed"]])
+        missing = [f for f in report["findings"] if f["code"] == "claude_missing"]
+        self.assertIn("not routed yet", missing[0]["note"])
+        # the next pass sees Claude installed: claude_route keeps capture-host closed and its heal takes over
+        self.mini.answers = {SR2: True, POOL: True}
+        self.assertEqual(self.codes(self.run_once(at=NOW + health.HEAL_EVERY_S)), [])
+
+    def test_a_route_write_that_fails_after_the_install_keeps_the_finding(self) -> None:
+        def broken(url, token):
+            raise OSError(28, "No space left on device")
+        self.mini.set_claude_route = broken  # type: ignore[method-assign]
+        report = self.run_once()
+        missing = [f for f in report["findings"] if f["code"] == "claude_missing"]
+        self.assertEqual(len(missing), 1, "a failed route write never reads as healthy")
+        self.assertIn("No space left", missing[0]["note"])
+
+    def test_a_tunnel_that_is_down_holds_the_install_too(self) -> None:
+        # The heal ends in a route probe, which hangs through a broken tunnel: no install, no try spent.
+        self.mini.route = "en0"
+        self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
+        for at in (NOW, NOW + 120):
+            missing = [f for f in self.run_once(at=at)["findings"] if f["code"] == "claude_missing"]
+            self.assertEqual(len(missing), 1)
+            self.assertIn("not installed while the tunnel is down", missing[0]["note"])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("install ", "probe ", "route "))])
+        self.mini.route = "utun4"
+        self.assertEqual(self.codes(self.run_once(at=NOW + 240)), [])
+        self.assertEqual(self.mini.did[0], "install claude stable")
+
+    def test_the_real_config_turns_the_check_on_for_every_test_mini(self) -> None:
+        # FakeMini hides claude_code by default; the shipped config names it, so a real fleet mini is checked.
+        self.assertIsInstance(ROUTES.get("claude_code"), dict)
+        self.mini.claude_source = False
+        self.assertEqual(self.codes(self.run_once(apply=False)), [])
+
+    def test_with_the_shipped_config_a_routed_mini_reports_nothing_new(self) -> None:
+        # The other tests' minis run with claude_code hidden; with it on, a mini that has a routed Claude is
+        # exactly as healthy as before (only a mini without Claude gains a finding).
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+
+    def test_a_failed_install_stays_a_finding_and_is_retried_at_the_heal_pace(self) -> None:
+        self.mini.install_ok = False
+        found = [f for f in self.run_once()["findings"] if f["code"] == "claude_missing"]
+        self.assertEqual(len(found), 1)
+        self.assertIn("timed out", found[0]["note"])
+        self.run_once(at=NOW + 120)
+        self.assertEqual(self.mini.did, ["install claude stable"], "no second try inside HEAL_EVERY_S")
+        self.run_once(at=NOW + health.HEAL_EVERY_S)
+        self.assertEqual(self.mini.did, ["install claude stable"] * 2)
+
+    def test_check_only_installs_nothing(self) -> None:
+        self.assertEqual(self.codes(self.run_once(apply=False)), ["claude_missing"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_personal_mac_is_left_alone(self) -> None:
+        self.mini.fleet = False
+        self.assertEqual(self.codes(self.run_once()), [])
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_capture_only_mini_without_claude_gets_it_too(self) -> None:
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        self.assertEqual([h["code"] for h in report["healed"]], ["claude_missing"])
+
+    def test_a_capture_only_mini_holds_the_install_while_its_tunnel_is_down(self) -> None:
+        self.mini.route = "en0"
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        self.assertEqual([f["code"] for f in report["findings"]], ["claude_missing"],
+                         "tailscale_no_route is reported only from its second run")
+        self.assertIn("not installed while the tunnel is down", report["findings"][0]["note"])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("install ", "probe ", "route "))])
+
+    def capture_only(self, at: float = NOW) -> dict:
+        with mock.patch.object(self.mini, "foreign_runners", return_value=[], create=True):
+            return health.run(self.mini, True, now=at, state_path=self.state, report_path=self.report, runner=False)
+
+    def test_a_capture_only_mini_gets_tailscale_up_when_stopped_twice(self) -> None:
+        # cmux-mac-mini, 2026-11-17: Stopped (WantRunning=false) after a power loss until a person ran `tailscale up`
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.ts, self.mini.ts_after = ("app", "Stopped", ""), ["Running"]
+        first = self.capture_only()
+        # claude_route is held (not probed, not rerouted) while the tunnel is down, as on a runner host
+        self.assertEqual([f["code"] for f in first["findings"]], ["tailscale_down", "claude_route"])
+        self.assertNotIn("up", self.mini.did, "one sighting never heals")
+        second = self.capture_only(NOW + 120)
+        self.assertEqual(self.mini.did.count("up"), 1)
+        self.assertNotIn("tailscale_down", [f["code"] for f in second["findings"]])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("probe ", "route ", "vpn"))])
+        third = self.capture_only(NOW + 240)  # the tunnel is back: the route is probed again and clears
+        self.assertEqual(third["findings"], [])
+        self.assertEqual([h["action"] for h in second["healed"] if h["code"] == "tailscale_down"],
+                         ["tailscale up: Running"])
+
+    def test_a_capture_only_mini_with_a_running_tailscale_has_no_tailscale_finding(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        for at in (NOW, NOW + 120):
+            self.assertEqual(self.capture_only(at)["findings"], [])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart"))])
+
+    def test_a_capture_only_mini_reports_a_stuck_starting_without_restarting_the_vpn(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.ts = ("app", "Starting", "")
+        for at in (NOW, NOW + 120):
+            found = [f for f in self.capture_only(at)["findings"] if f["code"] == "tailscale_down"]
+        self.assertEqual(found[0]["auto_fix"], "impossible")
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart"))])
+
+    def test_a_capture_only_mini_reports_no_route_and_never_restarts(self) -> None:
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.route = "en0"
+        self.mini.opt_in = ({"hosts": ["cmux-mac-mini"]}, "")  # even an opt-in never restarts a capture-only mini
+        self.assertEqual([f["code"] for f in self.capture_only()["findings"]], ["claude_route"])
+        report = self.capture_only(NOW + 120)
+        route = [f for f in report["findings"] if f["code"] == "tailscale_no_route"]
+        self.assertEqual(len(route), 1)
+        self.assertEqual(route[0]["auto_fix"], "impossible")
+        self.assertIn("not restarted here", route[0]["note"])
+        self.assertNotIn("flavor", route[0])
+        self.assertFalse([d for d in self.mini.did if d.startswith(("up", "vpn", "restart", "probe ", "route "))])
+        self.assertEqual(report["heals"], [])
+        claude = [f for f in report["findings"] if f["code"] == "claude_route"]
+        self.assertIn("rerouted while the tunnel is down", claude[0]["note"])
+
+    def test_main_on_a_capture_only_mini_runs_the_claude_pass(self) -> None:
+        # main(): no runner dirs, no Claude yet; the claude_missing check alone opens the pass.
+        mini = self.mini
+        mini.runner_dirs = lambda: []  # type: ignore[method-assign]
+        with mock.patch.object(health, "Mini", return_value=mini), \
+                mock.patch.object(health, "check_daemon_heal", return_value=[]), \
+                mock.patch.object(health, "check_foreign_runners", return_value=[]), \
+                mock.patch.object(health, "STATE", self.state), mock.patch.object(health, "REPORT", self.report), \
+                mock.patch.object(health, "KILL_SWITCH", self.dir / "off"):
+            self.assertEqual(health.main(["--apply"]), 0)
+        self.assertEqual(mini.did[0], "install claude stable")
+
+
+class ClaudeInstallOnDisk(unittest.TestCase):
+    """install_claude keeps only a binary whose sha256 matches its manifest, and runs nothing else."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.mini = health.Mini(self.home)
+        self.ran: list[list[str]] = []
+        self.body = b"#!/bin/sh\nexit 0\n"
+        self.served: dict[str, bytes] = {}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def serve(self, version: str, checksum: str) -> None:
+        base = "https://downloads.example/r"
+        self.served = {f"{base}/stable": (version + "\n").encode(),
+                       f"{base}/{version}/manifest.json": json.dumps(
+                           {"platforms": {"darwin-arm64": {"checksum": checksum}}}).encode(),
+                       f"{base}/{version}/darwin-arm64/claude": self.body}
+
+    def install(self, fail_after: int | None = None) -> tuple[bool, str]:
+        import io
+        envs = self.envs = []
+        class Body(io.BytesIO):
+            def __init__(self, data, cut):
+                super().__init__(data)
+                self.cut = cut
+            def read(self, n=-1):
+                if self.cut is not None and self.tell() >= self.cut:
+                    raise ConnectionResetError("reset mid-download")
+                return super().read(min(n, self.cut - self.tell()) if self.cut is not None and n > 0 else n)
+        served = self.served
+        class Opener:
+            def open(self, url, timeout=None):
+                if url not in served:
+                    raise OSError(f"404 {url}")
+                return Body(served[url], fail_after if url.endswith("/claude") else None)
+        def sh(argv, timeout=15, env=None, cwd=None):
+            self.ran.append(list(argv))
+            envs.append(dict(env or {}))
+            link = self.home / ".local/bin/claude"
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.write_text("#!/bin/sh\n")
+            link.chmod(0o755)
+            return 0, "installed"
+        with mock.patch("urllib.request.build_opener", return_value=Opener()), \
+                mock.patch.object(health, "sh", side_effect=sh), \
+                mock.patch.object(health.sys, "platform", "darwin"), \
+                mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "personal", "ANTHROPIC_AUTH_TOKEN": "tok",
+                                             "ANTHROPIC_API_KEY": "key", "ANTHROPIC_BASE_URL": "http://x",
+                                             "PATH": "/usr/bin"}):
+            return self.mini.install_claude({"downloads": "https://downloads.example/r", "channel": "stable"})
+
+    def leftovers(self) -> list[Path]:
+        folder = self.home / ".local/share/glaeda/claude-install"
+        return list(folder.iterdir()) if folder.exists() else []
+
+    def test_a_binary_matching_its_manifest_is_installed_and_removed_after(self) -> None:
+        import hashlib
+        self.serve("2.1.308", hashlib.sha256(self.body).hexdigest())
+        ok, what = self.install()
+        self.assertTrue(ok, what)
+        self.assertIn("2.1.308", what)
+        self.assertEqual(len(self.ran), 1)
+        self.assertEqual(self.ran[0][1:], ["install", "2.1.308"])
+        for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"):
+            self.assertNotIn(key, self.envs[0], "no credential or route reaches the downloaded binary")
+        self.assertEqual(self.envs[0].get("PATH"), "/usr/bin")
+
+    def test_a_prerelease_version_is_accepted_and_odd_ones_refused(self) -> None:
+        self.assertTrue(health.CLAUDE_VERSION.fullmatch("2.2.0-beta.1"))
+        for odd in ("2.2", "2.2.0;rm", "2.2.0-", "2.2.0-a/b", "<html>"):
+            self.assertIsNone(health.CLAUDE_VERSION.fullmatch(odd), odd)
+        self.assertEqual(self.leftovers(), [], "the download is gone")
+
+    def test_a_download_cut_short_leaves_nothing_and_runs_nothing(self) -> None:
+        import hashlib
+        self.body = b"x" * (3 << 20)
+        self.serve("2.1.308", hashlib.sha256(self.body).hexdigest())
+        ok, what = self.install(fail_after=1 << 20)
+        self.assertFalse(ok)
+        self.assertIn("ConnectionResetError", what)
+        self.assertEqual((self.ran, self.leftovers()), ([], []))
+
+    def test_a_manifest_of_another_shape_is_a_failed_heal_not_a_crash(self) -> None:
+        for manifest in ([], {"platforms": []}, {"platforms": {"darwin-arm64": "x"}}, "x"):
+            with self.subTest(manifest=manifest):
+                self.serve("2.1.308", "0" * 64)
+                self.served["https://downloads.example/r/2.1.308/manifest.json"] = json.dumps(manifest).encode()
+                ok, what = self.install()
+                self.assertFalse(ok)
+                self.assertIn("no darwin-arm64 checksum", what)
+        self.serve("2.1.308", "0" * 64)
+        self.served["https://downloads.example/r/2.1.308/manifest.json"] = b'{"platforms": {"darw'
+        self.assertFalse(self.install()[0])
+        self.assertEqual(self.ran, [])
+
+    def test_a_redirect_off_https_is_refused(self) -> None:
+        handler = None
+        def capture(h):
+            nonlocal handler
+            handler = h
+            raise RuntimeError("stop")
+        with mock.patch("urllib.request.build_opener", side_effect=capture), \
+                mock.patch.object(health.sys, "platform", "darwin"), \
+                mock.patch.object(health.os, "uname", return_value=mock.Mock(machine="arm64")):
+            with self.assertRaises(RuntimeError):
+                self.mini.install_claude({"downloads": "https://downloads.example/r", "channel": "stable"})
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request("https://downloads.example/r/stable")
+        with self.assertRaises(urllib.error.URLError):
+            handler().redirect_request(req, None, 302, "Found", {}, "http://evil.example/stable")
+        self.assertIsNotNone(handler().redirect_request(req, None, 302, "Found", {}, "https://cdn.example/stable"))
+
+    def test_a_download_that_cannot_be_removed_fails_the_heal(self) -> None:
+        import hashlib
+        self.serve("2.1.308", hashlib.sha256(self.body).hexdigest())
+        real = Path.unlink
+        def stuck(path, *a, **k):
+            if path.name.startswith("claude-2.1.308"):
+                raise PermissionError(13, "Operation not permitted")
+            return real(path, *a, **k)
+        with mock.patch.object(Path, "unlink", stuck):
+            ok, what = self.install()
+        self.assertFalse(ok)
+        self.assertIn("could not remove the download claude-2.1.308-darwin-arm64", what)
+
+    def test_a_binary_that_does_not_match_is_never_run(self) -> None:
+        self.serve("2.1.308", "0" * 64)
+        ok, what = self.install()
+        self.assertFalse(ok)
+        self.assertIn("did not match", what)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_odd_channel_answers_and_sources_are_refused(self) -> None:
+        self.serve("<html>", "0" * 64)
+        self.assertEqual(self.install(), (False, "the stable channel named no version"))
+        self.assertEqual(self.mini.install_claude({"downloads": "http://x", "channel": "stable"})[0], False)
+        self.assertEqual(self.mini.install_claude({"downloads": "https://x", "channel": "1.0; rm"})[0], False)
+        self.assertEqual(self.ran, [])
+
+
+class ClaudeRouteOnDisk(unittest.TestCase):
+    """The real reads and writes: settings.json keeps everything else, the probe never sees a personal token."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.mini = health.Mini(self.home)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_set_route_keeps_the_rest_of_the_settings_and_a_backup(self) -> None:
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        before = {"hooks": {"Stop": []}, "env": {"FOO": "1", "CLAUDE_CODE_OAUTH_TOKEN": "personal"}}
+        settings.write_text(json.dumps(before))
+        what = self.mini.set_claude_route(SR2, "subrouter")
+        after = json.loads(settings.read_text())
+        self.assertEqual(after["hooks"], {"Stop": []})
+        self.assertEqual(after["env"], {"FOO": "1", "ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        backups = list(settings.parent.glob("settings.json.bak-mini-health-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600, "the backup can hold a token")
+        self.assertEqual(json.loads(backups[0].read_text()), before)
+        self.assertIn(SR2, what)
+        self.assertNotIn("personal", what)
+
+    def test_only_a_fleet_mini_counts_as_one(self) -> None:
+        conf = self.home / ".config/glaeda/update.json"
+        self.assertFalse(self.mini.fleet_host(), "no update.json: glaeda-update's default is --hygiene-only")
+        conf.parent.mkdir(parents=True)
+        for args, fleet in ((["--hygiene-only"], False), ([], True), (["--role=builder"], True)):
+            conf.write_text(json.dumps({"setupArgs": args}))
+            self.assertEqual(self.mini.fleet_host(), fleet, args)
+
+    def test_set_route_writes_settings_where_there_were_none(self) -> None:
+        self.mini.set_claude_route(SR2, "subrouter")
+        self.assertEqual(json.loads((self.home / ".claude/settings.json").read_text())["env"]["ANTHROPIC_BASE_URL"], SR2)
+
+    def fake_claude(self, body: str) -> Path:
+        path = self.home / ".local/bin/claude"
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def test_the_probe_routes_through_settings_and_drops_a_personal_token(self) -> None:
+        seen = self.home / "seen"
+        self.fake_claude(f'printf "%s\\n" "$@" > {seen}; env >> {seen}; echo PONG\n')
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "personal"
+        try:
+            ok, detail = self.mini.claude_probe(SR2, "subrouter")
+        finally:
+            del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+        self.assertEqual((ok, detail), (True, "PONG"))
+        text = seen.read_text()
+        self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
+        self.assertNotIn("personal", text)
+
+    def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
+        self.fake_claude("sleep 30\n")
+        orig = health.CLAUDE_PROBE_S
+        health.CLAUDE_PROBE_S = 1
+        try:
+            self.assertEqual(self.mini.claude_probe(SR2, "subrouter"), (False, "no answer in 1 s"))
+        finally:
+            health.CLAUDE_PROBE_S = orig
+        (self.home / ".local/bin/claude").write_text("#!/bin/sh\necho 'API Error: 401 OAuth session expired'\nexit 1\n")
+        ok, detail = self.mini.claude_probe(SR2, "subrouter")
+        self.assertFalse(ok)
+        self.assertIn("exit 1", detail)
+        self.assertIn("401", detail)
+
+    def test_no_claude_binary_means_no_check(self) -> None:
+        self.assertIsNone(self.mini.claude_bin())
+
+
+class PersonalMac(unittest.TestCase):
+    def status_with(self, update: dict | None) -> object:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            if update is not None:
+                (home / ".config/glaeda").mkdir(parents=True)
+                (home / ".config/glaeda/update.json").write_text(json.dumps(update))
+            mini = health.Mini(home)
+            mini.daemon_policy = lambda: health.SCRIPT_DIR.parent / "config/macos-daemons.json"
+            calls = []
+            orig = health.sh
+            health.sh = lambda argv, **kw: (calls.append(argv), (1, ""))[1]
+            try:
+                mini.daemon_heal_status()
+            finally:
+                health.sh = orig
+            return calls
+
+    def test_missing_update_config_or_setup_args_is_hygiene_only_like_glaeda_update(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("the daemon healer is macOS-only")
+        self.assertEqual(self.status_with(None), [])
+        self.assertEqual(self.status_with({"ring": "stable"}), [])
+        self.assertEqual(self.status_with({"setupArgs": ["--hygiene-only"]}), [])
+        self.assertEqual(len(self.status_with({"setupArgs": []})), 1, "a fleet host asks the healer")
+
+
 class Parsing(unittest.TestCase):
     def test_no_runner_is_a_no_op(self) -> None:
         with tempfile.TemporaryDirectory() as home:
@@ -483,6 +3429,227 @@ class Parsing(unittest.TestCase):
         for command in ("/usr/bin/xcodebuild test -scheme cmux", "/Applications/Xcode.app/x/usr/bin/xctest a.xctest"):
             self.assertTrue(health.XCTEST_RUNNING.search(command), command)
         self.assertFalse(health.XCTEST_RUNNING.search("/usr/bin/xcodebuild build -scheme cmux"))
+
+
+
+class DedicatedRunnerAgentTest(unittest.TestCase):
+    def test_a_dedicated_runner_is_checked_and_kickstarted_like_an_instance(self) -> None:
+        """glaeda-cmux-runner --dedicated NAME runs as com.teamleaderleo.glaeda.cmux-runner.dedicated.NAME in
+        ~/actions-runner-glaeda-NAME; its .watch agent is the builder's loop, not a runner."""
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        self.assertTrue(health.RUNNER_AGENT.fullmatch(label))
+        self.assertFalse(health.RUNNER_AGENT.fullmatch(label + ".watch"))
+        self.assertEqual(health.agent_label("nightly-next"), label)
+        self.assertEqual((health.agent_label("0"), health.agent_label("3")),
+                         ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.3"))
+        self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-nightly-next").group(1), "nightly-next")
+        self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-7").group(1), "7")
+        mini = mock.Mock()
+        mini.runner_registrations.return_value = []
+        mini.runner_agents.return_value = [(label, True, False, "0")]
+        with mock.patch.object(health, "HELD", Path(tempfile.mkdtemp())):
+            found = health.check_runners(mini)
+        self.assertEqual([f["id"] for f in found], ["runner_stopped:nightly-next"])
+
+class ForeignRunnerTest(unittest.TestCase):
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A runner service glaeda does not own is a
+    fault: its LaunchAgent or LaunchDaemon, or a Runner.Listener outside ~/actions-runner-glaeda*."""
+
+    def test_a_hand_made_runner_is_a_fault_and_glaedas_are_not(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        agents, daemons = home / "Library/LaunchAgents", home / "daemons"
+        agents.mkdir(parents=True)
+        daemons.mkdir()
+        old = home / "actions-runner-nightly-next"
+        old.mkdir()
+        (old / ".runner").write_text("{}")
+
+        def plist(folder, label, args, cwd=None):
+            doc = {"Label": label, "ProgramArguments": args}
+            if cwd:
+                doc["WorkingDirectory"] = cwd
+            (folder / f"{label}.plist").write_bytes(plistlib.dumps(doc))
+        plist(agents, "ai.manaflow.nightly-builder.runner", ["/bin/bash", "run.sh"], os.fspath(old))
+        plist(agents, "ai.manaflow.nightly-builder.watch", ["/usr/bin/python3", "/x/nightly_builder.py", "watch"])
+        (home / "actions-runner").mkdir()
+        (home / "actions-runner/.runner").write_text("{}")
+        plist(daemons, "actions.runner.manaflow-ai-cmux.mini", [f"{home}/actions-runner/runsvc.sh"])
+        plist(agents, "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next",
+              [f"{home}/actions-runner-glaeda-nightly-next/run.sh"])
+        plist(agents, "com.teamleaderleo.glaeda.cmux-runner.3", [f"{home}/actions-runner-glaeda-3/run.sh"])
+        (agents / "broken.plist").write_text("not a plist")
+        # valid plists of the wrong shape say nothing and never stop the pass
+        (agents / "odd-args.plist").write_bytes(plistlib.dumps({"Label": "com.example.odd", "ProgramArguments": 7}))
+        (agents / "odd-root.plist").write_bytes(plistlib.dumps(["not", "a", "dict"]))
+        (home / "build").mkdir()
+        plist(agents, "com.example.build", [f"{home}/build/run.sh"])  # a run.sh outside any runner: not a runner
+        plist(agents, "com.example.relative", ["/bin/bash", "run.sh"], os.fspath(home / "build"))
+        # a tool that only works in a runner's directory, or names it, is not a runner
+        plist(agents, "com.example.cleaner", ["/usr/bin/python3", "/x/clean.py", os.fspath(old)], os.fspath(old))
+        # ownership is the plist's Label: a renamed glaeda plist is glaeda's, a foreign one with a glaeda-like file
+        # name is not
+        renamed = {"Label": "com.teamleaderleo.glaeda.cmux-runner.4",
+                   "ProgramArguments": [f"{home}/actions-runner-glaeda-4/run.sh"]}
+        (agents / "renamed.plist").write_bytes(plistlib.dumps(renamed))
+        posing = {"Label": "ai.manaflow.ios-internal-builder.runner", "ProgramArguments": [f"{old}/run.sh"]}
+        (agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist").write_bytes(plistlib.dumps(posing))
+        mini = health.Mini(home)
+        mini.daemons_dir = daemons
+        global_agents = home / "global-agents"
+        global_agents.mkdir()
+        mini.global_agents_dir = global_agents
+        plist(global_agents, "com.example.global-runner", [f"{old}/run.sh"])
+        procs = [(1, 501, "S", f"{home}/actions-runner-glaeda-3/bin.2.338.0/Runner.Listener run"),
+                 (2, 501, "S", f"{home}/actions-runner-glaeda-nightly-next/bin/Runner.Listener run"),
+                 (3, 501, "S", f"{home}/actions-runner-glaeda/bin/Runner.Listener run"),
+                 (4, 501, "S", f"{old}/bin/Runner.Listener run"),
+                 (5, 501, "S", f"{home}/actions-runner-glaedax/bin/Runner.Listener run")]
+        with mock.patch.object(mini, "processes", return_value=procs):
+            found = health.check_foreign_runners(mini)
+        ids = sorted(f["id"] for f in found)
+        self.assertEqual(ids, ["runner_unmanaged:actions-runner-glaedax", "runner_unmanaged:actions-runner-nightly-next",
+                               "runner_unmanaged:actions.runner.manaflow-ai-cmux.mini.plist",
+                               "runner_unmanaged:ai.manaflow.nightly-builder.runner.plist",
+                               "runner_unmanaged:com.example.global-runner.plist",
+                               "runner_unmanaged:com.teamleaderleo.glaeda.cmux-runner.9.plist"])
+        self.assertTrue(all(f["severity"] == "error" for f in found))
+        with mock.patch.object(mini, "processes", return_value=procs[:3]):
+            for p in [*agents.glob("ai.manaflow.*"), agents / "com.teamleaderleo.glaeda.cmux-runner.9.plist"]:
+                p.unlink()
+            for p in [*daemons.glob("*.plist"), *global_agents.glob("*.plist")]:
+                p.unlink()
+            self.assertEqual(health.check_foreign_runners(mini), [], "every runner glaeda's: no fault")
+
+
+
+class UnmanagedServiceTest(unittest.TestCase):
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A fleet-looking launchd service that glaeda
+    does not install and config/fleet-services.json does not declare is reported (a warning), never unloaded."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.agents = self.home / "Library/LaunchAgents"
+        self.daemons = self.home / "daemons"
+        self.globals = self.home / "global-agents"
+        for d in (self.agents, self.daemons, self.globals):
+            d.mkdir(parents=True)
+        self.mini = health.Mini(self.home)
+        self.mini.daemons_dir, self.mini.global_agents_dir = self.daemons, self.globals
+
+    def plist(self, folder: Path, label: str, args: list[str], name: str | None = None) -> None:
+        (folder / (name or f"{label}.plist")).write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": args}))
+
+    def ids(self) -> list[str]:
+        return [f["id"] for f in health.check_unmanaged_services(self.mini)]
+
+    def test_the_policy_declares_an_installer_and_a_reason_for_every_service(self) -> None:
+        doc = json.loads((ROOT / "config" / "fleet-services.json").read_text())
+        self.assertEqual(doc["schema"], "glaeda-fleet-services/v1")
+        for m in doc["match"]:
+            re.compile(m)
+        for label, about in {**doc["services"], **doc["prefixes"]}.items():
+            self.assertTrue(about.get("owner") and about.get("why"), label)
+            self.assertFalse(label.startswith(health.GLAEDA_LABEL_PREFIX), f"{label} is glaeda's own")
+
+    def test_only_an_undeclared_fleet_service_is_reported_and_nothing_is_changed(self) -> None:
+        # what four CI minis held on 2026-10-29
+        for label in ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.3",
+                      "com.teamleaderleo.glaeda.disk-pressure", "ai.leo-workspace.ci-mini-reclaim",
+                      "ai.manaflow.vmpaused", "ai.manaflow.cua-driver", "com.cmuxterm.host-remote",
+                      "com.cmux.trajectory-archive", "ai.manaflow.chromium-golden"):
+            self.plist(self.agents, label, ["/bin/sh", "-c", "true"])
+        for label in ("ai.manaflow.console-unlock-guard", "ai.manaflow.symbol-cache-cap", "ai.manaflow.cmux-build-worker",
+                      "ai.manaflow.cmux-lent-worker", "ai.manaflow.cmux-disk-pressure", "com.cmux.caffeinate",
+                      "com.teamleaderleo.glaeda.daemon-heal", "com.tailscale.tailscaled", "com.apple.something"):
+            self.plist(self.daemons, label, ["/usr/bin/true"])
+        # a retired copy is no job; a non-plist says nothing
+        self.plist(self.daemons, "ai.manaflow.ci-dash", ["/x/ci-dash"], name="ai.manaflow.ci-dash.plist.retired-20260928")
+        (self.agents / "broken.plist").write_text("not a plist")
+        self.assertEqual(self.ids(), [])
+        # hand-made services: one in each folder, matched by prefix or by naming a worker or builder
+        self.plist(self.agents, "ai.manaflow.cmux-perf-worker", ["/Users/cmux/perf/worker.sh", "--loop"])
+        self.plist(self.globals, "com.example.nightly-builder", ["/opt/builder"])
+        self.plist(self.daemons, "com.cmux.nx-somethingnew", ["/usr/local/bin/nx-new"])
+        self.plist(self.agents, "org.git-scm.git.hourly", ["/usr/bin/git", "maintenance"])  # not fleet-looking
+        before = sorted(p.name for d in (self.agents, self.daemons, self.globals) for p in d.iterdir())
+        with mock.patch.object(health, "sh", side_effect=AssertionError("no command runs")):
+            found = health.check_unmanaged_services(self.mini)
+        self.assertEqual([f["id"] for f in found], ["unmanaged_service:ai.manaflow.cmux-perf-worker",
+                                                    "unmanaged_service:com.cmux.nx-somethingnew",
+                                                    "unmanaged_service:com.example.nightly-builder"])
+        self.assertTrue(all(f["severity"] == "warn" and f["auto_fix"] == "impossible" for f in found))
+        self.assertIn("/Users/cmux/perf/worker.sh", found[0]["evidence"])
+        self.assertIn(os.fspath(self.agents / "ai.manaflow.cmux-perf-worker.plist"), found[0]["evidence"])
+        self.assertEqual(sorted(p.name for d in (self.agents, self.daemons, self.globals) for p in d.iterdir()), before)
+        self.assertNotIn("unmanaged_service", health.HEALS)  # report only: no heal exists
+
+    def test_a_plist_launchd_would_not_load_is_no_unmanaged_service(self) -> None:
+        # Review on #1734: any plist dict qualified, even {}, so a fleet-looking file name warned with no job behind it
+        for name, doc in (("ai.manaflow.empty-worker", {}), ("ai.manaflow.label-only-worker",
+                                                             {"Label": "ai.manaflow.label-only-worker"}),
+                          ("ai.manaflow.no-label-worker", {"ProgramArguments": ["/x/worker"]}),
+                          ("ai.manaflow.blank-label-worker", {"Label": " ", "Program": "/x/worker"}),
+                          ("ai.manaflow.empty-args-worker", {"Label": "ai.manaflow.empty-args-worker",
+                                                             "ProgramArguments": []}),
+                          ("ai.manaflow.bad-args-worker", {"Label": "ai.manaflow.bad-args-worker",
+                                                           "ProgramArguments": [7]})):
+            (self.agents / f"{name}.plist").write_bytes(plistlib.dumps(doc))
+        self.assertEqual(self.ids(), [])
+        (self.agents / "ai.manaflow.program-worker.plist").write_bytes(
+            plistlib.dumps({"Label": "ai.manaflow.program-worker", "Program": "/x/worker"}))
+        self.plist(self.daemons, "ai.manaflow.args-worker", ["/x/worker", "--loop"])
+        self.assertEqual(self.ids(), ["unmanaged_service:ai.manaflow.args-worker",
+                                      "unmanaged_service:ai.manaflow.program-worker"])
+        # runner_unmanaged still reads every job, a label-less one by its file name
+        self.assertTrue(any(p.name == "ai.manaflow.no-label-worker.plist" for p, *_ in self.mini.launchd_jobs()))
+
+    def test_a_service_that_starts_a_runner_is_runner_unmanaged_not_this(self) -> None:
+        old = self.home / "actions-runner"
+        old.mkdir()
+        (old / ".runner").write_text("{}")
+        self.plist(self.daemons, "actions.runner.manaflow-ai-cmux.mini", [f"{old}/runsvc.sh"])
+        self.assertEqual(self.ids(), [])
+        with mock.patch.object(self.mini, "processes", return_value=[]):
+            self.assertEqual([f["code"] for f in health.check_foreign_runners(self.mini)], ["runner_unmanaged"])
+
+    def test_no_readable_policy_judges_nothing(self) -> None:
+        self.plist(self.agents, "ai.manaflow.cmux-perf-worker", ["/x"])
+        with mock.patch.object(self.mini, "fleet_services", return_value={}):
+            self.assertEqual(self.ids(), [])
+        with mock.patch.object(self.mini, "fleet_services", return_value={"match": ["("]}):
+            self.assertEqual(self.ids(), [])
+
+    def test_a_pass_reports_it_on_runner_and_runnerless_hosts(self) -> None:
+        hand = [health.finding("unmanaged_service:ai.manaflow.x-worker", "warn", "x", "impossible")]
+        state, report = self.home / "state.json", self.home / "health.json"
+        mini = FakeMini()
+        with mock.patch.object(health, "check_unmanaged_services", return_value=hand):
+            for runner in (True, False):
+                out = health.run(mini, True, now=NOW, state_path=state, report_path=report, runner=runner)
+                self.assertIn("unmanaged_service:ai.manaflow.x-worker", [f["id"] for f in out["findings"]], runner)
+                self.assertEqual(out["heals"], [])
+
+
+class PressureBlocked(unittest.TestCase):
+    """disk_pressure_blocked: under pressure with almost nothing reclaimable while tens of GiB are blocked."""
+
+    G = 1024**3
+
+    def summary(self, reclaimable: float, blocked: float, under: bool = True) -> dict:
+        return {"schema": "glaeda-disk/v1", "reclaimable": reclaimable * self.G, "blocked": blocked * self.G,
+                "filesystems": [{"mount": "/", "free": 27 * self.G, "total": 460 * self.G, "under": under}]}
+
+    def test_the_panel_that_read_reclaimable_zero_warns(self) -> None:
+        out = health.pressure_blocked_findings(self.summary(0.0, 153.5))
+        self.assertEqual([f["id"] for f in out], ["disk_pressure_blocked"])
+        self.assertIn("blocked 153.5 GiB", out[0]["evidence"])
+
+    def test_no_pressure_enough_reclaimable_or_little_blocked_is_quiet(self) -> None:
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 153.5, under=False)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(20.0, 153.5)), [])
+        self.assertEqual(health.pressure_blocked_findings(self.summary(0.0, 10.0)), [])
+        self.assertEqual(health.pressure_blocked_findings({"schema": "glaeda-disk/v1"}), [])
 
 
 if __name__ == "__main__":

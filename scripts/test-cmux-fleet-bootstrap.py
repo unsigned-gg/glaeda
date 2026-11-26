@@ -95,7 +95,17 @@ class Tests(unittest.TestCase):
             "cmux-mac-build-large",
         )
         self.assertFalse(result["eligibleForEnrollment"])
-        self.assertEqual(result["blockingChecks"], ["diskAdmission", "xcodePin"])
+        self.assertEqual(result["blockingChecks"], ["xcodePin"])
+        self.assertEqual(result["warningChecks"], ["diskAdmission"])
+
+    def test_a_disk_floor_warns_and_never_blocks_enrollment(self):
+        for failed in (("diskAdmission",), ("nativeCacheDiskAdmission",), ("diskAdmission", "nativeCacheDiskAdmission")):
+            result = b.evaluate(observation(failed=failed), ["cmux_macos_native_build"], "cmux-mac-build-large")
+            self.assertTrue(result["eligibleForEnrollment"], failed)
+            self.assertEqual(result["blockingChecks"], [])
+            self.assertEqual(result["warningChecks"], sorted(failed))
+        for check in b.WARNING_CHECKS:
+            self.assertIn(check, b.BLOCKING_FIXES)  # the warning names its fix
 
     def test_wrong_os_role_refused(self):
         with self.assertRaisesRegex(b.BootstrapError, "incompatible"):

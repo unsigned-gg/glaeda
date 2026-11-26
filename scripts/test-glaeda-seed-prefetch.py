@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -34,6 +35,7 @@ with open(os.environ["FAKE_CALLS"], "a") as log:
               + " curlrc=" + (open(os.path.join(os.environ["CURL_HOME"], ".curlrc")).read().strip().replace(" ", "")
                               if os.environ.get("CURL_HOME") else "") + "\\n")
 distance = int(os.environ.get("FAKE_DISTANCE", "0"))
+__import__("time").sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 print("some progress line")
 print(json.dumps({"fetched": "true", "key": "k", "distance": distance}))
 """
@@ -53,6 +55,9 @@ class PrefetchBase(unittest.TestCase):
         self.commit()
         self.calls = base / "calls"
         self.saved = (sp.REPO_URL, sp.running_commands, dict(os.environ))
+        saved_mirror_dir = sp.GIT_MIRROR_DIR  # never the host's own git mirror (a mini running this suite has one)
+        self.addCleanup(setattr, sp, "GIT_MIRROR_DIR", saved_mirror_dir)
+        sp.GIT_MIRROR_DIR = os.fspath(base / "git")
         sp.REPO_URL = self.repo.as_uri()
         sp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         os.environ["FAKE_CALLS"] = os.fspath(self.calls)
@@ -78,10 +83,73 @@ class PrefetchBase(unittest.TestCase):
 
 
 class SeedPrefetchTest(PrefetchBase):
+    def test_the_prefetch_mirror_borrows_the_minis_git_mirror(self):
+        mirror = Path(sp.GIT_MIRROR_DIR) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        work = self.state / ".prefetch"
+        own, head = sp.main_head(work)
+        self.assertEqual(head, subprocess.run([*self.git, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                              check=True).stdout.strip())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        self.assertEqual(json.loads((own / sp.BORROW_RECORD).read_text())["objects"], os.fspath(mirror / "objects"))
+        # A rebuilt git mirror may lack what this one relied on: it starts over, borrowing the new one.
+        (own / "marker").write_text("old")
+        mirror.rename(mirror.with_name("old.git"))  # held aside, so the new one cannot reuse its inode
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "marker").exists())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        # No usable git mirror: it fetches from GitHub alone, as before.
+        (mirror / "glaeda-repair-pending").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "objects/info/alternates").exists())
+
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")
         self.assertFalse((self.state / ".prefetch").exists())
+
+    def test_every_run_first_continues_a_group_a_killed_run_left_paused(self):
+        sleeper = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
+        folder = self.state / ".prefetch" / sp.PAUSED
+        folder.mkdir(parents=True)
+        (folder / f"{sleeper.pid}.json").write_text(json.dumps({"pgid": sleeper.pid,
+                                                                "started": sp.leader_start(sleeper.pid)}))
+        os.killpg(sleeper.pid, signal.SIGSTOP)
+        result = sp.run(True, self.state)  # no roots: still thaws, under the lock
+        self.assertEqual((result["state"], result.get("thawed")), ("skip", [sleeper.pid]))
+        stat = subprocess.run(["ps", "-o", "stat=", "-p", str(sleeper.pid)], capture_output=True, text=True)
+        self.assertFalse(stat.stdout.strip().startswith("T"))
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_a_paused_download_killed_by_its_timeout_is_continued_and_its_record_removed(self):
+        self.record(self.state)
+        saved = (sp.Governor.pace, sp.PREFETCH_TIMEOUT)
+        sp.PREFETCH_TIMEOUT = 2
+
+        held = []
+
+        def pace(governor) -> None:  # a job downloading the whole time: paused at once, never continued
+            governor.set_paused(True)
+            held.append((governor.paused, sorted(p.name for p in governor.record.parent.glob("*.json"))))
+            governor.stop_event.wait()
+
+        sp.Governor.pace = pace
+        os.environ["FAKE_SLEEP"] = "30"
+        try:
+            result = sp.run(True, self.state)
+        finally:
+            sp.Governor.pace, sp.PREFETCH_TIMEOUT = saved
+            os.environ.pop("FAKE_SLEEP", None)
+        self.assertIn("timed out", result["results"][os.fspath(self.state)]["reason"])
+        self.assertTrue(held[0][0])
+        self.assertEqual(len(held[0][1]), 1, "the pause was recorded while it held")
+        self.assertEqual(list((self.state / ".prefetch" / sp.PAUSED).glob("*.json")), [])
 
     def test_a_busy_mini_fetches_under_the_governor_and_never_at_a_fixed_rate(self):
         self.record(self.state)
@@ -255,8 +323,9 @@ class SeedPrefetchTest(PrefetchBase):
             f"open({os.fspath(pidfile)!r}, 'w').write(str(d.pid))\n"
             "time.sleep(300)\n")
         runner = subprocess.Popen([sys.executable, "-c",
-                                   "import importlib.machinery, sys; from pathlib import Path; "
-                                   f"m = importlib.machinery.SourceFileLoader('p', {os.fspath(ROOT / 'scripts/glaeda-seed-prefetch')!r}).load_module(); "
+                                   "import importlib.machinery, importlib.util, sys; from pathlib import Path; "
+                                   f"l = importlib.machinery.SourceFileLoader('p', {os.fspath(ROOT / 'scripts/glaeda-seed-prefetch')!r}); "
+                                   "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('p', l)); l.exec_module(m); "
                                    f"m.prefetch(Path({os.fspath(scripts)!r}), Path({os.fspath(base)!r}), 'x', Path({os.fspath(base / 'm')!r}))"])
         deadline = time.time() + 20
         while not (pidfile.exists() and pidfile.read_text()) and time.time() < deadline:
@@ -364,6 +433,185 @@ class GovernorTest(unittest.TestCase):
         self.assertFalse(self.stopped())  # stopping the governor always resumes the download
         governor.set_paused(True)  # and it never signals the group again
         self.assertFalse(self.stopped())
+
+    def test_a_counter_that_raises_never_leaves_the_group_stopped(self):
+        calls = {"n": 0}
+
+        def flaky() -> int:
+            calls["n"] += 1
+            if calls["n"] > 6:
+                raise RuntimeError("counter broke")
+            return calls["n"] * 50_000_000  # far ahead of the rate every tick: paused until the counter breaks
+
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None, read_own=flaky,
+                               tick=0.05)
+        hook, threading.excepthook = threading.excepthook, lambda args: None  # the RuntimeError is the point
+        try:
+            governor.start()
+            governor.thread.join(5)
+        finally:
+            threading.excepthook = hook
+        self.assertFalse(governor.thread.is_alive())
+        self.assertGreater(governor.stats["paused_seconds"], 0, "it was paused when the counter broke")
+        self.assertFalse(self.stopped(), "the loop's end continues the group it stopped")
+        governor.set_paused(True)
+        self.assertFalse(self.stopped())
+        governor.stop()
+
+    def test_a_pause_is_recorded_and_a_later_run_continues_a_group_a_killed_run_left_stopped(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        governor.set_paused(True)
+        self.assertTrue(self.stopped())
+        record = folder / f"{self.proc.pid}.json"
+        self.assertTrue(record.is_file())
+        # The run is SIGKILLed here: nothing continues the group, the record stays.
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+        governor.set_paused(True)
+        governor.set_paused(False)
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists(), "continuing removes the record")
+        governor.stop()
+
+    def write(self, folder: Path, name: str, pgid: int, started: str) -> Path:
+        path = folder / f"{name}.json"
+        path.write_text(json.dumps({"pgid": pgid, "started": started}))
+        return path
+
+    def test_thaw_never_signals_a_new_group_on_the_pgid_and_drops_bad_records(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        try:
+            self.write(folder, "a", self.proc.pid, "Mon Jan  1 00:00:00 2001")
+            (folder / "b.json").write_text("not json")
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(self.stopped(), "a different start time is a different group: left alone")
+            self.assertEqual(list(folder.iterdir()), [])
+        finally:
+            os.killpg(self.proc.pid, signal.SIGCONT)
+        self.assertEqual(sp.thaw_left_paused(folder / "missing"), [])
+
+    def test_a_start_time_one_microsecond_off_is_another_process(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        started = sp.leader_start(self.proc.pid)
+        self.assertTrue(started)
+        self.assertEqual(sp.leader_start(self.proc.pid), started, "stable for one process")
+        head, _, last = started.rpartition(" " if started.startswith("linux") else ".")
+        sep = " " if started.startswith("linux") else "."
+        self.write(folder, "a", self.proc.pid, f"{head}{sep}{int(last) + 1:0{len(last)}d}")
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        try:
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(self.stopped(), "a pid reused within the same second is not continued")
+        finally:
+            os.killpg(self.proc.pid, signal.SIGCONT)
+
+    def test_a_sigcont_that_fails_keeps_the_record_and_the_pause(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        governor.set_paused(True)
+        record = folder / f"{self.proc.pid}.json"
+        real = os.killpg
+
+        def refuse(pgid, sig):
+            if sig == signal.SIGCONT:
+                raise PermissionError(1, "refused")
+            real(pgid, sig)
+
+        sp.os.killpg = refuse
+        try:
+            governor.set_paused(False)
+            self.assertTrue(governor.paused)
+            self.assertTrue(record.exists())
+            self.assertFalse(governor.resume())
+            governor.stop()
+            self.assertTrue(record.exists(), "left for the next run's thaw")
+            self.assertTrue(self.stopped())
+        finally:
+            sp.os.killpg = real
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+
+    def test_thaw_keeps_the_record_when_ps_cannot_tell(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        record = self.write(folder, "a", self.proc.pid, sp.leader_start(self.proc.pid))
+        os.killpg(self.proc.pid, signal.SIGSTOP)
+        saved = sp.group_alive
+        sp.group_alive = lambda pgid: None
+        try:
+            self.assertEqual(sp.thaw_left_paused(folder), [])
+            self.assertTrue(record.exists(), "kept for the next run")
+            self.assertTrue(self.stopped())
+        finally:
+            sp.group_alive = saved
+        self.assertEqual(sp.thaw_left_paused(folder), [self.proc.pid])
+        self.assertFalse(self.stopped())
+        self.assertFalse(record.exists())
+
+    def test_thaw_continues_members_whose_leader_has_exited(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        leader = subprocess.Popen([sys.executable, "-c", "import subprocess, sys; "
+                                   "print(subprocess.Popen(['sleep', '60']).pid, flush=True)"],
+                                  stdout=subprocess.PIPE, text=True, start_new_session=True)
+        member = int(leader.stdout.readline())
+        started = sp.leader_start(leader.pid)
+        os.killpg(leader.pid, signal.SIGSTOP)
+        self.addCleanup(lambda: (os.kill(member, signal.SIGKILL), os.kill(member, signal.SIGCONT)))
+        self.write(folder, "a", leader.pid, started)
+        os.kill(leader.pid, signal.SIGKILL)
+        leader.wait()
+        leader.stdout.close()
+        stat = lambda: subprocess.run(["ps", "-o", "stat=", "-p", str(member)], capture_output=True,
+                                      text=True).stdout.strip()
+        self.assertTrue(stat().startswith("T"))
+        self.assertEqual(sp.thaw_left_paused(folder), [leader.pid])
+        self.assertFalse(stat().startswith("T"))
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_thaw_drops_the_record_of_a_group_that_is_gone(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        gone = subprocess.Popen(["true"], start_new_session=True)
+        gone.wait()
+        self.write(folder, "a", gone.pid, "Mon Jan  1 00:00:00 2001")
+        self.assertEqual(sp.thaw_left_paused(folder), [])
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_set_paused_runs_no_ps_under_the_lock(self):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=folder)
+        saved, seen = sp.leader_start, []
+        sp.leader_start = lambda pid: seen.append(governor.lock._is_owned()) or saved(pid)
+        try:
+            governor.set_paused(True)
+        finally:
+            sp.leader_start = saved
+        self.assertEqual(seen, [False])
+        self.assertTrue(self.stopped())
+        governor.stop()
+        self.assertFalse(self.stopped())
+        self.assertEqual(list(folder.iterdir()), [])
+
+    def test_no_record_means_no_pause(self):
+        governor = sp.Governor(self.proc.pid, 1000, lambda: "job", read_interface=lambda: None,
+                               read_own=lambda: 0, tick=60, record_dir=Path("/dev/null/not-a-folder"))
+        governor.set_paused(True)
+        self.assertFalse(self.stopped())
+        self.assertFalse(governor.paused)
+        governor.stop()
 
     def test_download_bytes_follows_the_curls_in_the_group_by_their_output_file(self):
         base = Path(tempfile.mkdtemp())
@@ -648,6 +896,55 @@ class LanSeedTest(PrefetchBase):
         self.assertIn("No route to host", lan["reason"])
         self.assertIn("Local Network Privacy", lan["reason"])
         self.assert_clean()
+
+    def archive_config(self, seeder: str, addresses: list[str] | None = None) -> None:
+        (self.conf / "config.json").write_text(json.dumps({"schema": 1, "seeder": seeder, "user": "cmux",
+                                                           "addresses": addresses or ["172.20.21.158"]}))
+
+    def test_archive_list_is_recorded_for_glaeda_disk_when_the_seeder_is_the_archive(self):
+        self.record(self.state)
+        old, head = self.commit(), self.commit()
+        self.seeder_keeps(old)
+        self.seeder_keeps(head)
+        self.archive_config("cmux-lawrence", ["172.20.21.157", "172.20.21.158"])
+        os.environ["FAKE_UNREACHABLE"] = "172.20.21.157"  # the next address answers
+        record = sp.run(True, self.state)
+        self.assertEqual(record["archive_list"], {"state": "listed", "count": 2, "address": "172.20.21.158"})
+        listed = json.loads((self.state / ".prefetch" / sp.ARCHIVE_LIST).read_text())
+        self.assertEqual((listed["schema"], listed["seeder"]), (1, "cmux-lawrence"))
+        self.assertEqual(sorted(listed["keys"]), sorted([self.key(old), self.key(head)]))
+        self.assertLessEqual(abs(listed["time"] - time.time()), 60)
+        self.assertEqual(list((self.state / ".prefetch").glob(f".{sp.ARCHIVE_LIST}.*")), [])
+        # a plan never asks
+        self.ssh_log.unlink()
+        sp.run(False, self.state)
+        self.assertFalse(self.ssh_log.exists())
+
+    def test_a_failed_archive_list_keeps_the_last_one_and_bounds_the_wait(self):
+        self.record(self.state)
+        self.commit()
+        self.archive_config("cmux-lawrence")
+        os.environ["FAKE_SSH_MODE"] = "silent"
+        started = time.monotonic()
+        got = sp.record_archive_list(self.state, sp.lan_config(), timeout=1.0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(got, {"state": "error", "reason": "seed-list-v1 timed out"})
+        self.assertFalse((self.state / sp.ARCHIVE_LIST).exists())
+        os.environ["FAKE_SSH_MODE"] = "busy"
+        self.assertEqual(sp.record_archive_list(self.state, sp.lan_config())["reason"], "seeder: busy")
+
+    def test_a_mini_reading_the_trusted_seeder_never_lists_it(self):
+        # the seeder's glaeda-disk reads a client that lists as the archive's filler (archived_seeds)
+        self.record(self.state)
+        self.seeder_keeps(self.commit())
+        for config in ({"schema": 1, "seeder": "cmux15", "user": "cmux", "addresses": ["172.20.21.202"]},
+                       {"schema": 1, "user": "cmux", "addresses": ["172.20.21.202"]}):
+            (self.conf / "config.json").write_text(json.dumps(config))
+            record = sp.run(True, self.state)
+            self.assertEqual(record["archive_list"]["state"], "off")
+            asked = [json.loads(line)[-1] for line in self.ssh_log.read_text().splitlines()]
+            self.assertNotIn("seed-list-v1", asked)
+            self.assertFalse((self.state / ".prefetch" / sp.ARCHIVE_LIST).exists())
 
     def test_every_bad_stream_leaves_the_cache_as_it_was(self):
         self.record(self.state)

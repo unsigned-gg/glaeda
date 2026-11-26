@@ -13,9 +13,11 @@ import plistlib
 import pwd
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -86,6 +88,7 @@ class MiniSetupTest(unittest.TestCase):
             mock.patch.object(ms, "run", recording_run),
             mock.patch.dict(os.environ, {"HOME": os.fspath(self.home)}),
             mock.patch.object(ms, "enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"),
+            mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: None),  # never probe the real host
             mock.patch.object(ms, "brew_install", mock.Mock(side_effect=AssertionError("brew must not run"))),
         ]
         for p in self.patches:
@@ -143,17 +146,60 @@ class MiniSetupTest(unittest.TestCase):
                 self.invoke("--apply", "--python", "/opt/x/python3")
                 seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
                 disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
-                self.assertEqual(seed["ProgramArguments"][0], wanted)
+                self.assertEqual(seed["ProgramArguments"],
+                                 [*ms.LAN_PARENT, wanted, os.fspath(self.home / ".local/bin/glaeda-seed-prefetch"), "--apply"])
                 self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
                 self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
+
+    def test_the_lan_parent_stays_the_jobs_process_and_passes_argv_and_status(self) -> None:
+        # Local Network Privacy judges the job's own process, so the shell must outlive the python3 it starts
+        # (no exec), hand it every argument unchanged and return its exit status to launchd.
+        child = self.home / "child.py"
+        child.write_text("import os, subprocess, sys\n"
+                         "parent = subprocess.run(['ps', '-o', 'comm=', '-p', str(os.getppid())],\n"
+                         "                        capture_output=True, text=True).stdout.strip()\n"
+                         "print(repr(sys.argv[1:]), os.path.basename(parent))\n"
+                         "sys.exit(7)\n")
+        argv = ms.lan_program(sys.executable, "-I", os.fspath(child), "a b", "$HOME", "--apply")
+        self.assertEqual(argv[0], "/bin/sh")
+        run = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertEqual(run.stdout.rsplit(" ", 1)[-1].strip(), "sh")
+        self.assertIn("['a b', '$HOME', '--apply']", run.stdout)
+
+    def test_the_lan_parent_forwards_term_and_waits_for_the_python(self) -> None:
+        # `launchctl kill SIGTERM` reaches only the shell: the python3 must still get TERM, finish its handler,
+        # and the shell must outlive it and report its status, or launchd loses track of a live agent.
+        child = self.home / "child.py"
+        done = self.home / "handled"
+        child.write_text("import signal, sys, time\n"
+                         "def term(*_):\n"
+                         "    time.sleep(0.5)\n"
+                         f"    open({os.fspath(done)!r}, 'w').write('TERM')\n"
+                         "    sys.exit(3)\n"
+                         "signal.signal(signal.SIGTERM, term)\n"
+                         "print('ready', flush=True)\n"
+                         "time.sleep(60)\n")
+        shell = subprocess.Popen(ms.lan_program(sys.executable, "-I", os.fspath(child)), stdout=subprocess.PIPE,
+                                 text=True)
+        try:
+            self.assertEqual(shell.stdout.readline().strip(), "ready")
+            shell.send_signal(signal.SIGTERM)
+            self.assertEqual(shell.wait(timeout=30), 3)
+        finally:
+            if shell.poll() is None:
+                shell.kill()
+            shell.stdout.close()
+        self.assertEqual(done.read_text(), "TERM")
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
         with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
             self.invoke("--apply")
         agent = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.lan-fetch.plist").read_bytes())
         self.assertEqual(agent["ProgramArguments"],
-                         ["/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"), "serve-local"])
+                         [*ms.LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"),
+                          "serve-local"])
         self.assertTrue(agent["KeepAlive"])
         self.assertEqual((self.home / ".local/bin/glaeda-lan-fetch").read_bytes(),
                          (ROOT / "scripts/glaeda-lan-fetch").read_bytes())
@@ -223,10 +269,11 @@ class MiniSetupTest(unittest.TestCase):
         first = self.invoke("--apply")
         self.assertTrue(first["applied"])
         bin_dir = self.home / ".local/bin"
-        for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+        for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-idle-repair", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
         self.assertEqual((bin_dir / "disk-pressure.sh").read_bytes(), (ROOT / "scripts/disk-pressure.sh").read_bytes())
+        self.assertEqual((bin_dir / "glaeda-idle-repair").read_bytes(), (ROOT / "scripts/glaeda-idle-repair").read_bytes())
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "fleet-cas-prune", "seed-prefetch"):
             path = self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist"
             raw = path.read_bytes()
@@ -236,13 +283,30 @@ class MiniSetupTest(unittest.TestCase):
             if label == "disk-pressure":
                 self.assertEqual(doc["ProgramArguments"], [os.fspath(bin_dir / "disk-pressure.sh"), "--once"])
             else:
-                for arg in doc["ProgramArguments"][1:2]:
+                program = doc["ProgramArguments"]
+                if program[:len(ms.LAN_PARENT)] == ms.LAN_PARENT:
+                    program = program[len(ms.LAN_PARENT):]
+                for arg in program[1:2]:
                     self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
-                             "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch") else None)
+                             "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch", "worktree-reclaim") else None)
+        # the declared-cache evictor ships as a dry run: its plist never carries the deletion flag
+        registry = plistlib.loads(
+            (self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.disk-registry-evict.plist").read_bytes())
+        self.assertEqual(registry["ProgramArguments"][1:],
+                         [os.fspath(bin_dir / "glaeda-disk-registry"), "evict", "--json", "--apply"])
+        self.assertNotIn("GLAEDA_DISK_REGISTRY", registry.get("EnvironmentVariables", {}))
+        self.assertEqual((bin_dir / "glaeda-disk-registry").read_bytes(), (ROOT / "scripts/glaeda-disk-registry").read_bytes())
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
+        repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
+        self.assertEqual(repair["ProgramArguments"],
+                         ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply", "--scheduled-log"])
+        self.assertEqual(repair["StandardOutPath"], "/dev/null")
+        self.assertEqual(repair["StartInterval"], 60)
+        self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
+        self.assertEqual(repair["EnvironmentVariables"]["BOOT_SPREAD_S"], "300", "boot's first pass waits 0-300 s")
         self.assertEqual(warm["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply"])
         self.assertIsNone(warm.get("ProcessType"), "its build runs only while the mini is idle and should be fast")
         self.assertEqual((bin_dir / "glaeda-idle-warm").read_bytes(), (ROOT / "scripts/glaeda-idle-warm").read_bytes())
@@ -250,6 +314,10 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(fuzz["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-idle-warm"), "--apply", "--fuzz"])
         self.assertEqual((fuzz["StartInterval"], fuzz["Nice"]), (60, 10), "beside compiles, below them")
         self.assertIsNone(fuzz.get("ProcessType"), "Background would throttle the app it drives into false hangs")
+        mirror = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.git-mirror.plist").read_bytes())
+        self.assertEqual((mirror["StartInterval"], mirror["Nice"]), (60, 10))
+        self.assertIsNone(mirror.get("ProcessType"), "jobs read the mirror: throttled, a loaded mini stalls its fetch")
+        self.assertIsNone(mirror.get("LowPriorityIO"), "throttled I/O timed out every git config of a pass")
         health = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.mini-health.plist").read_bytes())
         self.assertEqual(health["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-mini-health"), "--apply"])
         self.assertEqual(health["StartInterval"], 120)
@@ -257,6 +325,7 @@ class MiniSetupTest(unittest.TestCase):
         guard = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.local-guard.plist").read_bytes())
         self.assertEqual(guard["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-local-guard"), "--apply"])
         self.assertEqual(guard["StartInterval"], 30)
+        self.assertEqual(guard["EnvironmentVariables"], {"BOOT_SPREAD_S": "120"}, "boot's first pass waits 0-120 s")
         self.assertIsNone(guard.get("ProcessType"), "it must get CPU while the runs it stops hold the machine")
         self.assertTrue(os.access(bin_dir / "glaeda-local-guard", os.X_OK))
         gh = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist").read_bytes())
@@ -264,6 +333,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue(gh["KeepAlive"])
         self.assertIn("/opt/homebrew/bin", gh["EnvironmentVariables"]["PATH"])  # gh supplies the token
         self.assertTrue(os.access(bin_dir / "glaeda-gh", os.X_OK))
+        self.assertTrue(os.access(bin_dir / "cmux-gh", os.X_OK))  # the primary name, beside the old one
         skill = self.home / ".claude/skills/github-ci-wait/SKILL.md"
         self.assertEqual(skill.read_bytes(), (ROOT / "skills/github-ci-wait/SKILL.md").read_bytes())
         self.assertEqual(skill.stat().st_mode & 0o777, 0o644)
@@ -370,6 +440,55 @@ class MiniSetupTest(unittest.TestCase):
         act = next(a for a in receipt["actions"] if a.get("path") == os.fspath(old))
         self.assertEqual(act["state"], "update")
         self.assertEqual(Path(act["backup"]).read_text(), "#!/bin/sh\necho old\n")
+
+    def test_ota_uses_its_retained_rollback_copy_only_for_identical_owned_tools(self) -> None:
+        update = self.home / ".local/state/glaeda/update"
+        tag = "r-20261123-0123456789ab"
+        gen = update / "generations" / tag
+        scripts = gen / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh", "cmux-disk"):
+            shutil.copy2(ms.SCRIPT_DIR / name, scripts / name)
+        old = b"#!/bin/sh\necho previous release\n"
+        for name in ("glaeda-gh", "glaeda-disk", "disk-pressure.sh"):
+            (scripts / name).write_bytes(old)
+        with (scripts / "glaeda-update").open("ab") as updater:
+            updater.write(b"\n# previous release\n")
+        prior_updater = (scripts / "glaeda-update").read_bytes()
+        installed = self.home / ".local/bin"
+        installed.mkdir(parents=True)
+        shutil.copy2(scripts / "disk-pressure.sh", installed / "disk-pressure.sh")
+        (gen / ".complete").write_text(tag + "\n")
+        (update / "state.json").write_text(json.dumps({"current": tag, "previous": None}))
+        with mock.patch.object(ms, "SCRIPT_DIR", scripts), mock.patch.object(ms, "REPO", scripts.parent):
+            self.invoke("--gh-only", "--apply")
+        (installed / "glaeda-disk").write_bytes(b"local edit")
+        (scripts / "glaeda-update").write_bytes(b"different release bytes")
+        with mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
+            receipt = self.invoke("--gh-only", "--apply")
+        actions = {Path(a["path"]).name: a for a in receipt["actions"] if a["kind"] == "tool"}
+        gh = actions["glaeda-gh"]
+        self.assertNotIn("backup", gh)
+        self.assertEqual(Path(gh["rollbackSource"]).read_bytes(), old)
+        self.assertEqual((installed / "glaeda-gh").read_bytes(), (ROOT / "scripts/glaeda-gh").read_bytes())
+        self.assertEqual(Path(actions["glaeda-disk"]["backup"]).read_bytes(), b"local edit")
+        self.assertEqual(Path(actions["glaeda-update"]["backup"]).read_bytes(), prior_updater)
+        self.assertEqual(Path(actions["disk-pressure.sh"]["backup"]).read_bytes(), old)
+        backups = self.home / ".local/state/glaeda/mini-setup/backup"
+        self.assertEqual(list(backups.glob("glaeda-gh.*")), [])
+
+    def test_two_backups_in_one_second_preserve_both_files(self) -> None:
+        ctx = mock.Mock(state=self.home / "state")
+        file = self.home / "glaeda-gh"
+        fixed = ms.datetime.datetime(2026, 11, 23, 10, 0, 0)
+        with mock.patch.object(ms.datetime, "datetime") as clock:
+            clock.now.return_value = fixed
+            file.write_bytes(b"original")
+            first = ms.backup(ctx, file)
+            file.write_bytes(b"edit")
+            second = ms.backup(ctx, file)
+        self.assertEqual(Path(first).read_bytes(), b"original")
+        self.assertEqual(Path(second).read_bytes(), b"edit")
 
     def test_git_defaults_only_fill_unset_keys_and_uninstall_only_ours(self) -> None:
         (self.home / ".gitconfig").write_text("[fetch]\n\tparallel = 4\n")
@@ -612,7 +731,7 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_bootout_waits_and_bootstrap_retries_eio(self) -> None:
         calls: list[tuple[str, ...]] = []
-        answers = {"print": [(0, ""), (0, ""), (113, "")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
+        answers = {"print": [(0, ""), (0, ""), (113, "Could not find service")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
 
         def fake(ctx, *args):
             calls.append(args)
@@ -624,6 +743,12 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(ms.bootout(ctx, "x"))
             self.assertEqual(ms.bootstrap(ctx, "/p.plist")[0], 0)
         self.assertEqual([c[0] for c in calls], ["bootout", "print", "print", "print", "bootstrap", "bootstrap"])
+
+    def test_bootout_fails_closed_when_unload_is_not_confirmed(self) -> None:
+        ctx = mock.Mock(uid=501)
+        with mock.patch.object(ms, "launchctl", return_value=(127, "")) as ctl:
+            self.assertFalse(ms.bootout(ctx, "x", wait_s=0))
+        ctl.assert_called_once_with(ctx, "bootout", "gui/501/x")
 
     def test_power_parser_reuses_fleet_rule(self) -> None:
         with mock.patch.object(ms, "run", lambda argv, **kw: (0, PMSET_SLEEPY)):
@@ -655,12 +780,44 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim"):
             self.assertTrue((self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist").is_file())
+        for name in ("macos-daemons.json", "claude-routes.json", "fleet-services.json", "gh-daemon.json"):  # what the tools read off the repo
+            self.assertEqual((self.home / ".local/share/glaeda" / name).read_bytes(),
+                             (ROOT / "config" / name).read_bytes(), name)
         # the build-host profile still blocks on the same machine
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             ms.main(["--output", "json", "--python", "/usr/bin/python3",
                      "--reclaim-binary", os.fspath(self.reclaim)])
         self.assertIn("diskFree", json.loads(out.getvalue())["blocking"])
+
+    def test_hygiene_only_without_a_glaeda_runner_drops_the_runner_agents(self) -> None:
+        """A personal Mac (air-blue) gets no runner-only agents, and setup removes the ones an earlier release
+        installed; a headless EC2 runner Mac is --hygiene-only too, so a glaeda runner keeps them."""
+        agents = self.home / "Library/LaunchAgents"
+        runner_only = sorted(ms.RUNNER_ONLY_AGENTS)
+        old = ms.agent_names
+        with mock.patch.object(ms, "agent_names", lambda ctx: [*old(ctx), *(
+                label for label in runner_only if label not in old(ctx))]):
+            self.invoke("--hygiene-only", "--apply")  # what an earlier release left on the laptop
+        for label in runner_only:
+            self.assertTrue((agents / f"{label}.plist").is_file(), label)
+        receipt = self.invoke("--hygiene-only", "--apply")
+        removed = {a["label"] for a in receipt["actions"] if a["kind"] == "agent" and a["state"] == "remove"}
+        self.assertEqual(removed, set(runner_only))
+        for label in runner_only:
+            self.assertFalse((agents / f"{label}.plist").exists(), label)
+        for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "update", "local-guard", "gh-watch"):
+            self.assertTrue((agents / f"com.teamleaderleo.glaeda.{label}.plist").is_file(), label)
+        runner = self.home / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.invoke("--hygiene-only", "--apply")
+        for label in runner_only:
+            self.assertTrue((agents / f"{label}.plist").is_file(), label)
+        # uninstall after the runner is gone still removes the agents the receipt owns
+        (runner / "glaeda-hooks").rmdir()
+        self.invoke("--hygiene-only", "--uninstall", "--apply")
+        for label in runner_only:
+            self.assertFalse((agents / f"{label}.plist").exists(), label)
 
     def test_hygiene_only_still_blocks_without_python(self) -> None:
         self.patches[0].stop()
@@ -674,6 +831,101 @@ class MiniSetupTest(unittest.TestCase):
             ms.main(["--output", "json", "--python", "/usr/bin/python3",
                      "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
         self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
+
+    def test_legacy_build_host_receipt_preserves_fleet_role_during_hygiene_upgrade(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "build-host"}))
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
+    def test_legacy_hygiene_receipt_becomes_devbox_without_projects_tidy(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene"}))
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual((receipt["role"], receipt["projectsTidy"]), ("devbox", False))
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
+    def test_hygiene_host_recorded_as_fleet_mini_converges_to_devbox(self) -> None:
+        """A personal Mac an earlier release recorded as fleet-mini (cosmic-gray, 2026-11-16: idle-repair ran
+        `glaeda-disk --role fleet-mini` every 15 minutes) moves to devbox on the next OTA setup run, with
+        update.json's setupArgs ["--hygiene-only"], keeps every agent it had, and a rerun rewrites nothing."""
+        agents = self.home / "Library/LaunchAgents"
+        with mock.patch.object(ms, "resolve_role", lambda *a: ("fleet-mini", False)):
+            self.invoke("--hygiene-only", "--apply")  # what the earlier release installed
+        before_labels = {p.name for p in agents.glob("*.plist")}
+        repair = plistlib.loads((agents / "com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
+        self.assertEqual(repair["EnvironmentVariables"]["GLAEDA_ROLE"], "fleet-mini")
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        old = json.loads(receipt_path.read_text())
+        self.assertEqual(old.pop("role"), "fleet-mini")
+        old.pop("projectsTidy")  # the earlier release did not record it
+        receipt_path.write_text(json.dumps({**old, "role": "fleet-mini"}))
+
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual((receipt["role"], receipt["projectsTidy"]), ("devbox", False))
+        self.assertEqual({p.name for p in agents.glob("*.plist")}, before_labels, "no agent gained or lost")
+        for label in ("idle-repair", "disk-pressure"):
+            doc = plistlib.loads((agents / f"com.teamleaderleo.glaeda.{label}.plist").read_bytes())
+            self.assertEqual(doc["EnvironmentVariables"]["GLAEDA_ROLE"], "devbox", label)
+        for label in ("local-guard", "worktree-reclaim", "disk-dedupe", "gh-watch", "update"):
+            self.assertTrue((agents / f"com.teamleaderleo.glaeda.{label}.plist").is_file(), label)
+        changed = {a["label"]: a["state"] for a in receipt["actions"] if a["kind"] == "agent" and a["state"] != "unchanged"}
+        self.assertEqual(changed, {"com.teamleaderleo.glaeda.idle-repair": "update",
+                                   "com.teamleaderleo.glaeda.disk-pressure": "update"})
+
+        before = self.tree()
+        again = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(again["role"], "devbox")
+        self.assertEqual({a["state"] for a in again["actions"] if a["kind"] == "agent"}, {"unchanged"})
+        after = self.tree()
+        for tree in (before, after):
+            tree.pop(".local/state/glaeda/mini-setup/receipt.json")
+        self.assertEqual(before, after)
+
+    def test_hygiene_runner_host_and_explicit_fleet_mini_keep_fleet_mini(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene", "role": "fleet-mini"}))
+        (self.home / "actions-runner-glaeda/glaeda-hooks").mkdir(parents=True)
+        self.assertEqual(self.invoke("--hygiene-only", "--apply")["role"], "fleet-mini")
+        (self.home / "actions-runner-glaeda/glaeda-hooks").rmdir()
+        receipt = self.invoke("--hygiene-only", "--role=fleet-mini", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        update = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertIn("--role=fleet-mini", update["setupArgs"])
+        self.assertEqual(self.invoke("--hygiene-only", "--role=fleet-mini", "--apply")["role"], "fleet-mini")
+
+    def test_resolve_role(self) -> None:
+        hygiene, fleet = {"profile": "hygiene"}, {"profile": "hygiene", "role": "fleet-mini"}
+        cases = [
+            # (explicit, hygiene, prior, runner) -> (role, projects tidy)
+            ((None, True, None, False), ("devbox", True)),                    # a fresh personal install
+            ((None, True, hygiene, False), ("devbox", False)),                # role-less legacy receipt
+            ((None, True, fleet, False), ("devbox", False)),                  # recorded by the old migration
+            ((None, True, {"profile": "hygiene", "role": "devbox"}, False), ("devbox", True)),
+            ((None, True, {"profile": "hygiene", "role": "devbox", "projectsTidy": False}, False), ("devbox", False)),
+            ((None, True, fleet, True), ("fleet-mini", False)),               # a hygiene runner Mac keeps its role
+            (("fleet-mini", True, None, False), ("fleet-mini", False)),
+            (("devbox", True, fleet, False), ("devbox", True)),
+            ((None, False, None, False), ("fleet-mini", False)),              # build hosts as before
+            ((None, False, {"profile": "build-host"}, False), ("fleet-mini", False)),
+            ((None, True, {"profile": "build-host"}, False), ("fleet-mini", False)),
+            ((None, False, {"profile": "build-host", "role": "devbox"}, False), ("devbox", True)),
+            ((None, True, {"profile": "gh", "role": "fleet-mini"}, False), ("devbox", False)),
+        ]
+        for args, want in cases:
+            self.assertEqual(ms.resolve_role(*args), want, args)
+
+    def test_explicit_devbox_overrides_legacy_fleet_receipt(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene"}))
+        receipt = self.invoke("--hygiene-only", "--role", "devbox", "--apply")
+        self.assertEqual(receipt["role"], "devbox")
+        self.assertTrue((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
 
     def python_action(self, receipt: dict) -> dict:
         return next(a for a in receipt["actions"] if a["kind"] == "python")
@@ -706,10 +958,23 @@ class MiniSetupTest(unittest.TestCase):
                 mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
                 mock.patch.object(ms, "brew_allowed", lambda ctx: True):
             receipt = self.invoke("--apply")
-        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13")
+        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13", no_auto_update=True)
         act = self.python_action(receipt)
         self.assertEqual((act["state"], act["applied"], act["value"]), ("create", True, "/opt/homebrew/bin/python3.13"))
         self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_a_python_too_slow_to_answer_is_never_reinstalled(self) -> None:
+        """A loaded host (load 130) missed the 10 s version probe; setup then ran brew install python@3.13, whose
+        auto-update held the update agent for half an hour while Python 3.13 was there all along."""
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
+            receipt = self.invoke("--apply")
+        act = self.python_action(receipt)
+        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/python3.13"))
+        ms.brew_install.assert_not_called()
+        self.assertNotIn("action:enroll-python", receipt["blocking"])
 
     def test_plan_only_names_the_brew_install(self) -> None:
         with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
@@ -767,7 +1032,7 @@ class MiniSetupTest(unittest.TestCase):
         platform_patch.start()
         self.patches.append(platform_patch)
 
-    def test_linux_installs_the_ops_systemd_units_verbatim_then_is_idempotent(self) -> None:
+    def test_linux_installs_the_ops_systemd_units_then_is_idempotent(self) -> None:
         self.linux()
         receipt = self.invoke("--apply")  # Linux gets the hygiene profile without the flag
         self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "hygiene"))
@@ -775,7 +1040,12 @@ class MiniSetupTest(unittest.TestCase):
         units = self.home / ".config/systemd/user"
         self.assertEqual(sorted(p.name for p in units.iterdir()), sorted(ms.LINUX_UNITS))
         for name in ms.LINUX_UNITS:
-            self.assertEqual((units / name).read_bytes(), (ROOT / "ops/systemd" / name).read_bytes(), name)
+            expected = (ROOT / "ops/systemd" / name).read_bytes().replace(b"@GLAEDA_ROLE@", b"devbox")
+            self.assertEqual((units / name).read_bytes(), expected, name)
+        self.assertIn(
+            b"Environment=PATH=%h/.local/lib/gh-quota/bin:%h/.local/bin:",
+            (units / "glaeda-gh.service").read_bytes(),
+        )
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         self.assertTrue((self.home / ".local/state").is_dir())
@@ -787,6 +1057,88 @@ class MiniSetupTest(unittest.TestCase):
         again = self.invoke("--apply")
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
+
+    def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
+        """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and
+        glaeda-disk's pressure pass, which acts only below the floor (Leo, 2026-11-08: "on every machine")."""
+        self.linux()
+        receipt = self.invoke("--gh-only", "--ota-ring", "stable", "--apply")
+        self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "gh"))
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        units = self.home / ".config/systemd/user"
+        self.assertEqual(sorted(p.name for p in units.iterdir()),
+                         ["glaeda-disk-pressure.service", "glaeda-disk-pressure.timer", "glaeda-gh.service",
+                          "glaeda-update.service", "glaeda-update.timer"])
+        self.assertNotIn("--idle", (units / "glaeda-disk-pressure.service").read_text())
+        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()),
+                         ["cmux-disk", "cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
+        config = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
+        self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
+        self.assertEqual((self.home / ".local/share/glaeda/gh-daemon.json").read_bytes(),
+                         (ROOT / "config/gh-daemon.json").read_bytes())  # the daemon's share, on a gh-only host too
+        for name in ("intent.py", "intent_aliases.json"):  # the shared intent layer the CLIs in ~/.local/bin load
+            self.assertEqual((self.home / ".local/share/glaeda/intent" / name).read_bytes(),
+                             (ROOT / "scripts" / name).read_bytes(), name)
+        self.assertFalse((self.home / "Projects").exists())
+        kinds = {a["kind"] for a in receipt["actions"]}
+        self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker
+        self.assertEqual(self.states(self.invoke("--gh-only", "--apply")), {"unchanged"})
+
+    def test_naming_a_profile_moves_an_enrolled_host_to_it_for_ota(self) -> None:
+        """update.json is otherwise never overwritten, so without this OTA would rerun the old profile."""
+        self.linux()
+        config_path = self.home / ".config/glaeda/update.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"ring": "stable", "setupArgs": ["--hygiene-only", "--headless"]}))
+        self.invoke("--gh-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--gh-only", "--headless"])
+        self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--hygiene-only", "--headless"])
+        config_path.write_text(json.dumps({"ring": "canary", "note": "hand edit"}))  # no setupArgs: hygiene
+        self.invoke("--gh-only", "--apply")
+        self.assertEqual(json.loads(config_path.read_text()),
+                         {"ring": "canary", "note": "hand edit", "setupArgs": ["--gh-only"]})
+        self.invoke("--apply")  # no profile named: the recorded one stays
+        self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--gh-only"])
+
+    def test_gh_only_on_a_mac_keeps_three_agents(self) -> None:
+        receipt = self.invoke("--gh-only", "--apply")
+        self.assertEqual(receipt["profile"], "gh")
+        labels = sorted(a["label"] for a in receipt["actions"] if a["kind"] == "agent")
+        pressure = ms.LABEL_PREFIX + "disk-pressure"
+        self.assertEqual(labels, sorted(l for l in ms.agent_plists(self.ctx_for_steps())
+                                        if ms.is_update_agent(l) or ms.is_gh_agent(l) or l == pressure))
+        self.assertEqual(len(labels), 3)
+        # only below the floor: disk-pressure.sh leaves out the idle sweep
+        gh_ctx = self.ctx_for_steps()
+        gh_ctx.gh_only = True
+        self.assertEqual(ms.agent_plists(gh_ctx)[pressure]["EnvironmentVariables"]["GLAEDA_DISK_PRESSURE_ONLY"], "1")
+        self.assertNotIn("GLAEDA_DISK_PRESSURE_ONLY",
+                         ms.agent_plists(self.ctx_for_steps())[pressure]["EnvironmentVariables"])
+        self.assertFalse(any(a["kind"] == "marker" for a in receipt["actions"]))
+
+    def test_linux_fleet_role_does_not_install_devbox_tidy_units(self) -> None:
+        self.linux()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                                      "--reclaim-binary", os.fspath(self.reclaim), "--role", "fleet-mini",
+                                      "--apply"]), 0)
+        units = self.home / ".config/systemd/user"
+        self.assertFalse((units / "glaeda-projects-tidy.service").exists())
+        self.assertFalse((units / "glaeda-projects-tidy.timer").exists())
+
+    def test_fleet_role_update_config_uses_valid_single_argument(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "fleet-mini"
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=fleet-mini"])
+
+    def test_explicit_devbox_role_is_preserved_for_ota(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "devbox"
+        ctx.role_explicit = True
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=devbox"])
 
     def test_linux_uninstall_removes_only_our_units(self) -> None:
         self.linux()
@@ -942,7 +1294,7 @@ class MiniSetupTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
             ms.apply_install(ctx, [act])
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
-        self.assertIn("deferred", act["note"])
+        self.assertIn("glaeda-update reloads it after this run", act["note"])
 
     def test_headless_agents_use_system_domain_and_persist_for_ota(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"
@@ -976,6 +1328,35 @@ class MiniSetupTest(unittest.TestCase):
                            os.fspath(daemon_dir / "x.plist")], commands)
             self.assertIn([ms.SUDO, "/bin/launchctl", "bootout", "system/com.teamleaderleo.glaeda.update"], commands)
 
+    def test_a_runner_host_gets_the_git_mirror_source_once(self) -> None:
+        """A macOS host with a GitHub Actions runner gets glaeda-git-mirror's source config (direct) when it has none;
+        an existing one (an operator's lan config) is never rewritten, and a host without a runner, a --gh-only
+        host and Linux get none."""
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="macos")
+        self.assertIsNone(ms.git_mirror_source_action(ctx))
+        runner = self.home / "actions-runner-glaeda-2"
+        runner.mkdir()
+        (runner / ".runner").write_text("{}")
+        act = ms.git_mirror_source_action(ctx)
+        self.assertEqual((act["state"], act["value"]), ("create", {"schema": 1, "source": "direct"}))
+        self.assertIn(act, ms.plan_install(ctx))
+        ms.apply_install(ctx, [act])
+        path = self.home / ".config/glaeda/lan-cache/config.json"
+        self.assertEqual(json.loads(path.read_text()), {"schema": 1, "source": "direct"})
+        lan = {"schema": 1, "source": "lan", "host": "cmux15", "user": "cmux", "addresses": ["10.0.0.5"]}
+        path.write_text(json.dumps(lan))
+        self.assertEqual(ms.git_mirror_source_action(ctx)["state"], "unchanged")
+        ms.apply_install(ctx, [ms.git_mirror_source_action(ctx)])
+        self.assertEqual(json.loads(path.read_text()), lan)
+        path.unlink()
+        gh_only = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, gh_only=True, platform_name="macos")
+        self.assertIsNone(ms.git_mirror_source_action(gh_only))
+        linux = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                           ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
+        self.assertIsNone(ms.git_mirror_source_action(linux))
+
     def test_headless_install_stages_and_installs_a_plist(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"
         with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
@@ -994,22 +1375,116 @@ class MiniSetupTest(unittest.TestCase):
             with mock.patch.object(ms, "run", fake_run):
                 ms.install_service_file(ctx, destination, b"headless plist\n", 0o644)
             self.assertEqual(destination.read_bytes(), b"headless plist\n")
+
+    def test_reclaim_agent_is_left_out_where_the_hygiene_reconciler_owns_reclaim(self) -> None:
+        """A Linux agent host, 2026-11: setup reinstalled glaeda-worktree-reclaim every hour, leo-workspace's host-baseline
+        deleted it after every sync, and a run whose unit vanished mid-sweep died at the default start timeout."""
+        for platform, marker, reclaim in (
+                ("linux", ".config/systemd/user/ai.leo-workspace.hygiene-reconciler.timer",
+                 {"glaeda-worktree-reclaim.service", "glaeda-worktree-reclaim.timer"}),
+                ("macos", "Library/LaunchAgents/ai.leo-workspace.hygiene-reconciler.plist",
+                 {"com.teamleaderleo.glaeda.worktree-reclaim"})):
+            with self.subTest(platform=platform):
+                ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                                 ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name=platform)
+                with mock.patch.object(ms, "has_glaeda_runner", lambda *_: True):
+                    self.assertTrue(reclaim <= set(ms.agent_names(ctx)))
+                    path = self.home / marker
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("")
+                    names = set(ms.agent_names(ctx))
+                    path.unlink()
+                self.assertFalse(reclaim & names)
+                self.assertTrue(names)  # the rest of the profile stays
+        unit = (ms.REPO / "ops/systemd/glaeda-worktree-reclaim.service").read_text()
+        self.assertIn("TimeoutStartSec=", unit)
+
+    def test_macos_disk_pressure_agent_is_left_to_the_hygiene_reconciler_where_it_is_installed(self) -> None:
+        """Leo's Mac, 2026-11-22/23: setup installed com.teamleaderleo.glaeda.disk-pressure, leo-workspace's
+        host-baseline (after every ws-sync) retired it as a legacy scheduler (machines/worktree-reclaim.json
+        glaeda.legacy_schedulers.Darwin, the reconciler runs glaeda-disk --pressure itself), and launchd-loaded
+        reloaded it in between: 5 NOW pages in 19 h. Setup must agree with that list on macOS, and only there: Linux's
+        glaeda-disk-pressure timer is required by host-baseline.json glaeda_ota.timers and retired by nobody."""
+        # the labels leo-workspace retires on a Mac as legacy glaeda schedulers (worktree-reclaim.json)
+        retired_on_macos = {"com.teamleaderleo.glaeda.worktree-reclaim", "com.teamleaderleo.glaeda.disk-pressure"}
+        for gh_only in (False, True):
+            for platform, marker, kept_without, left_out in (
+                    ("macos", "Library/LaunchAgents/ai.leo-workspace.hygiene-reconciler.plist",
+                     {"com.teamleaderleo.glaeda.disk-pressure"}, retired_on_macos),
+                    ("linux", ".config/systemd/user/ai.leo-workspace.hygiene-reconciler.timer",
+                     {"glaeda-disk-pressure.timer"}, {"glaeda-worktree-reclaim.service", "glaeda-worktree-reclaim.timer"})):
+                with self.subTest(platform=platform, gh_only=gh_only):
+                    ctx = ms.Context(self.home, gh_only, "/usr/bin/python3", True, self.reclaim, None, None,
+                                     ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name=platform)
+                    with mock.patch.object(ms, "has_glaeda_runner", lambda *_: True):
+                        without = set(ms.agent_names(ctx))
+                        path = self.home / marker
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text("")
+                        try:
+                            names = set(ms.agent_names(ctx))
+                            # an earlier setup's own plist is removed, so no orphan is left for launchd-loaded
+                            owned = {label: "sha" for label in without}
+                            with mock.patch.object(ms, "sha256_file", lambda *_: "sha"), \
+                                    mock.patch.object(ms, "agent_loaded", lambda *_: True):
+                                removed = {a["label"] for a in ms.stale_agent_actions(ctx, names, owned)
+                                           if a["state"] == "remove"}
+                        finally:
+                            path.unlink()
+                    if not gh_only or platform == "macos":
+                        self.assertTrue(kept_without <= without)
+                    self.assertFalse(left_out & names)
+                    self.assertEqual(removed, without & left_out)
+                    if platform == "linux" and not gh_only:
+                        self.assertIn("glaeda-disk-pressure.timer", names)
+
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
-        with mock.patch.object(ms, "newest_git", lambda: ("/usr/bin/git", (2, 55, 0))):
+        with mock.patch.object(ms, "probe_gits", lambda: ("/usr/bin/git", (2, 55, 0), [])):
             self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
-        old = lambda: ("/usr/bin/git", (2, 50, 1))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+        old = lambda: ("/usr/bin/git", (2, 50, 1), [])
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
             self.assertEqual(ms.plan_git(ctx)["state"], "blocked")  # sandbox HOME never runs brew
             ctx.sandbox = False
             act = ms.plan_git(ctx)
             self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: None):
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: None):
             self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
             linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                                ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
             self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
+
+    def test_a_git_too_slow_to_answer_is_never_reinstalled(self) -> None:
+        """cmux9s at load 100-200: Homebrew's git 2.55 missed the version probe's deadline, /usr/bin/git 2.50.1
+        answered, and setup ran brew install git, which timed out at 600 s inside the update agent and the
+        release update rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer;
+        a git that fails or prints no version is not a slow answer and never holds an upgrade back."""
+        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        ctx.sandbox = False
+        answers = {"/opt/homebrew/bin/git": "slow", "/usr/local/bin/git": "broken", "/usr/bin/git": "git version 2.50.1"}
+
+        def fake_subprocess_run(argv, **kwargs):
+            answer = answers[argv[0]]
+            if answer == "slow":
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(argv, 1 if answer == "broken" else 0, answer, None)
+
+        def plan() -> dict:
+            with mock.patch.object(ms, "GIT_CANDIDATES", tuple(answers)), \
+                    mock.patch.object(ms.shutil, "which", lambda name: None), \
+                    mock.patch.object(ms.os, "access", lambda path, mode: path in answers), \
+                    mock.patch.object(ms.subprocess, "run", fake_subprocess_run), \
+                    mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+                return ms.plan_git(ctx)
+
+        act = plan()
+        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/git"))
+        self.assertIn("did not answer", act["note"])
+        answers["/opt/homebrew/bin/git"] = "broken"  # every git answered, one broken and one old: install
+        act = plan()
+        self.assertEqual((act["state"], act["value"]), ("create", "/usr/bin/git 2.50.1"))
 
     def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
         ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
@@ -1040,6 +1515,160 @@ class MiniSetupTest(unittest.TestCase):
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
 
+
+FAKE_INSTALLER = """#!/usr/bin/env python3
+# A brew that hangs: like Homebrew's sandbox_operation.rb children on cmux9s (2026-10-30), its grandchild moves to a
+# process group of its own, ignores TERM and HUP, outlives its parent and keeps the output pipe open.
+import os, signal, sys, time
+pid_file = os.environ["FAKE_INSTALLER_PIDS"]
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(pid_file, "a") as f:
+        f.write(f"grandchild {os.getpid()}\\n")
+    time.sleep(300)
+    os._exit(0)
+with open(pid_file, "a") as f:
+    f.write(f"installer {os.getpid()}\\n")
+print("pouring git", flush=True)
+time.sleep(300)
+"""
+
+
+def live(pid: int) -> bool:
+    """pid names a process that has not exited (a zombie waiting on a reaper that is not ours has exited)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+class TimedOutInstallTest(unittest.TestCase):
+    """A timed-out install is stopped with every process it started. brew install git ran past GIT_BREW_TIMEOUT on
+    cmux9s (2026-10-30); the timeout killed only brew, and three `sandbox_operation.rb extract` rubies, each in a
+    process group of its own, were left running under launchd."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="mini-setup-reap-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.brew = self.tmp / "brew"
+        self.brew.write_text(FAKE_INSTALLER)
+        self.brew.chmod(0o755)
+        self.pid_file = self.tmp / "pids"
+        os.environ["FAKE_INSTALLER_PIDS"] = os.fspath(self.pid_file)
+        self.addCleanup(os.environ.pop, "FAKE_INSTALLER_PIDS", None)
+        self.addCleanup(self.kill_started)
+
+    def started(self) -> dict[str, int]:
+        lines = self.pid_file.read_text().split() if self.pid_file.exists() else []
+        return dict(zip(lines[::2], map(int, lines[1::2])))
+
+    def kill_started(self) -> None:
+        # a failing run must not leak the fakes this test started (by their recorded pids, never by name)
+        for pid in self.started().values():
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_a_timed_out_brew_leaves_no_process_behind(self) -> None:
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertIn(f"reaped session {self.started()['installer']}", log.getvalue())
+        started = self.started()
+        self.assertEqual(set(started), {"installer", "grandchild"}, out)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out after 2 s", out)
+        for name, pid in started.items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        self.assertEqual(ms.session_members(started["installer"]), [])
+        # the log names what it stopped: the session, each pid with its group and command, and the time it ran
+        self.assertIn(f"session {started['installer']}", out)
+        self.assertIn(f"pid {started['grandchild']} pgid {started['grandchild']}", out)
+        self.assertIn(os.fspath(self.brew), out)
+        self.assertIn("pouring git", out)
+
+    def test_a_failed_process_listing_never_ends_the_reap_early(self) -> None:
+        """ps failing right after TERM (a loaded host) must not read as an empty session: KILL still goes out."""
+        real = ms.session_members
+        calls = []
+
+        def flaky(sid: int):
+            calls.append(sid)
+            return None if len(calls) == 2 else real(sid)  # the first listing after TERM fails
+
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), mock.patch.object(ms, "session_members", flaky), \
+                contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertEqual(code, 1)
+        for name, pid in self.started().items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        with mock.patch.object(ms, "REAP_GRACE_S", 0.3), mock.patch.object(ms, "session_members", lambda sid: None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            self.addCleanup(sleeper.wait)
+            note = ms.reap_session(sleeper.pid, time.monotonic())
+        self.assertIn("not confirmed", note)  # never "reaped" with nothing checked
+        self.assertEqual(sleeper.wait(timeout=5), -signal.SIGTERM)  # the leader's group is still signalled
+
+    def test_a_pid_outside_the_session_is_never_signalled(self) -> None:
+        """A pid listed earlier that exited and was reused belongs to another session and is left alone, with a
+        pidfd (Linux) and without one (macOS)."""
+        no_pidfd = mock.patch.object(ms, "hasattr", lambda obj, name: False if "pidfd" in name else hasattr(obj, name),
+                                     create=True)
+        # Python has pidfd_open but the call fails (an old kernel: ENOSYS; no fd to spare: EMFILE)
+        failing_pidfd = mock.patch.object(ms.os, "pidfd_open", mock.Mock(side_effect=OSError(24, "EMFILE")),
+                                          create=True)
+        for label, patch in (("pidfd", contextlib.nullcontext()), ("no pidfd", no_pidfd),
+                             ("pidfd_open fails", failing_pidfd)):
+            with self.subTest(label), patch:
+                other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+                self.addCleanup(other.wait)
+                self.addCleanup(other.kill)
+                ms.signal_session_member(other.pid, other.pid + 1, signal.SIGKILL)
+                time.sleep(0.2)
+                self.assertIsNone(other.poll())
+                ms.signal_session_member(other.pid, other.pid, signal.SIGKILL)
+                self.assertEqual(other.wait(timeout=5), -signal.SIGKILL)
+
+    def test_an_install_that_finishes_in_time_is_left_alone(self) -> None:
+        quick = self.tmp / "quick-brew"
+        quick.write_text("#!/bin/sh\necho \"$1 $2 done\"\n")
+        quick.chmod(0o755)
+        self.assertEqual(ms.brew_install(os.fspath(quick), "git", timeout=30), (0, "install git done\n"))
+
+    def test_the_reap_never_signals_this_process_own_session(self) -> None:
+        with self.assertRaises(ValueError):
+            ms.reap_session(os.getsid(0), time.monotonic())
+
+
+
+class FleetBootstrapWarnings(unittest.TestCase):
+    """A disk floor warns, never refuses: the bootstrap's warningChecks reach the setup receipt (#1909 F1)."""
+
+    def test_warning_checks_are_carried_into_the_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            glaeda = root / "glaeda"
+            glaeda.write_text("")
+            (root / "cache").mkdir()
+            ctx = mock.Mock(cmux_root=root, glaeda_bin=glaeda, cache_root=root / "cache", show=str)
+            doc = {"schema": "s", "eligibleForEnrollment": True, "blockingChecks": [], "warningChecks": ["diskAdmission"]}
+            done = subprocess.CompletedProcess([], 0, stdout=json.dumps(doc), stderr="")
+            with mock.patch.object(ms.subprocess, "run", return_value=done):
+                slot = ms.run_fleet_bootstrap(ctx)
+            self.assertEqual(slot["warningChecks"], ["diskAdmission"])
+            self.assertTrue(slot["eligibleForEnrollment"])
+            doc.pop("warningChecks")
+            done = subprocess.CompletedProcess([], 0, stdout=json.dumps(doc), stderr="")
+            with mock.patch.object(ms.subprocess, "run", return_value=done):
+                self.assertEqual(ms.run_fleet_bootstrap(ctx)["warningChecks"], [])
 
 if __name__ == "__main__":
     unittest.main()

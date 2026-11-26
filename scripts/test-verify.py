@@ -40,16 +40,44 @@ class VerifyPlanTests(unittest.TestCase):
         self.assertEqual(plan["authority"], "developer_feedback_only")
         self.assertEqual(
             [phase["name"] for phase in plan["phases"]],
-            ["compile-all-targets", "format", "repo-query-integration"],
+            [
+                "fleet-rule-lints",
+                "gh-auth-token-lint",
+                "compile-all-targets",
+                "format",
+                "repo-query-integration",
+            ],
         )
         self.assertEqual(
             plan["phases"][0]["argv"],
-            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+            ["python3", "-I", "scripts/test-fleet-rule-lints.py"],
+        )
+        self.assertEqual(
+            plan["phases"][1]["argv"],
+            ["python3", "-I", "scripts/gh_auth_token_lint.py"],
         )
         self.assertEqual(
             plan["phases"][2]["argv"],
+            ["cargo", "check", "--locked", "--all-targets", "--all-features"],
+        )
+        self.assertEqual(
+            plan["phases"][4]["argv"],
             ["cargo", "test", "--locked", "--test", "repo_query_cli"],
         )
+
+    def test_the_script_lints_run_before_any_cargo_phase_of_the_focused_plan(self) -> None:
+        """`run` breaks at the first failing phase, so the sub-second lints must not sit behind a
+        cargo check. Both lints also exist in CI's `scripts` job; this profile is where a change
+        under `scripts/` learns their verdict without a CI cycle."""
+        names = [phase["name"] for phase in read_plan("focused")["phases"]]
+        argvs = {phase["name"]: phase["argv"] for phase in read_plan("focused")["phases"]}
+        lints = ["fleet-rule-lints", "gh-auth-token-lint"]
+        first_cargo = min(i for i, n in enumerate(names) if argvs[n][0] == "cargo")
+        for lint in lints:
+            self.assertLess(names.index(lint), first_cargo, names)
+        for lint in lints:
+            # -I so a planted module beside the script cannot be imported by it.
+            self.assertEqual(argvs[lint][:2], ["python3", "-I"], argvs[lint])
 
     def test_required_profile_is_the_exact_eight_step_agents_sequence(self) -> None:
         plan = read_plan("required")
@@ -560,6 +588,186 @@ class VerifyPlanTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("cannot be combined", result.stderr)
             self.assertFalse(receipt_path.exists())
+
+
+class HostPolicyRefusalTests(unittest.TestCase):
+    """A phase the host refused to run is not a verdict on the phases after it.
+
+    2026-11-22, measured on a shared workstation: `./scripts/verify focused` exited 77 at phase 3 of
+    5 because `tools/heavy-guard` refuses cargo there, and the two phases after it -- format and the
+    repo-query integration test, the ones a change under `scripts/` needs -- printed no verdict at
+    all. The refusal is now reported, the rest of the plan still runs, and the run is still not green.
+    """
+
+    def phase(self, module, name: str, script: str):
+        return module["Phase"](name, "capability", "sh", ("-c", script))
+
+    def run_phases(self, module, phases) -> tuple[int, str]:
+        run = module["run"]
+        run.__globals__["phases_for"] = lambda profile: tuple(phases)
+        with tempfile.TemporaryDirectory() as directory:
+            captured = Path(directory) / "stderr.log"
+            with captured.open("w+b") as sink:
+                sys.stderr.flush()
+                saved = os.dup(2)
+                try:
+                    os.dup2(sink.fileno(), 2)
+                    code = run("fast")
+                finally:
+                    sys.stderr.flush()
+                    os.dup2(saved, 2)
+                    os.close(saved)
+            return code, captured.read_text(encoding="utf-8", errors="replace")
+
+    def test_a_refused_phase_reports_itself_and_the_rest_of_the_plan_still_runs(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        refusal = "heavy-guard: refused: [routing-order] 'cargo check' on this host"
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "compile-all-targets", f"echo \"{refusal}\" >&2; exit 77"),
+                self.phase(module, "format", "exit 0"),
+                self.phase(module, "repo-query-integration", "exit 0"),
+            ],
+        )
+
+        self.assertEqual(code, 77, said)
+        self.assertIn("compile-all-targets: refused by host policy", said)
+        self.assertIn("CI owns its verdict", said)
+        self.assertIn("[2/3] format: exit=0", said)
+        self.assertIn("[3/3] repo-query-integration: exit=0", said)
+        self.assertIn("host policy refused 1 phase(s): compile-all-targets", said)
+
+    def test_a_refusal_never_reports_green(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [self.phase(module, "compile-all-targets", "echo refused: policy >&2; exit 77")],
+        )
+
+        self.assertNotEqual(code, 0, said)
+        self.assertIn("exit=77", said)
+
+    def test_a_real_failure_after_a_refusal_still_decides_the_exit_code(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "compile-all-targets", "echo refused: policy >&2; exit 77"),
+                self.phase(module, "repo-query-integration", "echo boom >&2; exit 3"),
+            ],
+        )
+
+        self.assertEqual(code, 3, said)
+        self.assertIn("host policy refused 1 phase(s)", said)
+
+    def test_our_own_tool_exiting_77_is_a_failure_and_still_breaks_the_run(self) -> None:
+        """77 alone is not a refusal: the captured text has to say so, or a coincidence passes."""
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "repo-query-integration", "echo 77 cases failed >&2; exit 77"),
+                self.phase(module, "format", "exit 0"),
+            ],
+        )
+
+        self.assertEqual(code, 77, said)
+        self.assertNotIn("refused by host policy", said)
+        self.assertNotIn("[2/2] format", said)
+
+
+class FocusedPhaseSelectionFollowsTheDiffTests(unittest.TestCase):
+    """A cargo phase the diff cannot affect is skipped with a reason naming what was read.
+
+    2026-11-23: `focused` ran its three cargo phases unconditionally. On a shared workstation
+    `tools/heavy-guard` then refuses two of them, so every Python-only change paid for phases whose
+    verdict was never obtainable here and was never needed: 91.6% of the 812 commits on
+    origin/main in the 30 days from 2026-10-23 change only `docs/`, `scripts/`, `skills/`,
+    `.claude/` or a top-level `*.md`. Measured on one Python-only diff: 6.42 s and exit 77 before,
+    4.75 s and exit 0 after.
+    """
+
+    def fixture(self, directory: str, paths: list[str]) -> Path:
+        root = Path(directory)
+        author = ["-c", "user.name=Glaeda test", "-c", "user.email=glaeda-test@example.invalid"]
+
+        def git(*arguments: str) -> None:
+            subprocess.run(["git", *author, *arguments], cwd=root, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git("init", "--quiet", "-b", "main")
+        (root / "base.txt").write_text("base\n", encoding="utf-8")
+        git("add", "base.txt")
+        git("commit", "--quiet", "-m", "base")
+        git("checkout", "--quiet", "-b", "work")
+        for name in paths:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("changed\n", encoding="utf-8")
+            git("add", name)
+        git("commit", "--quiet", "-m", "change")
+        return root
+
+    def focused_run(self, root: Path) -> tuple[int, str]:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        cargo = [
+            module["Phase"]("compile-all-targets", "capability", "cargo",
+                            ("check", "--locked", "--all-targets", "--all-features")),
+            module["Phase"]("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+            module["Phase"]("repo-query-integration", "capability", "cargo",
+                            ("test", "--locked", "--test", "repo_query_cli")),
+        ]
+        run = module["run"]
+        run.__globals__["phases_for"] = lambda profile: tuple(cargo)
+        run.__globals__["repository_root"] = lambda: root
+        with tempfile.TemporaryDirectory() as sink_directory:
+            captured = Path(sink_directory) / "stderr.log"
+            with captured.open("w+b") as sink:
+                sys.stderr.flush()
+                saved = os.dup(2)
+                try:
+                    os.dup2(sink.fileno(), 2)
+                    code = run("focused")
+                finally:
+                    sys.stderr.flush()
+                    os.dup2(saved, 2)
+                    os.close(saved)
+            return code, captured.read_text(encoding="utf-8", errors="replace")
+
+    def test_a_scripts_only_diff_skips_every_cargo_phase_and_says_what_it_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory, ["scripts/apple_queue.py", "docs/NOTE.md"])
+            code, said = self.focused_run(root)
+
+        for name in ("compile-all-targets", "format", "repo-query-integration"):
+            self.assertIn(f"{name}: skipped:", said)
+        self.assertIn("no *.rs, Cargo.toml or Cargo.lock in the diff vs origin/main", said)
+        self.assertIn("read 2 changed path(s) from `git diff --name-only", said)
+        self.assertIn("scripts/apple_queue.py", said)
+        self.assertEqual(code, 0, said)
+
+    def test_a_diff_touching_rust_or_an_unreadable_diff_still_runs_every_cargo_phase(self) -> None:
+        """A wrong skip is far worse than a wasted phase, so anything unproven runs everything."""
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        reason = module["rust_phase_skip_reason"]
+        for paths in (
+            ["src/lib.rs"],
+            ["Cargo.toml"],
+            ["Cargo.lock"],
+            ["rustfmt.toml"],
+            ["scripts/apple_queue.py", "src/host.rs"],
+            ["tests/repo_query_cli.rs"],
+            ["ops/whatever.yml"],
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = self.fixture(directory, paths)
+                self.assertIsNone(reason(root), paths)
+
+        with tempfile.TemporaryDirectory() as directory:
+            no_git_history = Path(directory)
+            (no_git_history / "file.txt").write_text("x\n", encoding="utf-8")
+            self.assertIsNone(reason(no_git_history))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 # cmux fleet rollout: merged means deployed
 
-Status: design. Owner issue: #149 (automated updates with canary checks and rollback).
+Status: superseded by [`GLAEDA_OTA.md`](GLAEDA_OTA.md), which now owns #149: every merge to `main`
+is released, canaried, promoted and pulled by `glaeda-update` on every host every 10 minutes,
+including the runner minis' staged copy and hook files. This page is the September design record;
+only "Recovery route for a paused runner" below is still a current procedure.
+Original status: design. Owner issue: #149 (automated updates with canary checks and rollback).
 Builds on [host reconciliation](HOST_RECONCILIATION.md), [fleet distribution](FLEET_DISTRIBUTION.md),
 the mini-fleet manifest, host reservations (`scripts/glaeda_reservation.py`), and the journaled
 service updater (`src/disposable_launchd_service/upgrade.rs`, #1131).
@@ -33,12 +37,44 @@ Underneath:
   already flags a missing `controller_token`, but nothing compares a present, rejected token or
   the running binary against what the host should run.
 
+## Recovery route for a paused runner
+
+`cmux-lawrence` is the controller mini and the supported recovery entrypoint
+for the AWS Mac fleet. A controller row with `claim_paused: host_lock` is not
+a Tailscale-login problem. Inspect the live worker row and its `host_bin`
+fields: if `with-host-lock` is absent or refused, the worker is healthy but
+cannot admit new work until that executable is restored and the controller
+observes it again.
+
+Use the controller mini's existing fleet SSH route to reach the runner, copy a
+peer-verified `with-host-lock` payload, preserve its mode and ownership, and
+wait for a fresh heartbeat. Do not send an interactive Tailscale
+reauthentication link to an operator as the repair procedure. The post-repair
+receipt must include the source peer and SHA-256, the runner name, the
+controller observation time, `claim_paused` cleared, and queue/active-job
+counts.
+
+`claim_paused: runner_job` is a different state: the native Actions runner may
+be executing a job that is not represented in the controller's own job list.
+Inspect `Runner.Worker` and the build process before calling it stale or
+restarting the service. The fleet status report labels this state explicitly.
+
 ## Goal
 
 A merged, reviewed build-fleet change reaches every eligible worker without a human copying
 files. It reaches one canary first, is promoted when the canary stays healthy, rolls back when
 it does not, and never touches a host that is building, reserved by someone else, pinned, or
 listed in `never_touch`.
+
+### Live-builder observation
+
+`glaeda-fleet-status` may consume a local, read-only cmux16 live-builder receipt with
+`--live-builder-status PATH --live-builder-profile PROFILE`. The file must be the
+versioned `cmux-live-builder-status/v1` contract emitted by cmuxterm-hq's live-builder;
+the parser keeps only bounded host identity, fixed health states, and public build
+identifiers. The profile is explicit policy input, so a hostname or `host_role` never
+enrolls a personal builder as CI. Until the HQ exporter writes this contract, the
+source remains unavailable and no rollout action is inferred.
 
 ## Design
 

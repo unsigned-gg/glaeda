@@ -85,6 +85,7 @@ BUCKET_URL = os.environ.get("GLAEDA_SEED_BUCKET_URL", "https://ci-cache.cmux.com
 # launchd's PATH lacks Homebrew, and without zstd cmux's r2-cache.sh cannot read a .tar.zst seed.
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
 SOURCE = "seed-source.json"
+PAUSED = "paused"  # in the prefetch's work folder: the Governor's record of each group it holds stopped
 DEPTH = 60  # seed_derived_data.ANCESTOR_LIMIT (50) commits of history, plus margin
 # A job or build that may be using the uplink or the seed cache right now.
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
@@ -152,6 +153,17 @@ LAN_ATTEMPTS = 4
 LAN_BUSY_BACKOFF = (10.0, 30.0)
 LAN_RETRY_BACKOFF = (2.0, 8.0)
 LAN_BUSY_BUDGET = 120.0  # seconds a busy seeder is waited for, from the first attempt
+# What the seed archive holds (glaeda-disk evicts on it). A mini whose LAN seeder is the seed archive on
+# cmux-lawrence (glaeda-seed-lan install --role archive) asks it `seed-list-v1` once per applied run and writes
+# the answer to ARCHIVE_LIST in its work folder (STATE/.prefetch). glaeda-disk runs under Homebrew python3,
+# which Local Network Privacy keeps off the LAN, so it reads this file instead of asking: a local seed the
+# archive lists may go before its idle window, since a later miss comes back from the archive over the LAN
+# (63 to 184 s) instead of from R2 or a rebuild. Only the archive is asked: on the trusted seeder, glaeda-disk's
+# archived_seeds reads a client that lists as the archive's filler, so a PR mini must never list there.
+# A PR mini never uploads a seed: seeds are trusted bytes, and the archive takes them only from the seeder.
+ARCHIVE_SEEDERS = ("cmux-lawrence",)
+ARCHIVE_LIST = "archive-seeds.json"
+ARCHIVE_LIST_TIMEOUT = 30  # the whole ask, every address; a run never waits longer for it
 
 
 def running_commands() -> list[str] | None:
@@ -239,14 +251,70 @@ def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
                           text=True, timeout=timeout, env=env).stdout
 
 
+# This blobless mirror reads commits and trees through the mini's one full mirror (glaeda-git-mirror) instead of
+# fetching its own copy from GitHub. Leo, 2026-11-18: seeds and shared caches are read through, not copied to the
+# internal disk. glaeda-git-mirror never removes an object, so borrowing it is safe; a rebuilt mirror (a reseed is
+# a new directory) may lack an object this one relied on, so the borrow is recorded (as the runner hook's are) and
+# this mirror starts over when it changes. Without a usable git mirror it fetches from GitHub as before.
+GIT_MIRROR_DIR = os.environ.get("GLAEDA_GIT_MIRROR_DIR") or "/Users/Shared/cmux-build-fleet/git"
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+
+
+def mirror_identity(mirror: Path) -> dict | None:
+    """The git mirror's objects directory when it is usable (glaeda-git-mirror verified it, no repair pending, not
+    shallow), as {"objects", "ino", "birth"}; else None. The runner hook's test, kept in step."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not os.path.isdir(objects) or objects.is_symlink() or mirror.is_symlink() \
+                or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+    except OSError:
+        return None
+    identity = {"objects": os.fspath(objects), "ino": st.st_ino}
+    if (birth := getattr(st, "st_birthtime", None)) is not None:
+        identity["birth"] = birth
+    return identity
+
+
+def borrow_state(repo: Path) -> tuple[list[str], dict | None]:
+    try:
+        alternates = [line.strip() for line in (repo / "objects/info/alternates").read_text().splitlines()
+                      if line.strip()]
+    except OSError:
+        alternates = []
+    try:
+        recorded = json.loads((repo / BORROW_RECORD).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    return alternates, recorded if isinstance(recorded, dict) else None
+
+
+def borrow(repo: Path, identity: dict) -> None:
+    (repo / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (repo / "objects" / "info" / "alternates").write_text(identity["objects"] + "\n")
+    incoming = repo / f".{BORROW_RECORD}.{os.getpid()}"
+    incoming.write_text(json.dumps(identity) + "\n")
+    incoming.rename(repo / BORROW_RECORD)
+
+
 def main_head(work: Path) -> tuple[Path, str]:
     """A blobless shallow mirror of main, fetched now; returns (mirror, head sha)."""
     mirror = work / "cmux.git"
+    source = mirror_identity(Path(GIT_MIRROR_DIR) / "cmux.git")
+    alternates, recorded = borrow_state(mirror)
+    if alternates and (source is None or alternates != [source["objects"]] or recorded is None
+                       or recorded.get("ino") != source["ino"] or recorded.get("birth") != source.get("birth")):
+        shutil.rmtree(mirror, ignore_errors=True)  # the git mirror it borrowed went or was rebuilt: start over
     if not (mirror / "HEAD").is_file():
         shutil.rmtree(mirror, ignore_errors=True)
         mirror.mkdir(parents=True)
         git(mirror, "init", "--bare", "-q")
         git(mirror, "remote", "add", "origin", REPO_URL)
+    if source is not None and not borrow_state(mirror)[0]:
+        borrow(mirror, source)  # earlier objects stay until the mirror is next rebuilt; they are small (trees)
     git(mirror, "fetch", "-q", "--filter=blob:none", f"--depth={DEPTH}", "origin",
         "+refs/heads/main:refs/remotes/origin/main")
     return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()
@@ -303,7 +371,9 @@ def lan_config(path: Path | None = None) -> dict | None:
     identity, known_hosts = path.parent / "id_ed25519", path.parent / "known_hosts"
     if not identity.is_file() or not known_hosts.is_file():
         return None
-    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts}
+    seeder = raw.get("seeder") if isinstance(raw.get("seeder"), str) else ""
+    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts,
+            "seeder": seeder}
 
 
 def zstd_tool() -> str | None:
@@ -344,6 +414,57 @@ def lan_candidates(mirror: Path, store: Path, head: str) -> tuple[list[str], str
             break
         keys.append(key)
     return keys, "" if keys else "the nearest seed is kept here"
+
+
+def seed_list(config: dict, address: str, timeout: float) -> tuple[list[tuple[str, int]], str]:
+    """The seeder's kept seeds (key, mtime) as `seed-list-v1` answers, newest first, or [] and why."""
+    proc = subprocess.Popen(ssh_command(config, address, "seed-list-v1"), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return [], "seed-list-v1 timed out"
+    head, _, body = out.partition(b"\n")
+    while head and not head.startswith(SERVE_HEADER) and body:  # a noisy login shell printed first
+        head, _, body = body.partition(b"\n")
+    words = head[len(SERVE_HEADER):].decode(errors="replace").split()
+    if not head.startswith(SERVE_HEADER) or len(words) != 2 or words[0] != "list" or not words[1].isdigit():
+        detail = " ".join(words)[:120] or err.decode(errors="replace").strip()[-160:] or f"exit {proc.returncode}"
+        return [], f"seeder: {detail}"
+    kept = []
+    for line in body.decode(errors="replace").splitlines()[:int(words[1])]:
+        parts = line.split()
+        if len(parts) == 2 and KEY_RE.fullmatch(parts[0]) and parts[1].isdigit():
+            kept.append((parts[0], int(parts[1])))
+    return kept, ""
+
+
+def record_archive_list(work: Path, config: dict | None, timeout: float = ARCHIVE_LIST_TIMEOUT) -> dict:
+    """Ask the seed archive what it holds and write it to WORK/ARCHIVE_LIST for glaeda-disk; the outcome.
+
+    Only when this mini's LAN seeder is the archive. Each address in turn, within TIMEOUT in all. A failed
+    ask writes nothing: glaeda-disk ignores a list older than its bound, and the seeds keep their window.
+    """
+    if not config or config.get("seeder") not in ARCHIVE_SEEDERS:
+        return {"state": "off", "reason": "the LAN seeder is not the seed archive"}
+    deadline = time.monotonic() + timeout
+    why = "no address"
+    for address in config["addresses"]:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            why = "seed-list-v1 timed out"
+            break
+        kept, why = seed_list(config, address, left)
+        if not why:
+            record = {"schema": 1, "time": int(time.time()), "seeder": config["seeder"], "address": address,
+                      "keys": [key for key, _ in kept]}
+            incoming = work / f".{ARCHIVE_LIST}.{os.getpid()}"
+            incoming.write_text(json.dumps(record) + "\n")
+            incoming.rename(work / ARCHIVE_LIST)
+            return {"state": "listed", "count": len(kept), "address": address}
+    return {"state": "error", "reason": why}
 
 
 def ssh_command(config: dict, address: str, request: str) -> list[str]:
@@ -442,7 +563,7 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
             ssh_err.seek(0)
             detail = ssh_err.read().decode(errors="replace").strip()[-160:]
             if "No route to host" in detail:
-                detail += " (Local Network Privacy: the agent must run /usr/bin/python3)"
+                detail += " (Local Network Privacy: the agent must run /usr/bin/python3 under a /bin/sh parent; rerun glaeda-mini-setup)"
             run.unreachable = f"{address}: {'timed out' if run.timed_out else detail or 'no answer'}"
             return None
         words = header[len(SERVE_HEADER):].decode(errors="replace").split()
@@ -767,6 +888,87 @@ def running_group_commands(pgid: int) -> list[str]:
     return commands
 
 
+PS_TIMEOUT = 10
+
+
+def leader_start(pid: int) -> str | None:
+    """pid's start time, precise enough that a reused pid never matches ('' when no such process; None when it
+    could not be read): macOS proc_pidinfo's start seconds and microseconds, Linux /proc's start in clock ticks
+    since boot with the boot id. `ps lstart` has one-second precision, which a reused pid can share."""
+    if sys.platform == "darwin":
+        import ctypes
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError:
+            return None
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo (PROC_PIDTBSDINFO)
+        size = libproc.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136)
+        if size != 136:
+            return "" if ctypes.get_errno() == errno.ESRCH else None
+        sec, usec = int.from_bytes(info.raw[120:128], "little"), int.from_bytes(info.raw[128:136], "little")
+        return f"darwin {sec}.{usec:06d}"
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return None
+    fields = stat[stat.rfind(")") + 2:].split()
+    return f"linux {boot} {fields[19]}" if len(fields) > 19 else None
+
+
+def group_alive(pgid: int) -> bool | None:
+    """Whether any process is in process group pgid, or None when ps could not tell."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pgid="], capture_output=True, text=True, timeout=PS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return str(pgid) in out.stdout.split()
+
+
+def thaw_left_paused(folder: Path) -> list[int]:
+    """SIGCONT each process group a dead run left paused, by its record in folder; returns the groups continued.
+
+    A Governor records a group (pgid and its leader's start time) before it stops it and removes the record once
+    it has continued it, so a record that outlives its run means that run died with the group stopped (SIGKILL, a
+    crash, a power loss). Run under the prefetch lock, so no live Governor's record is touched. Per record:
+    - the group is gone: the record goes;
+    - its leader (pid == pgid) lives with another start time: a new group took the pgid after the old one died,
+      so it is left alone and the record goes (the start time has microseconds: leader_start);
+    - its leader lives with the recorded start time, or is gone while members remain (a pgid is never reused
+      while a member of its group lives): SIGCONT, and the record goes once that succeeded or found no group.
+    When ps cannot tell, or the SIGCONT fails otherwise, the record stays for the next run. Accepted: between the
+    check and the SIGCONT (microseconds; neither macOS nor a process group has a pidfd) every member would have to
+    exit, a new process take the pid, make it a group and be stopped by someone else; only then would it be
+    continued early."""
+    thawed = []
+    for record in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            data = json.loads(record.read_text())
+            pgid, started = int(data["pgid"]), str(data["started"])
+        except (OSError, ValueError, KeyError, TypeError):
+            record.unlink(missing_ok=True)
+            continue
+        alive, leader = group_alive(pgid), leader_start(pgid)
+        if pgid <= 1 or not started or alive is False or (leader and leader != started):
+            record.unlink(missing_ok=True)
+            continue
+        if alive is None or leader is None:
+            continue
+        try:
+            os.killpg(pgid, signal.SIGCONT)
+            thawed.append(pgid)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            continue
+        record.unlink(missing_ok=True)
+    return thawed
+
+
 class Governor:
     """Paces an R2 download by the running job's own use of the network, not by the job's existence.
 
@@ -783,12 +985,19 @@ class Governor:
 
     The group is signalled only under the lock and before stop(): the caller stops the Governor before it
     reaps the group's leader, so a signal never reaches a reused process group.
+
+    A paused group is always continued before the Governor lets it go: stop() continues it, the loop continues it if
+    it dies (an exception in a counter), and with record_dir a record written before each SIGSTOP and removed after
+    each SIGCONT lets the next run continue a group this one could not (SIGKILL; thaw_left_paused).
     """
 
     def __init__(self, pgid: int, rate: int, job: Callable[[], str],
                  read_interface: Callable[[], int | None] = interface_bytes,
-                 read_own: Callable[[], int] | None = None, tick: float = 1.0) -> None:
+                 read_own: Callable[[], int] | None = None, tick: float = 1.0,
+                 record_dir: Path | None = None) -> None:
         self.pgid, self.rate, self.job, self.tick = pgid, rate, job, tick
+        self.record = record_dir / f"{pgid}.json" if record_dir is not None else None
+        self.started = ""
         self.read_interface, self.read_own = read_interface, read_own or DownloadBytes(pgid)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()  # stop() may run in a signal handler on a thread inside stop()
@@ -797,16 +1006,71 @@ class Governor:
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def set_paused(self, paused: bool) -> None:
+        if paused and self.record is not None and not self.started:
+            self.started = leader_start(self.pgid) or ""  # read once, outside the lock: stop() never waits on it
         with self.lock:
             if self.stop_event.is_set() or paused == self.paused:
                 return
+            if not paused:
+                self.resume()
+                return
+            if not self.write_record():
+                return  # no record, no pause: a stop nothing could undo after a SIGKILL is worse than a fast download
             try:
-                os.killpg(self.pgid, signal.SIGSTOP if paused else signal.SIGCONT)
+                os.killpg(self.pgid, signal.SIGSTOP)
+            except OSError:
+                self.drop_record()  # not stopped: nothing to undo
+                return
+            self.paused = True
+
+    def write_record(self) -> bool:
+        if self.record is None:
+            return True
+        if not self.started:
+            return False
+        try:
+            self.record.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.record.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"pgid": self.pgid, "started": self.started}))
+            tmp.replace(self.record)
+            return True
+        except OSError:
+            return False
+
+    def drop_record(self) -> None:
+        if self.record is not None:
+            try:
+                self.record.unlink(missing_ok=True)
             except OSError:
                 pass
-            self.paused = paused
+
+    def resume(self) -> bool:
+        """Continue the group if this Governor stopped it (under the lock, so no tick pauses it in between).
+        The record goes only once the group is continued or gone; a SIGCONT that failed otherwise keeps it (and
+        paused), for the next tick, stop() or the next run's thaw_left_paused. Returns whether it is not paused."""
+        with self.lock:
+            if self.paused:
+                try:
+                    os.killpg(self.pgid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    return False
+                self.paused = False
+                self.drop_record()
+            return True
 
     def loop(self) -> None:
+        try:
+            self.pace()
+        finally:
+            # A counter that raised ends the loop: the group must not stay stopped until the prefetch times out.
+            with self.lock:
+                if not self.stop_event.is_set():
+                    self.resume()
+                    self.stop_event.set()
+
+    def pace(self) -> None:
         last_in, last_own, last = self.read_interface(), self.read_own(), time.monotonic()
         hot_until, job_checked, has_job, allowance = 0.0, 0.0, True, self.rate * BURST_SECONDS
         window: list[tuple[float, int | None, int]] = []
@@ -848,14 +1112,11 @@ class Governor:
     def stop(self) -> None:
         """Continue the group if it is stopped, and never signal it again (one lock hold: no tick between)."""
         with self.lock:
-            if self.paused and not self.stop_event.is_set():
-                try:
-                    os.killpg(self.pgid, signal.SIGCONT)
-                except OSError:
-                    pass
-                self.paused = False
+            if not self.stop_event.is_set():
+                self.resume()
             self.stop_event.set()
-        self.thread.join(timeout=30)
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=30)
 
     def report(self) -> dict:
         return {"rate": self.rate, **{k: round(v, 1) if isinstance(v, float) else v for k, v in self.stats.items()}}
@@ -869,7 +1130,7 @@ def remove_downloads(paths: list[str]) -> None:
             shutil.rmtree(folder, ignore_errors=True)
 
 
-def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "") -> dict:
+def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "", paused: Path | None = None) -> dict:
     """cmux's R2 prefetch for STORE, under the Governor; JOB (running at the start, or '') gives the longer timeout."""
     env = {key: value for key, value in os.environ.items()
            if key not in ("GITHUB_REPOSITORY", "GITHUB_OUTPUT", "CURL_HOME")}
@@ -886,7 +1147,7 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
                               os.fspath(store), head], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              env=env, start_new_session=True)
     downloads = DownloadBytes(child.pid)
-    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads).start()
+    governor = Governor(child.pid, BUSY_RATE, busy, read_own=downloads, record_dir=paused).start()
 
     def stop_child() -> None:
         # Only while the leader is unreaped (the Governor stopped first), so the group is still ours.
@@ -951,9 +1212,9 @@ def prefetch(scripts: Path, store: Path, head: str, mirror: Path, job: str = "")
 def run(apply: bool, state: Path = STATE) -> dict:
     record: dict = {"tool": "glaeda-seed-prefetch", "time": int(time.time()), "apply": apply}
     roots = stores(state)
-    if not roots:
-        return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
     work = state / ".prefetch"
+    if not roots and not (work / PAUSED).is_dir():
+        return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
     work.mkdir(parents=True, exist_ok=True)
     lock = os.open(work / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
     try:
@@ -962,6 +1223,14 @@ def run(apply: bool, state: Path = STATE) -> dict:
         os.close(lock)
         return {**record, "state": "skip", "reason": "another prefetch is running"}
     try:
+        # First, under the lock, on every run: a group an earlier run stopped and then died (SIGKILL) holding.
+        thawed = thaw_left_paused(work / PAUSED)
+        if thawed:
+            record["thawed"] = thawed
+        if not roots:
+            return {**record, "state": "skip", "reason": "no owned job has recorded a seed prefix on this mini"}
+        if apply:  # first: glaeda-disk needs the list even when no seed is due, and when git fetch fails
+            record["archive_list"] = record_archive_list(work, lan_config())
         try:
             mirror, head = main_head(work)
         except (OSError, subprocess.SubprocessError) as error:
@@ -1012,7 +1281,7 @@ def run(apply: bool, state: Path = STATE) -> dict:
                 if why:
                     lan["paced"] = f"{LAN_BUSY_RATE}B/s extraction, busy"
                 why = busy()  # the LAN step may have taken a while
-            result = prefetch(scripts, store, head, mirror, job=why)
+            result = prefetch(scripts, store, head, mirror, job=why, paused=work / PAUSED)
             if why:
                 result["busy"] = why
             if lan is not None:
