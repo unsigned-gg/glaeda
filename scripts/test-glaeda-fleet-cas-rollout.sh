@@ -13,6 +13,9 @@ if [ "${1:-}" = "-G" ]; then
   exit 0
 fi
 case "$*" in
+  *getifaddr*) printf '172.20.21.202\n' ;;
+  *"inet 172.20.21.158 "*) printf 'inet 172.20.21.158 netmask 0xffffff00\n' ;;
+  *"inet 172."*) exit 1 ;;
   *ifconfig*) printf '100.89.225.106\n' ;;
   *) printf '%s\n' "$*" >>"${ROLLOUT_CALLS:?}" ;;
 esac
@@ -74,5 +77,53 @@ if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
   exit 1
 fi
 grep -q -- '--store-image requires --store-root' "$temporary_root/no-root.err"
+
+# --store-lan: the store listens on its LAN address; the writer and nodes go through the relay,
+# and the store's only writer is the writer's LAN source address toward the store.
+PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --allow-coordinator --store-root /Volumes/glaeda-fleet-cas \
+  --store-lan 172.20.21.158 --writer cmux15 --sign-key /k --trusted-keys abc cmux15 cmux8s >"$temporary_root/lan.out"
+grep -q -- 'store --listen 172.20.21.158:7450 --writers 172.20.21.202 ' "$temporary_root/lan.out"
+grep -q -- 'writer --relay 172.20.21.158:7450 --sign-key /k ' "$temporary_root/lan.out"
+grep -q -- 'node --relay 172.20.21.158:7450 --trusted-keys abc ' "$temporary_root/lan.out"
+! grep -q -- '--store 100\.' "$temporary_root/lan.out"
+
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --allow-coordinator --store-root /Volumes/glaeda-fleet-cas \
+  --store-lan 172.20.21.99 cmux8s >"$temporary_root/lan-miss.out" 2>"$temporary_root/lan-miss.err"; then
+  exit 1
+fi
+grep -q 'has no address 172.20.21.99' "$temporary_root/lan-miss.err"
+
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux8s --store-lan 100.89.140.13 cmux9s >"$temporary_root/lan-tail.out" 2>"$temporary_root/lan-tail.err"; then
+  exit 1
+fi
+grep -q 'private (RFC 1918)' "$temporary_root/lan-tail.err"
+
+
+# --nodes-only: repoint readers at the LAN store through the relay without redeploying the store
+# (cmux-lawrence, a coordinator: no --allow-coordinator or --store-root needed when it is only read).
+: >"$temporary_root/calls"
+PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --store-lan 172.20.21.158 --trusted-keys abc --prewarm cmux@catchup-v1 \
+  --nodes-only cmux17 cmux20 >"$temporary_root/nodes.out"
+if grep -q '== cmux-lawrence' "$temporary_root/nodes.out"; then exit 1; fi
+if grep -q 'glaeda-fleet-cas store' "$temporary_root/nodes.out"; then exit 1; fi
+grep -q '== cmux17' "$temporary_root/nodes.out"
+grep -q 'glaeda-fleet-cas node --relay 172.20.21.158:7450 --trusted-keys abc --prewarm cmux@catchup-v1' "$temporary_root/nodes.out"
+grep -q '== cmux20' "$temporary_root/nodes.out"
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --store-lan 172.20.21.158 --writer cmux15 --sign-key /k --trusted-keys abc \
+  --nodes-only cmux17 >"$temporary_root/nodes-writer.out" 2>"$temporary_root/nodes-writer.err"; then
+  exit 1
+fi
+grep -q -- '--nodes-only redeploys no store or writer' "$temporary_root/nodes-writer.err"
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --store-lan 172.20.21.158 --nodes-only \
+  >"$temporary_root/nodes-none.out" 2>"$temporary_root/nodes-none.err"; then
+  exit 1
+fi
+grep -q -- '--nodes-only needs at least one NODE_HOST' "$temporary_root/nodes-none.err"
 
 echo "glaeda-fleet-cas rollout guard tests passed"

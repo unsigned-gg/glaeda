@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# glaeda-mini-bringup-dryrun: rehearse glaeda-mini-bringup on a mini already in the fleet. It probes this
+# host with the fleet's own probe, pretends it is new (a copy of the manifest without it), and prints what
+# admit would write, the runner labels, and every step bringup would run. Read-only: it changes no
+# manifest, enrollment, runner or checkout (a SHA is exported to a temp dir; git fetch only adds objects).
+#   glaeda-mini-bringup-dryrun [GLAEDA_SHA|GLAEDA_TREE_DIR] [MANIFEST]
+# Default tree: this checkout. Default manifest: ~/.config/glaeda/mini-fleet.json, else the example.
+set -euo pipefail
+src="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+work="$(mktemp -d "${TMPDIR:-/tmp}/mini-onboard-dryrun.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+if [[ -d "$src" ]]; then
+  for d in scripts examples config; do [[ -d "$src/$d" ]] && cp -R "$src/$d" "$work/"; done; sha="tree $src"
+else
+  sha="$src"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "GLAEDA_SHA must be 40 hex" >&2; exit 2; }
+  glaeda="$HOME/glaeda"
+  git -C "$glaeda" rev-parse --git-dir >/dev/null 2>&1 || { echo "no ~/glaeda on $(hostname -s)" >&2; exit 2; }
+  git -C "$glaeda" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$glaeda" fetch -q origin "$sha"
+  git -C "$glaeda" archive "$sha" scripts examples config | tar -x -C "$work"
+fi
+host="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+manifest="${2:-${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/mini-fleet.json}"
+[[ -f "$manifest" ]] || manifest="$work/examples/mini-fleet/manifest.example.json"
+echo "host $host, glaeda $sha, manifest $manifest"
+start=$(date +%s)
+/bin/bash "$work/scripts/cmux_mini_probe.sh" < /dev/null > "$work/probe.txt"
+echo "probe: $(wc -l < "$work/probe.txt") lines in $(( $(date +%s) - start ))s"
+python3 -I - "$work" "$host" "$manifest" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+work, host, manifest = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+loader = importlib.machinery.SourceFileLoader("glaeda_mini_fleet", str(work / "scripts" / "glaeda-mini-fleet"))
+spec = importlib.util.spec_from_loader("glaeda_mini_fleet", loader)
+mf = importlib.util.module_from_spec(spec); sys.modules["glaeda_mini_fleet"] = mf; loader.exec_module(mf)
+real = json.loads(manifest.read_text())
+member = next((n for n, h in real["hosts"].items() if mf.host_key(n) == host or mf.host_key(h.get("hostname") or "") == host
+               or mf.host_key(h.get("alias") or "") == host), None)
+scratch = json.loads(json.dumps(real))
+if member:
+    was = scratch["hosts"].pop(member)
+    scratch["never_touch"] = [n for n in scratch.get("never_touch", []) if mf.host_key(n) != host]
+name = "cmux-new-dryrun"
+(work / "scratch.json").write_text(json.dumps(scratch, indent=2))
+obs = {"hosts": {name: {"host": name, "reachable": True, **mf.parse_probe((work / "probe.txt").read_text())}}}
+(work / "observed.json").write_text(json.dumps(obs))
+o = obs["hosts"][name]
+print(f"observed: {o['model']} / {o['chip']} / {o['cpus']} cpus / {o['memory_gib']} GiB / macOS {o.get('macos')}; "
+      f"xcode {[a['path'] + ' ' + a['kind'] + ' ' + a['version'] for a in o['xcode_apps']]}; disk {o.get('disk')}")
+plan, notes = mf.admit_plan(mf.load_manifest(work / "scratch.json"), obs, [name], "std")
+print("admit would write:", json.dumps(plan, indent=2))
+for note in notes:
+    print("note:", note)
+merged = json.loads(json.dumps(scratch)); merged["hardware"].update(plan["hardware"]); merged["hosts"].update(plan["hosts"])
+merged = mf.load_manifest(work / "scratch.json", json.dumps(merged))
+summary, why = mf.labels.member_labels(merged, name, lambda app: True)
+print("runner labels:", why or sorted(summary["labels"]))
+if member:
+    entry = plan["hosts"][name]
+    same_hw = plan["hardware"] == {} and entry["hardware"] == was.get("hardware")
+    print(f"compare with {member}: hardware {entry['hardware']} vs {was.get('hardware')} "
+          f"({'same' if same_hw else 'differs'}); class {was.get('class')}; roles {was.get('roles')}")
+    real_labels, real_why = mf.labels.member_labels(mf.load_manifest(manifest), member, lambda app: True)
+    if real_labels:
+        print("labels only in the dry run:", sorted(set(summary["labels"]) - set(real_labels["labels"])))
+        print("labels only in the real entry:", sorted(set(real_labels["labels"]) - set(summary["labels"])))
+PY
+echo "== bringup dry run"
+python3 -I "$work/scripts/glaeda-mini-bringup" cmux-new-dryrun --manifest "$work/scratch.json" \
+  --observed "$work/observed.json" --registry-out "$work/registry"
+cat "$work/registry/cmux-new-dryrun.json"
+echo "DRYRUN-OK in $(( $(date +%s) - start ))s"

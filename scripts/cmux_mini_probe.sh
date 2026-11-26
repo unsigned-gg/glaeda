@@ -81,6 +81,7 @@ enrollment="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json"
 F=/Users/Shared/cmux-build-fleet
 if [ -d "$F" ]; then
   e fleet_root present
+  [ -x "$F/bin/with-host-lock" ] && e fleet_host_lock_tool present || e fleet_host_lock_tool missing
   # Existence only; the token is never read.
   [ -f "$F/secrets/controller.token" ] && e controller_token present || e controller_token missing
   e fleet_labels "$(plutil -extract EnvironmentVariables.CMUX_CI_LABELS raw /Library/LaunchDaemons/ai.manaflow.cmux-build-worker.plist 2>/dev/null)"
@@ -137,6 +138,8 @@ if [ -d "$F" ]; then
   E="$F/xcode/fleet-cas.env"
   store=$(sed -n 's/^FLEET_CAS_STORE=//p' "$E" 2>/dev/null | tail -1)
   [ -n "$store" ] && e fleet_cas_store "$store"
+  relay=$(sed -n 's/^FLEET_CAS_RELAY=//p' "$E" 2>/dev/null | tail -1)
+  [ -n "$relay" ] && e fleet_cas_relay "$relay"
   S="$F/xcode/node-store/stats.json"
   if [ -f "$S" ] && [ -r "$S" ]; then
     for stat in up_calls up_errors up_skipped up_cas_fetch up_cas_fetch_miss up_cas_verify_fail up_prefetch_calls up_prefetched up_slow_calls instance; do

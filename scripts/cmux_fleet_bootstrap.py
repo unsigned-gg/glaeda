@@ -99,7 +99,10 @@ METAL_FIX = "Metal Toolchain missing; run xcodebuild -downloadComponent MetalToo
 SUBMODULE_FIX = "submodules not initialized; run git submodule update --init --recursive --depth 1 in the cmux checkout"
 FIRST_LAUNCH_FIX = "Xcode first launch not done (plugins fail to load); run sudo xcodebuild -runFirstLaunch"
 LICENSE_FIX = "Xcode licence not accepted; run sudo xcodebuild -license accept"
-# The fix for each check `evaluate` can list in blockingChecks, so a refusal says what to do.
+# Checks that warn and never block enrollment: the disk floors (WARNING_CHECKS in evaluate).
+WARNING_CHECKS = frozenset({"diskAdmission", "nativeCacheDiskAdmission"})
+# The fix for each check `evaluate` can list in blockingChecks or warningChecks, so a refusal or warning says what
+# to do.
 BLOCKING_FIXES = {
     "supportedOs": "use macOS 15 or 26+ (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
     "hardwareCapability": "use a host that meets the hardware class minimum (8 CPUs, 16 GiB on macOS)",
@@ -782,7 +785,11 @@ def evaluate(
             or profile != ROLE_PROFILES.get(role)
         ):
             raise BootstrapError("role profiles are invalid")
-    failures = sorted(key for key, passed in checks.items() if not passed)
+    # A disk floor warns, never refuses (the fleet rule: "A busy machine makes things slower, never makes them
+    # fail; disk floors and probes warn, never refuse"). A host under the floor is still eligible; the check is
+    # listed in warningChecks with its fix, and glaeda-disk's pressure pass frees space once it runs jobs.
+    failures = sorted(key for key, passed in checks.items() if not passed and key not in WARNING_CHECKS)
+    warnings = sorted(key for key, passed in checks.items() if not passed and key in WARNING_CHECKS)
     result = {
         "schema": SCHEMA,
         "platform": platform_name,
@@ -797,6 +804,7 @@ def evaluate(
         "observed": observation.get("observed", {}),
         "eligibleForEnrollment": not failures,
         "blockingChecks": failures,
+        "warningChecks": warnings,
         "authority": "observation_only",
     }
     if len(canonical(result)) > MAX_OUTPUT_BYTES:
@@ -817,7 +825,7 @@ def parser() -> argparse.ArgumentParser:
         help="Existing operator-owned native build/cache root; path is never emitted",
     )
     p.add_argument("--min-free-gib", type=int,
-                   help="override the free-disk admission floor (default: from --build-slots)")
+                   help="override the free-disk floor, which warns and never blocks enrollment (default: from --build-slots)")
     p.add_argument("--build-slots", type=int, default=1,
                    help="concurrent cmux builds this host runs (default 1: one runner)")
     return p

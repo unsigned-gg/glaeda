@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ SPEC = importlib.util.spec_from_file_location("cmux_fleet_operator_base", MODULE
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("cmux fleet module is unavailable")
 fleet = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = fleet  # dataclasses look their module up in sys.modules while it loads
 SPEC.loader.exec_module(fleet)
 
 SUMMARY_SCHEMA = "glaeda-cmux-fleet-operator-summary/v1"

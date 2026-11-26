@@ -808,19 +808,21 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::current_dir()
-                .expect("current test checkout")
-                .join("target/glaeda-build-execution-tests")
-                .join(format!(
-                    "glaeda-build-execution-{label}-{}-{sequence}",
-                    std::process::id()
-                ));
+            let root = isolated_test_base_dir().join(format!(
+                "glaeda-build-execution-{label}-{}-{sequence}",
+                std::process::id()
+            ));
             let source = root.join("source");
             let build = root.join("build");
             let tools = root.join("tools");
-            fs::create_dir_all(&source).expect("source root");
-            fs::write(source.join("Cargo.lock"), LOCK_BYTES).expect("Cargo.lock");
-            fs::create_dir_all(&build).expect("build root");
+            fs::create_dir_all(&root).expect("fixture root");
+            set_mode(&root, 0o700);
+            fs::create_dir(&source).expect("source root");
+            set_mode(&source, 0o700);
+            let lock_path = source.join("Cargo.lock");
+            fs::write(&lock_path, LOCK_BYTES).expect("Cargo.lock");
+            set_mode(&lock_path, 0o600);
+            fs::create_dir(&build).expect("build root");
             set_mode(&build, 0o700);
             for child in ["work", "home", "cargo-home", "target"] {
                 let path = build.join(child);
@@ -828,6 +830,7 @@ mod tests {
                 set_mode(&path, 0o700);
             }
             fs::create_dir(&tools).expect("tool root");
+            set_mode(&tools, 0o700);
             let cargo = tools.join("cargo");
             let rustc = tools.join("rustc");
             let rustdoc = tools.join("rustdoc");
@@ -878,7 +881,70 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+            if let Some(parent) = self.root.parent() {
+                let _ = fs::remove_dir(parent);
+            }
         }
+    }
+
+    fn isolated_test_base_dir() -> PathBuf {
+        let mut candidates = Vec::new();
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            candidates.push(PathBuf::from(dir));
+        }
+        if let Some(dir) = std::env::var_os("RUNNER_TEMP") {
+            candidates.push(PathBuf::from(dir));
+        }
+        if let Ok(cwd) = std::env::current_dir()
+            && let Some(parent) = cwd.parent()
+        {
+            candidates.push(parent.to_path_buf());
+        }
+        candidates.push(std::env::temp_dir());
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("target"));
+        }
+
+        let euid = geteuid().as_raw();
+        let egid = getegid().as_raw();
+        for candidate in candidates {
+            let Ok(canonical) = fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if !has_clean_trusted_lineage(&canonical, euid, egid) {
+                continue;
+            }
+            let base = canonical.join("glaeda-build-execution-tests");
+            if fs::create_dir_all(&base).is_ok() {
+                let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+                return base;
+            }
+        }
+
+        std::env::current_dir()
+            .expect("current test checkout")
+            .join("target/glaeda-build-execution-tests")
+    }
+
+    fn has_clean_trusted_lineage(path: &Path, euid: u32, egid: u32) -> bool {
+        path.ancestors().all(|ancestor| {
+            let Ok(metadata) = fs::symlink_metadata(ancestor) else {
+                return false;
+            };
+            if !metadata.is_dir() {
+                return false;
+            }
+            let uid = metadata.uid();
+            let gid = metadata.gid();
+            let mode = metadata.mode() & 0o7777;
+            let trusted_owner = uid == 0 || (uid == euid && gid == egid);
+            let trusted_mode =
+                mode & 0o002 == 0 && (mode & 0o020 == 0 || (uid == euid && gid == egid));
+            let no_cargo_config = fs::symlink_metadata(ancestor.join(".cargo/config.toml"))
+                .is_err()
+                && fs::symlink_metadata(ancestor.join(".cargo/config")).is_err();
+            trusted_owner && trusted_mode && no_cargo_config
+        })
     }
 
     #[derive(Clone)]
@@ -1005,12 +1071,16 @@ mod tests {
                 }
                 return match self.build_behavior {
                     BuildBehavior::Succeed | BuildBehavior::ReplaceArtifactOnVersion => {
-                        fs::create_dir_all(self.artifact.parent().expect("release parent"))?;
+                        let release_dir = self.artifact.parent().expect("release parent");
+                        fs::create_dir_all(release_dir)?;
+                        set_mode(release_dir, 0o700);
                         write_fake_binary(&self.artifact);
                         Ok(success_record(spec, ""))
                     }
                     BuildBehavior::ChangeSource => {
-                        fs::create_dir_all(self.artifact.parent().expect("release parent"))?;
+                        let release_dir = self.artifact.parent().expect("release parent");
+                        fs::create_dir_all(release_dir)?;
+                        set_mode(release_dir, 0o700);
                         write_fake_binary(&self.artifact);
                         fs::write(&self.source_lock, b"changed during build\n")?;
                         Ok(success_record(spec, ""))
@@ -1230,8 +1300,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let fixture = Fixture::new("unsafe-artifact");
-        fs::create_dir_all(fixture.artifact.parent().expect("release parent"))
-            .expect("release directory");
+        let release_dir = fixture.artifact.parent().expect("release parent");
+        fs::create_dir_all(release_dir).expect("release directory");
+        set_mode(release_dir, 0o700);
         fs::write(&fixture.artifact, b"#!/bin/sh\nexit 0\n").expect("script artifact");
         set_mode(&fixture.artifact, 0o755);
         assert_eq!(
@@ -1251,8 +1322,9 @@ mod tests {
     #[test]
     fn artifact_snapshot_accepts_cargo_pair_but_rejects_extra_hard_links() {
         let fixture = Fixture::new("artifact-links");
-        fs::create_dir_all(fixture.artifact.parent().expect("release parent"))
-            .expect("release directory");
+        let release_dir = fixture.artifact.parent().expect("release parent");
+        fs::create_dir_all(release_dir).expect("release directory");
+        set_mode(release_dir, 0o700);
         write_fake_binary(&fixture.artifact);
         let cargo_deps_link = fixture.artifact.with_extension("cargo-deps-link");
         fs::hard_link(&fixture.artifact, &cargo_deps_link).expect("Cargo hard link");

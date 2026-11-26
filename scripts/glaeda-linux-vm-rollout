@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""glaeda-linux-vm-rollout: bring one mini's glaeda-linux-arm64 tier up the same way on every mini.
+
+    glaeda-linux-vm-rollout --host NAME --workflow W [--workflow W ...]
+                    plan: walk base -> stage -> install-root -> token -> enroll -> finish and stop at
+                    the first step with work left (no side effects)
+    glaeda-linux-vm-rollout --host NAME --workflow W ... --apply
+                    as the operator: make every step's change that needs no root and no approval;
+                    stops at install-root with the exact fleet-sudo command for the controller
+    glaeda-linux-vm-rollout --host NAME --workflow W ... --apply --approve-plan ID
+                    also `finish --apply` the service plan whose identity a previous run printed
+
+Run it on the mini, as the operator, from the glaeda checkout whose commit should be installed. It
+composes the per-step commands next to it, unchanged: glaeda-linux-vm-base, glaeda-linux-vm-serve
+(stage, install-root, finish) and the staged scaleset-enroll.
+
+One scale set per mini. A Runner Scale Set's message session belongs to one listener: the
+service creates it per scale set id, and every listener sizes itself from the scale set's
+whole TotalAssignedJobs, so two minis on one scale set would conflict or both scale for every job.
+Each mini therefore enrolls its own scale set, `glaeda-linux-arm64-<host>`, in the shared runner
+group, every one carrying the one job label `glaeda-linux-arm64`. The bridge advertises a maximum
+capacity of one (one 4 vCPU / 8 GiB clone at a time per mini) until its target accepts more.
+
+--workflow must repeat the runner group's existing workflow list exactly (scaleset-enroll refuses a
+group whose list differs; widening it is a separate scaleset-enroll --update-workflows decision).
+
+Every step is idempotent: a rerun skips what is already in place, and the enrollment output already
+written for this host's scale set is reused. Output is one bounded JSON document whose `stopped_at`
+names the step with work left (or `serving`) and whose `next` lists the exact commands; exit 0 ok,
+2 refused, 1 failed.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+from typing import Any, Sequence
+
+SCHEMA = "glaeda-linux-vm-rollout/v1"
+LABEL = "glaeda-linux-arm64"
+SCALE_SET_PREFIX = LABEL + "-"
+# scaleset-enroll's defaults, which the rollout never overrides; a stored enrollment must name them.
+ORG, REPOSITORY, RUNNER_GROUP = "manaflow-ai", "cmux", "cmux-fleet-linux"
+HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+WORKFLOW_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/\.github/workflows/"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.ya?ml@refs/heads/(main|feat-cmux-next)$")
+MAX_OUTPUT = 1 << 20
+STEP_TIMEOUT = 4 * 3600
+
+
+class Refused(Exception):
+    pass
+
+
+class Failed(Exception):
+    pass
+
+
+def tail(text: str, limit: int = 600) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def scale_set_name(host: str) -> str:
+    if not HOST_PATTERN.match(host):
+        raise Refused("--host must be the manifest host name (letters, digits, . _ -)")
+    return SCALE_SET_PREFIX + host
+
+
+def write_private(path: pathlib.Path, data: bytes) -> None:
+    stage = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(stage, path)
+
+
+class Rollout:
+    def __init__(self, *, host: str, workflows: Sequence[str], root: pathlib.Path, home: pathlib.Path,
+                 scripts: pathlib.Path, apply: bool, approve: str | None) -> None:
+        self.host = host
+        self.scale_set = scale_set_name(host)
+        if not workflows:
+            raise Refused("--workflow is required: repeat the runner group's workflow list exactly")
+        for workflow in workflows:
+            if not WORKFLOW_PATTERN.match(workflow):
+                raise Refused(f"--workflow {workflow!r} is not ORG/REPO/.github/workflows/F.yml@refs/heads/main "
+                              "or feat-cmux-next")
+        self.workflows = sorted(set(workflows))
+        self.root, self.home, self.scripts = root, home, scripts
+        self.apply, self.approve = apply, approve
+        self.serve_dir = root / "serve"
+        self.enroll_bin = self.serve_dir / "stage" / "scaleset-enroll"
+        self.enroll_out = self.serve_dir / "scaleset-enroll.json"
+        self.token_file = home / ".config" / "glaeda" / "scaleset-token.json"
+        self.steps: list[dict[str, Any]] = []
+
+    # ---- helpers ----------------------------------------------------------------------------------
+    def self_command(self, *, apply: bool, approve: str | None = None) -> str:
+        parts = ["python3", str(self.scripts / "glaeda-linux-vm-rollout"), "--host", self.host]
+        for workflow in self.workflows:
+            parts += ["--workflow", workflow]
+        if apply:
+            parts.append("--apply")
+        if approve:
+            parts += ["--approve-plan", approve]
+        return " ".join(parts)
+
+    def run(self, step: str, argv: list[str]) -> tuple[int, dict[str, Any]]:
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=STEP_TIMEOUT, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise Failed(f"{step}: {argv[0]} did not run: {error}") from None
+        out = result.stdout[:MAX_OUTPUT]
+        try:
+            document = json.loads(out)
+        except ValueError:
+            raise Failed(f"{step}: {pathlib.Path(argv[0]).name} printed no JSON ({result.returncode}): "
+                         f"{tail(out or result.stderr)}") from None
+        if not isinstance(document, dict):
+            raise Failed(f"{step}: {pathlib.Path(argv[0]).name} printed {type(document).__name__}, not an object")
+        return result.returncode, document
+
+    def record(self, step: str, code: int, document: dict[str, Any], keys: Sequence[str]) -> None:
+        entry = {"step": step, "exit": code}
+        entry.update({k: document.get(k) for k in keys if k in document})
+        self.steps.append(entry)
+        if code == 2 or document.get("disposition") == "refused":
+            raise Refused(f"{step}: {tail(document.get('reason') or document.get('error') or document)}")
+        if code != 0 or document.get("disposition") == "failed":
+            raise Failed(f"{step}: {tail(document.get('reason') or document.get('error') or document)}")
+
+    def stop(self, step: str, next_steps: list[str], **extra: Any) -> dict[str, Any]:
+        return {"stopped_at": step, "next": next_steps, **extra}
+
+    # ---- steps ------------------------------------------------------------------------------------
+    def base(self) -> dict[str, Any] | None:
+        argv = [str(self.scripts / "glaeda-linux-vm-base")] + (["--apply"] if self.apply else [])
+        code, doc = self.run("base", argv)
+        self.record("base", code, doc, ("disposition", "plan", "receipt"))
+        if self.apply:
+            if (doc.get("receipt") or {}).get("state") != "ready_stopped":
+                raise Failed(f"base: the receipt is {(doc.get('receipt') or {}).get('state')!r} after --apply")
+            return None
+        if doc.get("disposition") != "unchanged":
+            return self.stop("base", [self.self_command(apply=True)])
+        return None
+
+    def stage(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        argv = [str(self.scripts / "glaeda-linux-vm-serve")] + (["--apply"] if self.apply else [])
+        code, doc = self.run("stage", argv)
+        self.record("stage", code, doc, ("disposition", "plan", "stage", "base_vm"))
+        if not self.apply and doc.get("plan"):
+            return self.stop("stage", [self.self_command(apply=True)]), doc
+        if not doc.get("stage"):
+            raise Failed("stage: no staged artifacts after the stage step")
+        return None, doc
+
+    def install_root(self, stage: dict[str, Any]) -> dict[str, Any] | None:
+        installed = stage.get("installed") or {}
+        program, bridge = installed.get("program") or {}, installed.get("bridge") or {}
+        if (installed.get("dirs_ok") is not False and program.get("matches_stage") and bridge.get("matches_stage")
+                and program.get("contract_ok") and bridge.get("contract_ok")):
+            self.steps.append({"step": "install_root", "state": "installed"})
+            return None
+        sudo = [line for line in stage.get("next") or [] if isinstance(line, str) and line.startswith("fleet-sudo ")]
+        if len(sudo) != 1:
+            raise Failed("install_root: the stage step named no single fleet-sudo install command")
+        command = sudo[0].replace("fleet-sudo <host> ", f"fleet-sudo {self.host} ", 1)
+        self.steps.append({"step": "install_root", "state": "needs_root"})
+        return self.stop("install_root", [command, self.self_command(apply=True)], needs="root")
+
+    def token(self) -> dict[str, Any] | None:
+        if self.token_file.is_file():
+            self.steps.append({"step": "token", "state": "present"})
+            return None
+        self.steps.append({"step": "token", "state": "absent"})
+        return self.stop("token", [self.self_command(apply=self.apply)], needs="token_push",
+                         detail=f"{self.token_file} is absent: the org-runners token push must target this host")
+
+    def existing_enrollment(self) -> dict[str, Any] | None:
+        try:
+            doc = json.loads(self.enroll_out.read_bytes()[:MAX_OUTPUT])
+        except (OSError, ValueError):
+            return None
+        item = doc.get("enrollment") if isinstance(doc, dict) else None
+        group = doc.get("runner_group") if isinstance(doc, dict) else None
+        if not (isinstance(item, dict) and isinstance(group, dict)) or doc.get("error"):
+            return None
+        workflows = group.get("selected_workflows")
+        if (item.get("scale_set_name") == self.scale_set and item.get("labels") == [LABEL]
+                and item.get("owner") == ORG and item.get("repository") == REPOSITORY
+                and group.get("name") == RUNNER_GROUP
+                and isinstance(workflows, list) and sorted(set(workflows)) == self.workflows):
+            return item
+        return None
+
+    def enroll(self) -> dict[str, Any] | None:
+        if self.existing_enrollment() is not None:
+            self.steps.append({"step": "enroll", "state": "enrolled", "scale_set": self.scale_set})
+            return None
+        if self.enroll_out.exists():
+            raise Refused(f"enroll: {self.enroll_out} names another scale set, runner group or workflow list, or failed; read it and move it "
+                          f"aside to enroll {self.scale_set}")
+        argv = [str(self.enroll_bin), "--token-file", str(self.token_file), "--scale-set", self.scale_set,
+                "--label", LABEL]
+        for workflow in self.workflows:
+            argv += ["--workflow", workflow]
+        if self.apply:
+            argv.append("--apply")
+        code, doc = self.run("enroll", argv)
+        group, scale = doc.get("runner_group") or {}, doc.get("scale_set") or {}
+        self.steps.append({"step": "enroll", "exit": code, "mode": doc.get("mode"), "group": group.get("action"),
+                           "scale_set": self.scale_set, "scale_set_action": scale.get("action")})
+        if code != 0 or doc.get("error"):
+            raise Refused(f"enroll: {doc.get('error')} {doc.get('next') or ''}".strip())
+        if not self.apply:
+            return self.stop("enroll", [self.self_command(apply=True)])
+        item = doc.get("enrollment")
+        if not isinstance(item, dict) or item.get("scale_set_name") != self.scale_set:
+            raise Failed("enroll: --apply printed no enrollment for this host's scale set")
+        write_private(self.enroll_out, (json.dumps(doc, sort_keys=True) + "\n").encode())
+        return None
+
+    def finish(self) -> dict[str, Any]:
+        serve = str(self.scripts / "glaeda-linux-vm-serve")
+        code, doc = self.run("finish", [serve, "finish", "--scale-set", str(self.enroll_out)])
+        self.record("finish", code, doc, ("disposition", "enrollment", "plan_identity", "scale_set"))
+        identity = doc.get("plan_identity")
+        if not isinstance(identity, str) or not identity:
+            raise Failed("finish: the plan printed no plan_identity")
+        if not (self.apply and self.approve):
+            return self.stop("approve", [self.self_command(apply=True, approve=identity)], plan_identity=identity,
+                             enrollment=doc.get("enrollment"))
+        if self.approve != identity:
+            raise Refused(f"finish: the plan identity is {identity}, the approval names {self.approve}; re-plan")
+        code, doc = self.run("finish_apply", [serve, "finish", "--scale-set", str(self.enroll_out), "--apply",
+                                              "--approve-plan", identity])
+        self.record("finish_apply", code, doc, ("disposition", "service_apply", "service_status"))
+        return self.stop("serving", [], plan_identity=identity, service_status=doc.get("service_status"))
+
+    def execute(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"schema": SCHEMA, "mode": "apply" if self.apply else "plan", "host": self.host,
+                               "scale_set": self.scale_set, "label": LABEL, "max_capacity": 1,
+                               "workflows": self.workflows}
+        result = self.base()
+        if result is None:
+            result, stage = self.stage()
+            if result is None:
+                result = self.install_root(stage) or self.token() or self.enroll() or self.finish()
+        out.update(result)
+        out["steps"] = self.steps
+        out["disposition"] = "ok"
+        return out
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-linux-vm-rollout", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--host", required=True, help="this mini's manifest host name (names its scale set)")
+    parser.add_argument("--workflow", action="append", default=[], help="the runner group's workflow list (repeat)")
+    parser.add_argument("--apply", action="store_true", help="make the changes (default: plan only)")
+    parser.add_argument("--approve-plan", help="with --apply: the finish plan_identity a previous run printed")
+    parser.add_argument("--root", default=str(pathlib.Path.home() / ".glaeda" / "linux-vm"), help=argparse.SUPPRESS)
+    parser.add_argument("--scripts", default=str(pathlib.Path(__file__).resolve().parent), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    rollout = None
+    try:
+        if args.approve_plan and not args.apply:
+            raise Refused("--approve-plan only goes with --apply")
+        if os.geteuid() == 0:
+            raise Refused("run the rollout as the operator; only the printed install-root step runs as root")
+        rollout = Rollout(host=args.host, workflows=args.workflow, root=pathlib.Path(args.root),
+                          home=pathlib.Path.home(), scripts=pathlib.Path(args.scripts), apply=args.apply,
+                          approve=args.approve_plan)
+        document, code = rollout.execute(), 0
+    except Refused as error:
+        document, code = {"schema": SCHEMA, "disposition": "refused", "reason": tail(str(error))}, 2
+    except Failed as error:
+        document, code = {"schema": SCHEMA, "disposition": "failed", "reason": tail(str(error))}, 1
+    if code and rollout is not None:
+        document["steps"] = rollout.steps
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

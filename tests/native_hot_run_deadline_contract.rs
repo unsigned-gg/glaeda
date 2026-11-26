@@ -11,6 +11,12 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
 use rustix::thread::{CpuSet, sched_getaffinity};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Two tests in one process can read the clock in the same nanosecond (a coarse clock, parallel test
+// threads): the counter keeps each temp path its own. glaeda#2244's CI, 2026-11-20: two
+// rolling_tip_ledger_store tests shared one journal and each read the other's partial line.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 static HEAVY_SCOPE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -134,6 +140,7 @@ fn heavy_profile_applies_exact_cgroup_limits_and_receipt() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-profile-limits-{}-{nonce}",
         std::process::id()
@@ -210,6 +217,7 @@ fn background_profile_applies_exact_cpu_weight_and_receipt() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-background-weight-{}-{nonce}",
         std::process::id()
@@ -271,6 +279,7 @@ fn cpu_grant_survives_launcher_crash_until_the_scoped_worker_exits() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-cpu-grant-{}-{nonce}",
         std::process::id()
@@ -382,6 +391,7 @@ fn cpu_granted_worker_cannot_widen_its_admitted_affinity() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-cpu-seal-{}-{nonce}",
         std::process::id()
@@ -454,6 +464,7 @@ fn sigint_is_forwarded_to_the_owned_process_group_and_receipted() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-sigint-{}-{nonce}",
         std::process::id()
@@ -534,6 +545,7 @@ fn profiled_deadline_terminates_the_scoped_process_group_and_receipts_it() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-profile-deadline-{}-{nonce}",
         std::process::id()
@@ -630,6 +642,7 @@ fn profiled_deadline_waits_for_scope_after_fast_leader_exit() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
     let directory = std::env::temp_dir().join(format!(
         "glaeda-native-hot-run-fast-leader-{}-{nonce}",
         std::process::id()

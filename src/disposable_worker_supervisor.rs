@@ -9,6 +9,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::disposable_host_yield::HostYieldReason;
 use crate::disposable_worker_coordinator::DisposableWorkerCoordinatorDisposition;
 
 const IDLE_DELAY: Duration = Duration::from_secs(1);
@@ -41,6 +42,18 @@ pub(crate) trait DisposableWorkerSupervisorControl {
     /// Wait up to the supplied delay, returning `true` when stop was requested during the wait.
     fn wait_or_stop(&mut self, duration: Duration)
     -> Result<bool, DisposableWorkerSupervisorError>;
+
+    /// Record that the worker started or stopped yielding to the host's own work. Called once per
+    /// change, never per idle poll: one bounded JSON line on stderr (the LaunchAgent's log).
+    fn report_host_yield(&mut self, reason: Option<HostYieldReason>) {
+        let line = match reason {
+            Some(reason) => {
+                serde_json::json!({"event": "disposable_host_yield", "state": "yielding", "why": reason})
+            }
+            None => serde_json::json!({"event": "disposable_host_yield", "state": "cleared"}),
+        };
+        eprintln!("{line}");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +76,7 @@ where
 {
     let mut consecutive_failures = 0_u8;
     let mut immediate_progress = 0_u8;
+    let mut yielding: Option<HostYieldReason> = None;
 
     loop {
         if control.stop_requested() {
@@ -83,7 +97,18 @@ where
             if control.stop_requested() {
                 return Ok(DisposableWorkerSupervisorDisposition::Stopped);
             }
-            match driver.supervise_once(&mut session) {
+            let step = driver.supervise_once(&mut session);
+            if let Ok(disposition) = &step {
+                let now = match disposition {
+                    DisposableWorkerCoordinatorDisposition::HostYielding(reason) => Some(*reason),
+                    _ => None,
+                };
+                if now != yielding {
+                    control.report_host_yield(now);
+                    yielding = now;
+                }
+            }
+            match step {
                 Ok(DisposableWorkerCoordinatorDisposition::DeliveryRecoveryRequired) => {
                     drop(session);
                     immediate_progress = 0;
@@ -94,7 +119,8 @@ where
                 }
                 Ok(
                     DisposableWorkerCoordinatorDisposition::Idle
-                    | DisposableWorkerCoordinatorDisposition::HostStorageUnavailable,
+                    | DisposableWorkerCoordinatorDisposition::HostStorageUnavailable
+                    | DisposableWorkerCoordinatorDisposition::HostYielding(_),
                 ) => {
                     consecutive_failures = 0;
                     immediate_progress = 0;
@@ -211,6 +237,7 @@ mod tests {
     struct FakeControl {
         waits: Vec<Duration>,
         stop_after_waits: usize,
+        yields: Vec<Option<HostYieldReason>>,
     }
 
     impl DisposableWorkerSupervisorControl for FakeControl {
@@ -224,6 +251,10 @@ mod tests {
         ) -> Result<bool, DisposableWorkerSupervisorError> {
             self.waits.push(duration);
             Ok(self.stop_requested())
+        }
+
+        fn report_host_yield(&mut self, reason: Option<HostYieldReason>) {
+            self.yields.push(reason);
         }
     }
 
@@ -245,6 +276,7 @@ mod tests {
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 1,
+            yields: Vec::new(),
         };
         assert_eq!(
             supervise_disposable_worker(&mut driver, &mut control).unwrap(),
@@ -262,12 +294,44 @@ mod tests {
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 1,
+            yields: Vec::new(),
         };
         assert_eq!(
             supervise_disposable_worker(&mut driver, &mut control).unwrap(),
             DisposableWorkerSupervisorDisposition::Stopped
         );
         assert_eq!(control.waits, [IDLE_DELAY]);
+        assert_eq!(driver.connections, 1);
+    }
+
+    #[test]
+    fn host_yield_idles_and_reports_each_change_once() {
+        let nightly = HostYieldReason::NightlyJobRunning { jobs: 1 };
+        let waiting = HostYieldReason::RunnerJobWaiting { jobs: 2 };
+        let mut driver = driver([
+            Ok(DisposableWorkerCoordinatorDisposition::HostYielding(
+                nightly,
+            )),
+            Ok(DisposableWorkerCoordinatorDisposition::HostYielding(
+                nightly,
+            )),
+            Ok(DisposableWorkerCoordinatorDisposition::HostYielding(
+                waiting,
+            )),
+            Ok(DisposableWorkerCoordinatorDisposition::Idle),
+            Ok(DisposableWorkerCoordinatorDisposition::Idle),
+        ]);
+        let mut control = FakeControl {
+            stop_after_waits: 5,
+            yields: Vec::new(),
+            ..FakeControl::default()
+        };
+        assert_eq!(
+            supervise_disposable_worker(&mut driver, &mut control).unwrap(),
+            DisposableWorkerSupervisorDisposition::Stopped
+        );
+        assert_eq!(control.waits, [IDLE_DELAY; 5]);
+        assert_eq!(control.yields, [Some(nightly), Some(waiting), None]);
         assert_eq!(driver.connections, 1);
     }
 
@@ -279,6 +343,7 @@ mod tests {
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 1,
+            yields: Vec::new(),
         };
         assert_eq!(
             supervise_disposable_worker(&mut driver, &mut control).unwrap(),
@@ -297,6 +362,7 @@ mod tests {
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 2,
+            yields: Vec::new(),
         };
         assert_eq!(
             supervise_disposable_worker(&mut driver, &mut control).unwrap(),
@@ -320,6 +386,7 @@ mod tests {
         let mut control = FakeControl {
             waits: Vec::new(),
             stop_after_waits: 7,
+            yields: Vec::new(),
         };
         assert_eq!(
             supervise_disposable_worker(&mut driver, &mut control).unwrap(),

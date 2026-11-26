@@ -8,6 +8,8 @@
     glaeda-mini-setup --cmux-root ~/Projects/cmux   also run the read-only fleet bootstrap
     glaeda-mini-setup --hygiene-only --apply        any Mac (a laptop, a Studio): only the
                                                     disk and worktree hygiene tools and agents
+    glaeda-mini-setup --gh-only --apply             a lane host with no glaeda hygiene: only
+                                                    glaeda-gh and glaeda-update, kept on the ring
     glaeda-mini-setup --runner [--apply]   GitHub Actions runner for manaflow-ai/cmux
                                            (scripts/glaeda-cmux-runner, docs/CMUX_MINI_RUNNER.md)
 
@@ -24,31 +26,49 @@ as operator steps instead. The one exception is the explicit --runner mode, whic
 GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
-    ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-disk, cmux-disk        from scripts/glaeda-disk, scripts/cmux-disk (cmux-disk is the primary name)
+    ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
+    ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
-    ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-procs, cmux-procs      from scripts/glaeda-procs and its primary name cmux-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
                                                left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
+    ~/.local/bin/glaeda-disk-registry          and cmux-disk-registry, its primary name (LRU eviction to config/disk-registry.toml's
+                                               budgets; a dry run without GLAEDA_DISK_REGISTRY=1)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
+    ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
+                                               /Users/Shared/cmux-build-fleet/git/cmux.git; a no-op without a runner)
     ~/.local/bin/glaeda-lan-fetch              from scripts/glaeda-lan-fetch (compiled products from LAN peers; a
                                                miss without a mesh config). CI calls a root-owned copy at
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
     ~/.local/bin/glaeda-idle-warm              from scripts/glaeda-idle-warm (builds main into a far kept root while an
                                                owned cmux mini is idle; a no-op anywhere else)
+    ~/.local/bin/glaeda-daemon-heal            from scripts/glaeda-daemon-heal (restarts a macOS daemon that holds a core for
+                                               hours; glaeda-mini-health installs its root LaunchDaemon where sudo -n works)
+    ~/.local/share/glaeda/macos-daemons.json   from config/macos-daemons.json (that desired state and its limits)
+    ~/.local/share/glaeda/claude-routes.json   from config/claude-routes.json (the fleet routes glaeda-mini-health keeps
+                                               Claude Code on, so captures never wait on an expired personal login)
+    ~/.local/share/glaeda/fleet-services.json  from config/fleet-services.json (the owned launchd services that are not
+                                               glaeda's; glaeda-mini-health reports any other as unmanaged_service)
     ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
-                                               the runner user can, reports the rest for ci-dash; a no-op off a runner)
-    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
-    ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+                                               the runner user can, reports the rest for ci-dash; off a runner, only
+                                               the Claude route)
+    ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
+                                               the first idle LaunchAgent tick
+    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (over-the-air updates every 10 min)
+    ~/.local/bin/glaeda-gh, cmux-gh            from scripts/glaeda-gh, scripts/cmux-gh (shared GitHub CI watcher, the one poller; cmux-gh is the primary name)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
-    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
+    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with cmux-gh
+    ~/.config/glaeda/lan-cache/config.json     on a macOS host with a GitHub Actions runner: glaeda-git-mirror's
+                                               source {"schema": 1, "source": "direct"}, written once when absent
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,idle-repair,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,git-mirror,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     on a Mac mini only: alert sounds off (defaults -g com.apple.sound.beep.volume 0, uiaudio.enabled 0,
@@ -62,6 +82,12 @@ What --apply installs (templated for the current user):
 glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks for it the way
 enroll does and is not ready without it, so a missing interpreter shows up here, not 13 minutes
 into enrollment. When Homebrew belongs to another account, the fix is printed instead.
+
+--gh-only is narrower still: glaeda-gh (its daemon, the github-ci-wait skill), glaeda-update with its
+agent or timer, and glaeda-disk's pressure pass (the disk-pressure agent or timer, without the idle sweep), so a
+host that runs agent lanes gets the shared GitHub watcher on the same release ring as every other host, and
+below its free-space floor glaeda clears old unused caches and compacts the shared repository mirrors there too
+(huge-blue and the lane VMs, whose worktree reclaim is leo-workspace's hygiene reconciler).
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
 It installs the tools and LaunchAgents above and nothing else: no build-host directories,
@@ -77,7 +103,7 @@ eviction, and OTA updates continue after reboot without a `gui/$uid` login domai
 requires passwordless sudo on the host, like `glaeda-cmux-runner --headless`; it never changes
 the runner registration or controller credentials.
 
-Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
+Linux (owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
 only one written for it so far, with or without the flag. It installs the same tools and
 the systemd user units in ops/systemd (glaeda-disk-pressure, glaeda-worktree-reclaim and
 glaeda-update, each a service and a timer, and the long-running glaeda-gh service) into
@@ -103,6 +129,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -144,19 +171,55 @@ DARWIN_REQUIRED = True
 HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
 # Linux: the systemd user units installed verbatim from ops/systemd, which stay their one definition.
 SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
+
+
+def update_every_s() -> int:
+    """glaeda-update's PROBE_EVERY_S, its one definition: the agent runs it that often (a run between its ten-minute
+    full runs only probes the channel). Read from the source beside this script, so a release's setup schedules that
+    release's updater."""
+    match = re.search(r"^PROBE_EVERY_S = (\d+)\b", (SCRIPT_DIR / "glaeda-update").read_text(), re.M)
+    if not match:
+        raise RuntimeError("scripts/glaeda-update defines no PROBE_EVERY_S")
+    return int(match.group(1))
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
+    "glaeda-idle-repair.service",
+    "glaeda-idle-repair.timer",
+    "glaeda-projects-tidy.service",
+    "glaeda-projects-tidy.timer",
     "glaeda-worktree-reclaim.service",
     "glaeda-worktree-reclaim.timer",
     "glaeda-update.service",
     "glaeda-update.timer",
     "glaeda-gh.service",
 )
+DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects-tidy.timer"})
+# --gh-only: the shared GitHub watcher, the updater that keeps it on its release ring, and glaeda-disk's pressure
+# pass, which acts only below the free-space floor (Leo, 2026-11-08: cleanup "on every machine ... this is what
+# glaeda is for"). For a host that runs agent lanes whose worktree reclaim is its own.
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh")
+# cmux-gh is glaeda-gh's primary name (Leo, 2026-11-25: "what if we start calling these cmux-gh?"). Installed beside
+# the tool it renames (scripts/cmux-gh, a shim that runs glaeda-gh beside it), so the old name keeps working for every caller, timer and skill. The service
+# labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded. cmux-disk, cmux-procs
+# and cmux-disk-registry are the same for their glaeda-* programs (Leo, 2026-11-25: "start migrating off glaeda and
+# into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
+TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
+                "glaeda-disk-registry": "cmux-disk-registry"}
+PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
+GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
+                                 "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
 # long-running Linux services with no timer: enabled and started themselves
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 # the Claude Code skill installed beside the tools
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
+DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
+CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
+FLEET_SERVICES_SOURCE = REPO / "config/fleet-services.json"  # the owned non-glaeda launchd services (unmanaged_service)
+GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
+# The shared intent layer every glaeda CLI loads (leo-workspace tools/intent.py, vendored by scripts/intent-sync): the
+# copies in ~/.local/bin have no scripts/ beside them, so they read it from ~/.local/share/glaeda/intent/ (every profile)
+INTENT_SOURCES = (REPO / "scripts/intent.py", REPO / "scripts/intent_aliases.json")
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -174,6 +237,8 @@ GIT_CANDIDATES = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git")
 # glaeda-update waits 30 minutes for this whole command; the git step must fit well inside that
 GIT_BREW_TIMEOUT = 600
 BREW_TIMEOUT = 1800
+# how long a timed-out install's processes get after TERM before KILL, and after KILL before they are reported left
+REAP_GRACE_S = 5.0
 
 
 # ---------------------------------------------------------------- small helpers
@@ -221,10 +286,16 @@ class Context:
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
-                 ota_source: str | None = None, headless: bool = False) -> None:
+                 ota_source: str | None = None, role: str = "devbox",
+                 role_explicit: bool = False, headless: bool = False, gh_only: bool = False,
+                 profile_flag: str | None = None, projects_tidy: bool = True) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
-        self.hygiene_only = hygiene_only
+        self.gh_only = gh_only
+        # --gh-only or --hygiene-only as given on the command line: it replaces the profile in update.json
+        self.profile_flag = profile_flag
+        # gh-only is a narrower hygiene profile: build-host checks and defaults never apply
+        self.hygiene_only = hygiene_only or gh_only
         self.apply = apply
         self.uid = os.getuid()
         self.real_home = Path(pwd.getpwuid(self.uid).pw_dir)
@@ -254,6 +325,10 @@ class Context:
         self.receipt_path = self.state / "receipt.json"
         self.ota_ring = ota_ring
         self.ota_source = ota_source
+        self.role = role
+        self.role_explicit = role_explicit
+        # the devbox daily Projects tidy (it moves checkouts); see resolve_role for who gets it
+        self.projects_tidy = projects_tidy
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -337,6 +412,26 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     return None
 
 
+# Local Network Privacy on macOS 27 also refuses Xcode's python3 (what /usr/bin/python3 runs once
+# xcode-select points at an Xcode, signed by Apple's developer team but not a platform binary) and every
+# child it starts: from 2026-10-09 every PR mini's seed prefetch got "No route to host" from cmux-lawrence
+# and fell back to R2. A /bin/sh parent that stays alive keeps the job's process an Apple platform binary,
+# and its children, the python3 and that python's /usr/bin/ssh, then reach the LAN (launchctl submit probe
+# on cmux14, macOS 27.0.1, 2026-10-19). No `exec`: the shell must stay the job's process. `launchctl kill`
+# signals only the shell, so it forwards TERM/HUP/INT to the python3 and waits for it, then exits with its
+# status; launchd keeps tracking the job until the python3 is gone (and keeps its SIGKILL backstop).
+# A group signal (bootout) therefore reaches the python3 twice, so its TERM handlers must be idempotent.
+# As an `&` job of a non-interactive shell it starts with SIGINT and SIGQUIT ignored; INT is forwarded as TERM.
+LAN_PARENT = ["/bin/sh", "-c",
+              '"$@" & p=$!; trap "kill -TERM $p 2>/dev/null" TERM HUP INT; s=0; wait $p || s=$?; '
+              'while kill -0 $p 2>/dev/null; do wait $p; s=$?; done; exit $s', "glaeda-lan"]
+
+
+def lan_program(*argv: str) -> list[str]:
+    """ProgramArguments for an agent whose children must reach LAN peers (see LAN_PARENT)."""
+    return [*LAN_PARENT, *argv]
+
+
 _ENROLL: Any = None
 
 
@@ -363,6 +458,11 @@ def enroll_python(ctx: Context) -> str | None:
     return enroll_module().pick_python(None, ctx.home)
 
 
+def unanswered_enroll_python(ctx: Context) -> str | None:
+    """A Python 3.13+ candidate that is there but did not answer enroll_python's probe in time, or None."""
+    return enroll_module().unanswered_python(ctx.home)
+
+
 def owned_brew() -> str | None:
     """brew, when this user owns it. Shared minis often have another account's Homebrew.
 
@@ -386,27 +486,53 @@ def brew_allowed(ctx: Context) -> bool:
     return not ctx.sandbox
 
 
+def git_probe(git: str) -> tuple[tuple[int, ...] | None, bool]:
+    """(version or None, whether the version check ran out of time). Only a timeout is a slow answer;
+    a git that exits with an error or prints no version answered, and it does not count."""
+    try:
+        result = subprocess.run([git, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        return None, True
+    except OSError:
+        return None, False
+    found = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", result.stdout) if result.returncode == 0 else None
+    return (tuple(int(x) for x in found.groups() if x is not None) if found else None), False
+
+
 def git_version(git: str) -> tuple[int, ...] | None:
-    code, out = run([git, "--version"])
-    found = re.search(r"git version (\d+)\.(\d+)(?:\.(\d+))?", out) if code == 0 else None
-    return tuple(int(x) for x in found.groups() if x is not None) if found else None
+    return git_probe(git)[0]
+
+
+def git_candidates() -> list[str]:
+    """Every executable git on PATH and in the usual install locations."""
+    return list(dict.fromkeys(g for g in (shutil.which("git"), *GIT_CANDIDATES) if g and os.access(g, os.X_OK)))
+
+
+def probe_gits() -> tuple[str | None, tuple[int, ...] | None, list[str]]:
+    """The newest git that answered its version check, and every git whose check ran out of time."""
+    best: tuple[str | None, tuple[int, ...] | None] = (None, None)
+    unanswered: list[str] = []
+    for git in git_candidates():
+        version, timed_out = git_probe(git)
+        if timed_out:
+            unanswered.append(git)
+        elif version and (best[1] is None or version > best[1]):
+            best = (git, version)
+    return best[0], best[1], unanswered
 
 
 def newest_git() -> tuple[str | None, tuple[int, ...] | None]:
     """The newest git among PATH and the usual install locations."""
-    best: tuple[str | None, tuple[int, ...] | None] = (None, None)
-    for git in dict.fromkeys(g for g in (shutil.which("git"), *GIT_CANDIDATES) if g and os.access(g, os.X_OK)):
-        version = git_version(git)
-        if version and (best[1] is None or version > best[1]):
-            best = (git, version)
-    return best
+    git, version, _ = probe_gits()
+    return git, version
 
 
 def plan_git(ctx: Context) -> dict[str, Any]:
     """git >= 2.55 on every host; Homebrew installs it when this user owns Homebrew."""
     need = ".".join(map(str, MIN_GIT))
     act: dict[str, Any] = {"kind": "gitpkg", "key": f"git>={need}", "formula": "git"}
-    git, version = newest_git()
+    git, version, unanswered = probe_gits()
     shown = f"{git} {'.'.join(map(str, version))}" if version else "none"
     if version and version >= MIN_GIT:
         on_path = shutil.which("git")
@@ -414,6 +540,13 @@ def plan_git(ctx: Context) -> dict[str, Any]:
         note = "" if not path_version or path_version >= MIN_GIT else (
             f"PATH resolves {on_path} {'.'.join(map(str, path_version))}: put {Path(git).parent} first")
         return {**act, "state": "unchanged", "value": shown, "note": note}
+    if unanswered:
+        # A loaded host (cmux9s, load 100-200) missed the probe's deadline for Homebrew's git 2.55 while
+        # /usr/bin/git 2.50.1 answered; brew install git then timed out at 600 s inside glaeda-update and its
+        # release rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer.
+        return {**act, "state": "skipped", "value": unanswered[0],
+                "note": f"{', '.join(unanswered)} did not answer its version check in time (a loaded host); "
+                        "not reinstalled, the next run checks again"}
     if ctx.platform == "linux":
         return {**act, "state": "blocked", "value": shown,
                 "note": f"git {need}+ fixes a git maintenance memory bug: sudo add-apt-repository ppa:git-core/ppa "
@@ -428,17 +561,146 @@ def plan_git(ctx: Context) -> dict[str, Any]:
             "note": f"git {need}+ fixes a git maintenance memory bug: the Homebrew owner runs brew install git"}
 
 
+def session_members(sid: int) -> list[tuple[int, int, str]] | None:
+    """(pid, pgid, command) of every process in session sid that has not exited; None when ps could not list them."""
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat=,command="], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=RUN_TIMEOUT,
+                                 check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listing.returncode != 0:
+        return None
+    members = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit() or fields[2].startswith("Z"):
+            continue
+        try:
+            if os.getsid(int(fields[0])) != sid:
+                continue
+        except OSError:
+            continue
+        members.append((int(fields[0]), int(fields[1]), fields[3] if len(fields) > 3 else ""))
+    return members
+
+
+def signal_session_member(pid: int, sid: int, sig: int) -> None:
+    """Signal pid only if it is still in session sid. A pid from an earlier listing may have exited and been reused;
+    a reused pid is in another session (a session is joined only by forking from a member), so the session is
+    checked again right before the signal. On Linux a pidfd pins the process between that check and the signal.
+
+    macOS has no pidfd, so there the check and the signal are two calls back to back. XNU hands out pids in order
+    (nextpid counts up and wraps only at PID_MAX, 99999; bsd/kern/kern_fork.c), so a pid freed between those two
+    calls goes to a new process only after the counter has passed every other pid once: about 100,000 forks
+    inside the microseconds between getsid and kill. The leader's own group is signalled with killpg instead
+    (reap_session), which is pinned because the leader is not reaped until the reap is over."""
+    fd = None
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # it has exited
+        except OSError:
+            fd = None  # a kernel without pidfds, or no fd to spare (EMFILE): check and signal the plain way
+    if fd is not None:
+        try:
+            if os.getsid(pid) == sid:
+                signal.pidfd_send_signal(fd, sig)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        return
+    with contextlib.suppress(OSError):
+        if os.getsid(pid) == sid:
+            os.kill(pid, sig)
+
+
+def reap_session(sid: int, started: float) -> str:
+    """Stop every process in the session a timed-out install started (TERM, up to REAP_GRACE_S, then KILL, up to
+    REAP_GRACE_S) and say what was stopped. sid is the recorded id of the session run_install made; nothing is found
+    by name or pattern. Homebrew moves its sandbox_operation.rb children to process groups of their own (cmux9s,
+    2026-10-30), so a signal to the installer's group alone misses them; they stay in its session. The caller has
+    not reaped the session leader yet, so its pid, which numbers the session and the leader's group, cannot be
+    reused meanwhile. Only a listing that worked and came back empty ends a pass early; a failed listing is retried
+    until the pass's deadline, and the note says when the end state could not be confirmed."""
+    if sid <= 1 or sid == os.getsid(0):
+        raise ValueError(f"session {sid} is not one a timed-out install started")
+    seen: dict[int, tuple[int, str]] = {}
+    left: list[tuple[int, int, str]] | None = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        deadline = time.monotonic() + REAP_GRACE_S
+        members = session_members(sid)
+        while True:
+            for pid, pgid, command in members or ():
+                seen.setdefault(pid, (pgid, command))
+            with contextlib.suppress(OSError):
+                os.killpg(sid, sig)  # the leader's own group, even when ps could not list the session
+            for pid, pgid, _ in members or ():
+                if pgid != sid:  # the leader's group had its signal from killpg above
+                    signal_session_member(pid, sid, sig)
+            time.sleep(0.1)
+            left = members = session_members(sid)
+            if left == [] or time.monotonic() >= deadline:
+                break
+        if left == []:
+            break
+    elapsed = time.monotonic() - started
+    stopped = "; ".join(f"pid {pid} pgid {pgid} {command[:160]}" for pid, (pgid, command) in sorted(seen.items()))
+    note = f"reaped session {sid} after {elapsed:.0f} s: {stopped or 'no process listed'}"
+    if left is None:
+        note += "; ps could not list the session, so its end state is not confirmed"
+    elif left:
+        note += "; still running after KILL: " + "; ".join(f"pid {pid} pgid {pgid}" for pid, pgid, _ in left)
+    print(f"glaeda-mini-setup: {note}", file=sys.stderr)
+    return note
+
+
+def run_install(argv: list[str], timeout: int, env: dict[str, str] | None = None,
+                cwd: Path | None = None) -> tuple[int | None, str, str]:
+    """Run an installer for at most timeout s: (exit code, output, ""), or (None, output, what was reaped) when it
+    ran out of time. The installer leads a session of its own, so on timeout every process it started is stopped
+    with it (reap_session), not only the direct child: subprocess.run's timeout kills only that child, and brew
+    install git's grandchildren outlived it under launchd on cmux9s (2026-10-30)."""
+    started = time.monotonic()
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, out, ""
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException:
+        reap_session(proc.pid, started)
+        proc.kill()
+        proc.wait()
+        raise
+    note = reap_session(proc.pid, started)
+    try:
+        out, _ = proc.communicate(timeout=REAP_GRACE_S)  # what it printed before it was stopped
+    except subprocess.TimeoutExpired:
+        # a process that left the session still holds the output pipe: stop reading and reap the leader
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+        proc.kill()
+        proc.wait()
+        out = ""
+    return None, out, note
+
+
 def brew_install(brew: str, formula: str, verb: str = "install", timeout: int = BREW_TIMEOUT,
                  no_auto_update: bool = False) -> tuple[int, str]:
     env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"} if no_auto_update else None
     try:
-        result = subprocess.run([brew, verb, formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=env)
-    except subprocess.TimeoutExpired:
-        return 1, f"brew {verb} {formula} timed out after {timeout} s"
+        code, out, reaped = run_install([brew, verb, formula], timeout, env=env)
     except OSError as error:
         return 1, str(error)
-    return result.returncode, result.stdout
+    if code is None:
+        # the callers keep the tail of the output, so the timeout and what it stopped come last
+        return 1, f"{out}\nbrew {verb} {formula} timed out after {timeout} s; {reaped}"
+    return code, out
 
 
 # ---------------------------------------------------------------- preflight (read-only)
@@ -677,9 +939,28 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk},
+            # a --gh-only host: only below the floor, never the idle sweep (its worktree reclaim is its own)
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role,
+                                     **({"GLAEDA_DISK_PRESSURE_ONLY": "1"} if ctx.gh_only else {})},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
+        },
+        # Queue disk and mini-health repairs behind the authoritative host gate. A busy host
+        # records a durable queued receipt; the next minute retries automatically.
+        LABEL_PREFIX + "idle-repair": {
+            "Label": LABEL_PREFIX + "idle-repair",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply", "--scheduled-log"],
+            "StartInterval": 60,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            # BOOT_SPREAD_S: its first pass after a boot or wake waits 0-300 s (glaeda-idle-repair boot_hold).
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role,
+                                     "BOOT_SPREAD_S": "300"},
+            # idle-repair opens its log under run.lock. A descriptor launchd opens first would race rotation.
+            "StandardOutPath": "/dev/null",
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
         },
         LABEL_PREFIX + "disk-dedupe": {
             "Label": LABEL_PREFIX + "disk-dedupe",
@@ -700,17 +981,21 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
                                  "--apply", "--output", "json"],
             # hourly: finished work is reclaimable after an hour idle, unfinished after three days
             "StartInterval": 3600,
+            # Never urgent (disk pressure has its own agent): throttle CPU and I/O like taskpolicy -b
+            # so its `git status` reads stay behind the sessions and builds on this host.
+            "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
         },
-        # Over-the-air updates (scripts/glaeda-update): hourly, installs this host's release ring and
+        # Over-the-air updates (scripts/glaeda-update): every PROBE_EVERY_S it probes the channel, and every
+        # APPLY_EVERY_S or on a change converges this host on its release ring (backing off while it cannot) and
         # rolls back when the new tools do not run.
         LABEL_PREFIX + "update": {
             "Label": LABEL_PREFIX + "update",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-update"), "--apply"],
-            "StartInterval": 3600,
+            "StartInterval": update_every_s(),
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
@@ -730,8 +1015,8 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-wallpaper.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-wallpaper.err"),
         },
-        # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
-        # once on a host without fleet-cas and defers while any build runs or holds the host lock.
+        # Keeps the fleet compilation-cache node store (a hard cap, builds or not) and local Xcode CAS (only while
+        # no build runs or holds the host lock) within budget; it exits at once on a host without fleet-cas.
         LABEL_PREFIX + "fleet-cas-prune": {
             "Label": LABEL_PREFIX + "fleet-cas-prune",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-fleet-cas-prune"), "--apply"],
@@ -742,19 +1027,48 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
+        # The declared caches (config/disk-registry.toml, scripts/glaeda-disk-registry): every hour, holds each
+        # regenerating cache to its budget, least recently used unit first, at most 8 units a pass. Without
+        # GLAEDA_DISK_REGISTRY=1 in its environment, which this plist does not set, it logs its plan and deletes
+        # nothing (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2; the per-host rollout sets the flag).
+        LABEL_PREFIX + "disk-registry-evict": {
+            "Label": LABEL_PREFIX + "disk-registry-evict",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-disk-registry"), "evict", "--json", "--apply"],
+            "StartInterval": 3600,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk-registry.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk-registry.err"),
+        },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
-        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3,
-        # so it may reach the trusted seeder on the LAN (apple_python).
+        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3
+        # under a /bin/sh parent, so it may reach the seed source on the LAN (apple_python, LAN_PARENT).
         LABEL_PREFIX + "seed-prefetch": {
             "Label": LABEL_PREFIX + "seed-prefetch",
-            "ProgramArguments": [apple_python(ctx.platform) or python, os.fspath(ctx.bin / "glaeda-seed-prefetch"),
-                                 "--apply"],
+            "ProgramArguments": lan_program(apple_python(ctx.platform) or python,
+                                            os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"),
             "StartInterval": 300,
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
+        },
+        # The runner mini's full cmux git mirror (scripts/glaeda-git-mirror): a job fetches its commit from this
+        # disk, not GitHub. Every minute a fetch of main, feat-cmux-next and nightly-next (under a second with
+        # nothing new); a missing mirror is seeded from the R2 bundle. A no-op on a host without a runner.
+        # Not ProcessType Background or LowPriorityIO: the jobs read this mirror, and on a mini at load 90-130
+        # throttled I/O kept each `git config` of a pass from starting within its 30 s (2026-10-27, six minis
+        # 43-120 min behind GitHub while a direct `git config` took 0.02 s). Nice keeps it below the compiles.
+        LABEL_PREFIX + "git-mirror": {
+            "Label": LABEL_PREFIX + "git-mirror",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-git-mirror"), "--apply"],
+            "StartInterval": 60,
+            "RunAtLoad": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-git-mirror.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-git-mirror.err"),
         },
         # Idle catch-up (scripts/glaeda-idle-warm): on an idle owned cmux mini whose kept build is far from main,
         # builds main's head into that root and yields to any job; it exits at once anywhere else. Not
@@ -802,16 +1116,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
             "StartInterval": 30,
             "RunAtLoad": True,
+            # Its first pass after a boot or wake waits 0-120 s (glaeda-local-guard boot_hold): a boot has no orphans
+            # yet, and every RunAtLoad job starting at once is what loaded cosmic-gray to 214 after its 11-24 panic.
+            "EnvironmentVariables": {"BOOT_SPREAD_S": "120"},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-local-guard.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-local-guard.err"),
         },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
-        # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
+        # agent over a private Unix socket instead. Apple's python3 under a /bin/sh parent is what lets its ssh
+        # reach the peers (LAN_PARENT).
         LABEL_PREFIX + "lan-fetch": {
             "Label": LABEL_PREFIX + "lan-fetch",
-            "ProgramArguments": [apple_python(ctx.platform) or python, "-I", os.fspath(ctx.bin / "glaeda-lan-fetch"),
-                                 "serve-local"],
+            "ProgramArguments": lan_program(apple_python(ctx.platform) or python, "-I",
+                                            os.fspath(ctx.bin / "glaeda-lan-fetch"), "serve-local"),
             "RunAtLoad": True,
             "KeepAlive": True,
             "ThrottleInterval": 30,
@@ -834,6 +1152,16 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
         },
     }
+    if ctx.role == "devbox" and ctx.projects_tidy:
+        agents[LABEL_PREFIX + "projects-tidy"] = {
+            "Label": LABEL_PREFIX + "projects-tidy",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-projects"), "tidy", "--apply"],
+            "StartInterval": 86400,
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-projects-tidy.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-projects-tidy.err"),
+        }
     if ctx.headless:
         # A system LaunchDaemon has no per-user GUI session. Run the same
         # unprivileged tools as the setup user and keep only the plist itself
@@ -844,9 +1172,89 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     return agents
 
 
+# Agents that only do work beside glaeda runners on a fleet Mac: each exits at once anywhere else, but still wakes
+# every 30 s to 5 min. A --hygiene-only Mac without a glaeda runner (Leo's laptop and desktops) does not get them;
+# a headless EC2 runner Mac is --hygiene-only too, so the runners decide, not the profile (Leo, 2026-11-08:
+# "It's just, like, random garbage that was accumulated").
+RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
+    "idle-warm", "idle-fuzz", "mini-health", "git-mirror", "seed-prefetch", "lan-fetch", "fleet-cas-prune",
+    "wallpaper", "disk-registry-evict"))
+
+
+def has_glaeda_runner(ctx: Context) -> bool:
+    """A glaeda runner directory here, registered (.runner) or hooked (glaeda-hooks), as glaeda-cmux-runner makes."""
+    return glaeda_runner_present(ctx.home)
+
+
+def glaeda_runner_present(home: Path) -> bool:
+    try:
+        return any((runner / ".runner").is_file() or (runner / "glaeda-hooks").is_dir()
+                   for runner in home.glob("actions-runner-glaeda*"))
+    except OSError:
+        return True  # unreadable: keep the agents, which gate themselves
+
+
 def agent_names(ctx: Context) -> list[str]:
     """LaunchAgent labels on macOS; systemd unit file names on Linux."""
-    return list(LINUX_UNITS) if ctx.platform == "linux" else list(agent_plists(ctx))
+    if ctx.platform != "linux":
+        runner_only_ok = not ctx.hygiene_only or has_glaeda_runner(ctx)
+        return [label for label in agent_plists(ctx)
+                if (not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
+                    or label == LABEL_PREFIX + "disk-pressure")
+                and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)
+                and not (owned_by_reconciler(ctx, label) and reclaim_owned_elsewhere(ctx))]
+    if ctx.gh_only:
+        return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
+    return [name for name in LINUX_UNITS
+            if ((ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS)
+            and not (owned_by_reconciler(ctx, name) and reclaim_owned_elsewhere(ctx))]
+
+
+# leo-workspace's hygiene reconciler (tools/host-baseline) runs worktree reclaim where it is installed and retires
+# glaeda's reclaim agent there as a legacy scheduler. On a Linux agent host, 2026-11-11 to 18:
+# each hourly OTA rerun reinstalled glaeda-worktree-reclaim, each ws-sync deleted it, and a run whose unit file
+# vanished mid-sweep was killed at systemd's default 90 s start timeout and left `not-found failed`. One owner:
+# where the reconciler is installed, setup leaves its reclaim agent out (and removes the one it owns).
+#
+# The same holds for the macOS disk-pressure agent: on a glaeda_pressure host (every glaeda hygiene host) the
+# reconciler's pressure pass runs `glaeda-disk --pressure --idle --apply --top 0` itself, and host-baseline retires
+# com.teamleaderleo.glaeda.disk-pressure as a legacy scheduler (leo-workspace machines/worktree-reclaim.json
+# glaeda.legacy_schedulers.Darwin). Leo's Mac, 2026-11-22/23: setup reinstalled it, the next ws-sync removed it,
+# launchd-loaded reloaded it in between and paged NOW 5 times in 19 h. Linux keeps glaeda-disk-pressure.timer: nothing
+# retires it there, and leo-workspace host-baseline.json glaeda_ota.timers requires it active.
+RECONCILER_LABEL = "ai.leo-workspace.hygiene-reconciler"
+RECONCILER_OWNED_MACOS = (LABEL_PREFIX + "disk-pressure",)
+
+
+def owned_by_reconciler(ctx: Context, label: str) -> bool:
+    """An agent the hygiene reconciler takes over where it is installed (reclaim_owned_elsewhere)."""
+    return is_reclaim_agent(label) or (ctx.platform != "linux" and label in RECONCILER_OWNED_MACOS)
+
+
+def reclaim_owned_elsewhere(ctx: Context) -> bool:
+    if ctx.platform == "linux":
+        marker = ctx.home / ".config/systemd/user" / f"{RECONCILER_LABEL}.timer"
+    else:
+        marker = ctx.home / "Library/LaunchAgents" / f"{RECONCILER_LABEL}.plist"
+    return marker.is_file()
+
+
+def stale_agent_actions(ctx: Context, desired: set[str], owned: dict[str, str | None]) -> list[dict[str, Any]]:
+    """Remove role-specific agents installed by an earlier profile."""
+    actions = []
+    for label, digest in owned.items():
+        if not label or label in desired:
+            continue
+        path = agent_path(ctx, label)
+        current = sha256_file(path)
+        if current is None:
+            continue
+        state = "remove" if digest and current == digest else "kept"
+        actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
+                        "state": state, "sha256": current, "owned": state == "remove",
+                        "ownedSha256": digest, "loaded": agent_loaded(ctx, label),
+                        "note": "stale agent from previous role" if state == "remove" else "changed since install"})
+    return actions
 
 
 def agent_path(ctx: Context, label: str) -> Path:
@@ -855,7 +1263,7 @@ def agent_path(ctx: Context, label: str) -> Path:
 
 def agent_bytes(ctx: Context, label: str) -> bytes:
     if ctx.platform == "linux":
-        return (SYSTEMD_UNITS_DIR / label).read_bytes()
+        return (SYSTEMD_UNITS_DIR / label).read_bytes().replace(b"@GLAEDA_ROLE@", ctx.role.encode())
     return plistlib.dumps(agent_plists(ctx)[label], sort_keys=True)
 
 
@@ -871,23 +1279,69 @@ def skill_path(ctx: Context) -> Path:
     return ctx.home / ".claude/skills/github-ci-wait/SKILL.md"
 
 
+def daemon_policy_path(ctx: Context) -> Path:
+    """config/macos-daemons.json, where glaeda-mini-health and glaeda-daemon-heal read it."""
+    return ctx.home / ".local/share/glaeda/macos-daemons.json"
+
+
+def claude_routes_path(ctx: Context) -> Path:
+    """config/claude-routes.json, where glaeda-mini-health reads it."""
+    return ctx.home / ".local/share/glaeda/claude-routes.json"
+
+
+def fleet_services_path(ctx: Context) -> Path:
+    """config/fleet-services.json, where glaeda-mini-health reads it."""
+    return ctx.home / ".local/share/glaeda/fleet-services.json"
+
+
+def gh_policy_path(ctx: Context) -> Path:
+    """config/gh-daemon.json, where glaeda-gh reads it (every profile: every host may run the daemon)."""
+    return ctx.home / ".local/share/glaeda/gh-daemon.json"
+
+
+def intent_dir(ctx: Context) -> Path:
+    """Where the glaeda CLIs in ~/.local/bin load the shared intent layer from (their INTENT_DIRS)."""
+    return ctx.home / ".local/share/glaeda/intent"
+
+
 def is_update_agent(label: str) -> bool:
     return label == LABEL_PREFIX + "update" or label.startswith("glaeda-update.")
 
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
+    setup_args = ["--gh-only"] if ctx.gh_only else ["--hygiene-only"] if ctx.hygiene_only else []
+    if ctx.role_explicit or ctx.role != "devbox":
+        setup_args.append(f"--role={ctx.role}")
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else []) + (["--headless"] if ctx.headless else []),
+        "setupArgs": setup_args + (["--headless"] if ctx.headless else []),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
     return {**config, "source": ctx.ota_source} if ctx.ota_source else config
 
 
+# glaeda-git-mirror runs only where ~/.config/glaeda/lan-cache/config.json names a source. A host with a GitHub
+# Actions runner gets source "direct" (GitHub and the R2 bundle), written once and never overwritten, so an
+# operator's "lan" config (glaeda-seed-lan cache) stays. glaeda-git-mirror spreads each host's first seed.
+GIT_MIRROR_SOURCE = {"schema": 1, "source": "direct"}
+
+
+def git_mirror_source_action(ctx: Context) -> dict[str, Any] | None:
+    """A create action for the mirror's source config on a macOS runner host without one, else None."""
+    if ctx.gh_only or ctx.platform == "linux" or not any(
+            (runner / ".runner").is_file() for runner in ctx.home.glob("actions-runner*")):
+        return None
+    path = ctx.home / ".config/glaeda/lan-cache/config.json"
+    act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
+    if path.exists() or path.is_symlink():
+        return {**act, "state": "unchanged"}
+    return {**act, "state": "create", "value": GIT_MIRROR_SOURCE}
+
+
 def update_config_action(ctx: Context) -> dict[str, Any]:
-    """Written once. A later run changes it only when --ota-ring or --ota-source names a different value."""
+    """Preserve hand edits; explicit ring, source and role flags update their owned fields."""
     path = ctx.update_config
     act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
     try:
@@ -915,8 +1369,29 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     # be treated as equivalent to the default when --ota-source was supplied.
     if ctx.ota_source and current.get("source") != ctx.ota_source:
         value["source"] = ctx.ota_source
+    if ctx.profile_flag:
+        # A profile asked for by name is what OTA reruns from now on (a missing setupArgs is glaeda-update's
+        # ["--hygiene-only"]), so a host moved to --gh-only stays there, and back.
+        setup_args = value.get("setupArgs", ["--hygiene-only"])
+        if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
+            return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
+        value["setupArgs"] = [ctx.profile_flag, *(a for a in setup_args if a not in PROFILE_FLAGS)]
+    if ctx.role_explicit:
+        setup_args = value.get("setupArgs", ["--hygiene-only"])
+        if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
+            return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
+        retained = []
+        skip_value = False
+        for arg in setup_args:
+            if skip_value:
+                skip_value = False
+            elif arg == "--role":
+                skip_value = True
+            elif not arg.startswith("--role="):
+                retained.append(arg)
+        value["setupArgs"] = [*retained, f"--role={ctx.role}"]
     if value != current:
-        previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
+        previous = {k: current.get(k) for k in ("ring", "source", "setupArgs") if current.get(k) != value.get(k)}
         return {**act, "state": "update", "value": value, "previous": previous}
     return {**act, "state": "unchanged", "value": current}
 
@@ -926,6 +1401,8 @@ def is_reclaim_agent(label: str) -> bool:
 
 
 def directories(ctx: Context) -> list[tuple[Path, int]]:
+    if ctx.gh_only:
+        return [(ctx.bin, 0o755), (ctx.agents, 0o755), (ctx.logs, 0o755), (ctx.state, 0o700)]
     if ctx.platform == "linux":
         return [
             (ctx.bin, 0o755),
@@ -1018,7 +1495,7 @@ def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
 def launchctl_loaded(ctx: Context, label: str) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
     code, _ = run(([SUDO, "/bin/launchctl", "print", domain] if ctx.headless
                    else ["/bin/launchctl", "print", domain]))
     return code == 0
@@ -1108,16 +1585,45 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+    tools = GH_ONLY_TOOLS if ctx.gh_only else (
+        "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
+        "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+        "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
+        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry")
+    for name in tools:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
+        if name in TOOL_ALIASES and (SCRIPT_DIR / TOOL_ALIASES[name]).is_file():
+            alias = file_action(ctx, "tool", ctx.bin / TOOL_ALIASES[name], (SCRIPT_DIR / TOOL_ALIASES[name]).read_bytes(), 0o755)
+            alias["source"] = os.fspath(SCRIPT_DIR / TOOL_ALIASES[name])
+            actions.append(alias)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    act = file_action(ctx, "tool", skill_path(ctx), SKILL_SOURCE.read_bytes(), 0o644)
-    act["source"] = os.fspath(SKILL_SOURCE)
-    actions.append(act)
+    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
+                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
+        act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
+        act["source"] = os.fspath(source)
+        actions.append(act)
+    if not ctx.gh_only:
+        actions += plan_hygiene_tools(ctx)
+    plan_agents(ctx, actions)
+    actions.append(update_config_action(ctx))
+    if (mirror_source := git_mirror_source_action(ctx)) is not None:
+        actions.append(mirror_source)
+    mark_owned(ctx, actions)
+    if not ctx.gh_only:
+        plan_host_defaults(ctx, actions)
+    return actions
+
+
+def plan_hygiene_tools(ctx: Context) -> list[dict[str, Any]]:
+    """The macOS daemon policy and glaeda-worktree-reclaim: the parts of a hygiene install beyond the scripts."""
+    actions: list[dict[str, Any]] = []
+    for dest, source in ((daemon_policy_path(ctx), DAEMON_POLICY_SOURCE), (claude_routes_path(ctx), CLAUDE_ROUTES_SOURCE),
+                         (fleet_services_path(ctx), FLEET_SERVICES_SOURCE)):
+        act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
+        act["source"] = os.fspath(source)
+        actions.append(act)
     mode, source, note = reclaim_source(ctx)
     dest = ctx.bin / "glaeda-worktree-reclaim"
     if mode == "blocked":
@@ -1139,11 +1645,13 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act = file_action(ctx, "tool", dest, data, 0o755, note)
         act["source"] = os.fspath(source) if source else None
         actions.append(act)
+    return actions
 
-    reclaim_act = actions[-1]
+
+def plan_agents(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    """Agent (plist or unit) actions, stale agents of an earlier profile, and Spotlight markers."""
+    reclaim_act = next((a for a in actions if a.get("path") == os.fspath(ctx.bin / "glaeda-worktree-reclaim")), None)
     prior_receipt = load_receipt(ctx) or {}
-    owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
-                   if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     for label in agent_names(ctx):
         dest = agent_path(ctx, label)
         act = file_action(ctx, "agent", dest, agent_bytes(ctx, label), 0o644)
@@ -1158,7 +1666,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                 pass
         if ctx.python is None and (is_disk_agent(label) or is_update_agent(label) or is_gh_agent(label)):
             act["state"], act["note"] = "blocked", "no usable python3 yet"
-        if is_reclaim_agent(label) and reclaim_act["state"] == "blocked":
+        if is_reclaim_agent(label) and reclaim_act is not None and reclaim_act["state"] == "blocked":
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
         act["label"] = label
         act["loaded"] = agent_loaded(ctx, label)
@@ -1166,9 +1674,13 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
 
+    previous_agents = {a.get("label"): a.get("ownedSha256") or a.get("sha256")
+                       for a in prior_receipt.get("actions", [])
+                       if a.get("kind") == "agent" and a.get("owned")}
+    actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
     # Keep Spotlight off the two canonical build roots. Markers are ordinary user-owned
     # files, so this remains idempotent and never changes the host-wide indexing policy.
-    for marker in scan_exclusion_markers(ctx):
+    for marker in [] if ctx.gh_only else scan_exclusion_markers(ctx):
         act = file_action(ctx, "marker", marker, b"", 0o644,
                           "Spotlight exclusion for CI build output")
         # Any existing marker already excludes the tree. Preserve its bytes (and any
@@ -1179,8 +1691,11 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
             act["state"], act["sha256"] = "unchanged", act["previousSha256"]
         actions.append(act)
 
-    actions.append(update_config_action(ctx))
 
+def mark_owned(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    prior_receipt = load_receipt(ctx) or {}
+    owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
+                   if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
     # A file that was already identical before the first install is never owned, so never removed.
     # Ownership follows the bytes on disk, not this run's outcome: a blocked or failed step
@@ -1191,6 +1706,9 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
             act["owned"] = recorded is not None and recorded == act.get("previousSha256")
             act["ownedSha256"] = recorded if act["owned"] else None
 
+
+def plan_host_defaults(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    """git defaults, alert sounds, Python 3.13 for enroll and git itself: never on a gh-only host."""
     # /usr/bin/git is an install-dialog stub until the Command Line Tools (or Xcode) exist.
     git_ok = which("git") is not None and (
         ctx.platform == "linux" or not DARWIN_REQUIRED or Path("/Library/Developer/CommandLineTools").exists() or bool(xcode_apps()))
@@ -1213,7 +1731,6 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     if not ctx.hygiene_only:
         actions.append(plan_enroll_python(ctx))
     actions.append(plan_git(ctx))
-    return actions
 
 
 def plan_alert_sounds(ctx: Context, prior: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1250,6 +1767,13 @@ def plan_enroll_python(ctx: Context) -> dict[str, Any]:
     found = enroll_python(ctx)
     if found:
         return {**act, "state": "unchanged", "value": found, "note": ""}
+    # A loaded host can miss the probe's deadline: a brew install then ran `brew update` for half an hour inside
+    # the update agent's setup while Python 3.13 sat there (2026-10-27). A Python that is there is never reinstalled.
+    slow = unanswered_enroll_python(ctx)
+    if slow:
+        return {**act, "state": "skipped", "value": slow,
+                "note": f"{slow} is there but did not answer its version check in time (a loaded host); "
+                        "not reinstalled, the next run checks again"}
     brew = owned_brew()
     if brew and not brew_allowed(ctx):
         return {**act, "state": "blocked", "value": None,
@@ -1279,15 +1803,36 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     if receipt is None:
         actions.append({"kind": "note", "state": "kept",
                         "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"})
-    for label in agent_names(ctx):
+    roles = {ctx.role}
+    recorded_role = (receipt or {}).get("role")
+    if recorded_role in {"devbox", "fleet-mini"}:
+        roles.add(recorded_role)
+    labels: set[str] = set()
+    original_role, original_tidy = ctx.role, ctx.projects_tidy
+    ctx.projects_tidy = True  # an earlier install may have had the tidy agent
+    for role in roles:
+        ctx.role = role
+        labels.update(agent_names(ctx))
+    ctx.role, ctx.projects_tidy = original_role, original_tidy
+    # and every agent the receipt owns, so one agent_names() no longer lists (a runner-only agent on a host
+    # whose glaeda runner is gone) is still removed with its tool
+    labels.update(a["label"] for a in (receipt or {}).get("actions", [])
+                  if a.get("kind") == "agent" and a.get("owned") and a.get("label"))
+    for label in sorted(labels):
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+                 "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
+        if name in TOOL_ALIASES:
+            actions.append({"kind": "tool", "path": os.fspath(ctx.bin / TOOL_ALIASES[name])})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(claude_routes_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(fleet_services_path(ctx))})
     for marker in scan_exclusion_markers(ctx):
         actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:
@@ -1341,10 +1886,54 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
     os.replace(stage, path)
 
 
+def ota_rollback_generation(ctx: Context) -> Path | None:
+    """The complete generation that glaeda-update restores on failure and keeps on success."""
+    if ctx.platform != "macos" or not os.environ.get(UPDATE_ENV):
+        return None
+    update = ctx.state.parent / "update"
+    try:
+        state = json.loads((update / "state.json").read_text())
+        tag = state.get("current") if isinstance(state, dict) else None
+        if not isinstance(tag, str) or not re.fullmatch(r"r-\d{8}-[0-9a-f]{12}", tag):
+            return None
+        gen = update / "generations" / tag
+        marker = gen / ".complete"
+        if marker_root_is_owned(ctx, marker) and marker.read_bytes() == (tag + "\n").encode():
+            return gen
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def rollback_tool(ctx: Context, gen: Path | None, act: dict[str, Any], dest: Path) -> Path | None:
+    """A receipt-owned tool whose exact prior bytes are already in OTA's rollback generation."""
+    if gen is None or act["kind"] != "tool" or not act.get("owned"):
+        return None
+    if dest == ctx.bin / "glaeda-worktree-reclaim":
+        source = gen / "bin" / dest.name
+    else:
+        try:
+            source = gen / "glaeda" / Path(act["source"]).relative_to(REPO)
+        except ValueError:
+            return None
+    digest = act.get("ownedSha256")
+    if (digest and marker_root_is_owned(ctx, source) and sha256_file(source) == digest
+            and sha256_file(dest) == digest and stat.S_IMODE(dest.stat().st_mode) == int(act["mode"], 8)):
+        return source
+    return None
+
+
 def backup(ctx: Context, path: Path) -> str:
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = ctx.state / "backup" / f"{path.name}.{stamp}"
-    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = ctx.state / "backup"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Two installs within a second must keep both originals, including a local edit between them.
+    dest = root / f"{path.name}.{stamp}"
+    try:
+        dest.touch(mode=0o600, exist_ok=False)
+    except FileExistsError:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=dest.name + ".", delete=False) as created:
+            dest = Path(created.name)
     shutil.copy2(path, dest)
     return os.fspath(dest)
 
@@ -1356,11 +1945,15 @@ def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
-    launchctl(ctx, "bootout", domain)
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
+    code, output = launchctl(ctx, "bootout", domain)
+    if code != 0 and "could not find" not in output.lower() and "no such process" not in output.lower():
+        return False
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if launchctl(ctx, "print", domain)[0] != 0:
+        print_code, print_output = launchctl(ctx, "print", domain)
+        if print_code != 0 and ("could not find" in print_output.lower()
+                                or "no such process" in print_output.lower()):
             return True
         time.sleep(0.25)
     return False
@@ -1396,6 +1989,7 @@ def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> No
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
     reclaim_failed = False
+    rollback = ota_rollback_generation(ctx)
     for act in actions:
         kind, state = act["kind"], act["state"]
         act["applied"] = False
@@ -1404,6 +1998,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if state == "create":
                 path.mkdir(parents=True, exist_ok=True, mode=int(act["mode"], 8))
                 act["applied"] = True
+            continue
+        if kind == "agent" and state == "remove":
+            unloaded = True
+            if ctx.platform == "linux" and not ctx.sandbox:
+                code, _ = run([systemctl(), "--user", "disable", "--now", act["label"]])
+                unloaded = code == 0
+            elif ctx.platform != "linux" and act.get("loaded"):
+                unloaded = bootout(ctx, act["label"])
+            if not unloaded:
+                act["state"], act["note"] = "blocked", "could not unload stale agent; file retained"
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                Path(act["path"]).unlink()
+            act["applied"] = True
             continue
         if kind == "agent" and is_reclaim_agent(act["label"]) and reclaim_failed:
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
@@ -1427,17 +2035,21 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             else:
                 data = b""
             if state == "update":
-                act["backup"] = backup(ctx, dest)
+                saved = rollback_tool(ctx, rollback, act, dest)
+                if saved is None:
+                    act["backup"] = backup(ctx, dest)
+                else:
+                    act["rollbackSource"] = os.fspath(saved)
             if not dest.parent.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
-                    # unloading would kill the glaeda-update that is running this setup; launchd
-                    # reads the new plist at the next login, or when setup runs by hand
+                    # unloading would kill the glaeda-update that is running this setup; it reloads
+                    # the agent from a detached helper once it exits (glaeda-update schedule_reload)
                     install_service_file(ctx, Path(act["path"]), data, int(act["mode"], 8))
                     act["applied"] = act["owned"] = True
                     act["ownedSha256"] = act["sha256"]
-                    act["note"] = "written; reload deferred while glaeda-update runs"
+                    act["note"] = "written; glaeda-update reloads it after this run"
                     continue
                 bootout(ctx, act["label"])
                 act["loaded"] = False
@@ -1473,7 +2085,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if not act["applied"]:
                 act["state"], act["note"] = "failed", f"brew install git exited {code}: {out.strip()[-300:]}"[:400]
         if kind == "python" and state == "create":
-            code, out = brew_install(act["brew"], act["formula"])
+            # no `brew update` first: python@3.13 from the installed formulae is enough, and an auto-update holds
+            # the update agent's setup on the network
+            code, out = brew_install(act["brew"], act["formula"], no_auto_update=True)
             found = enroll_python(ctx)
             act["applied"] = found is not None
             act["value"] = found
@@ -1542,14 +2156,13 @@ def find_cargo(ctx: Context) -> str | None:
 def build_reclaim(ctx: Context) -> tuple[int, str]:
     cargo = find_cargo(ctx) or "cargo"
     try:
-        result = subprocess.run(
-            [cargo, "build", "--locked", "--release", "--bin", "glaeda-worktree-reclaim"],
-            cwd=REPO, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=1800, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
+        code, out, reaped = run_install([cargo, "build", "--locked", "--release", "--bin", "glaeda-worktree-reclaim"],
+                                        1800, cwd=REPO)
+    except OSError as error:
         return 1, str(error)
-    return result.returncode, result.stdout
+    if code is None:
+        return 1, f"{out}\ncargo build timed out after 1800 s; {reaped}"
+    return code, out
 
 
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
@@ -1722,7 +2335,9 @@ def run_fleet_bootstrap(ctx: Context) -> dict[str, Any] | None:
         return {"state": "unparsed", "note": "bootstrap output was not JSON", "raw": result.stdout[-2000:]}
     return {"state": "observed", "schema": doc.get("schema"),
             "eligibleForEnrollment": doc.get("eligibleForEnrollment"),
-            "blockingChecks": doc.get("blockingChecks")}
+            "blockingChecks": doc.get("blockingChecks"),
+            # the disk floors: they warn and never block enrollment (cmux_fleet_bootstrap WARNING_CHECKS)
+            "warningChecks": doc.get("warningChecks") if isinstance(doc.get("warningChecks"), list) else []}
 
 
 # ---------------------------------------------------------------- output
@@ -1753,7 +2368,9 @@ def render(ctx: Context, receipt: dict[str, Any]) -> str:
     for name, slot in receipt["reserved"].items():
         extra = ""
         if slot.get("state") == "observed":
-            extra = f" eligible={slot['eligibleForEnrollment']} blocking={','.join(slot['blockingChecks']) or 'none'}"
+            extra = f" eligible={slot['eligibleForEnrollment']} blocking={','.join(slot['blockingChecks'] or []) or 'none'}"
+            if slot.get("warningChecks"):
+                extra += f" warning={','.join(slot['warningChecks'])} (a disk floor warns, never refuses)"
         lines.append(f"  {name}: {slot['state']}{extra}  {slot.get('note', '')}".rstrip())
     lines.append("ready: " + ("yes" if receipt["ready"] else "no, blocking: " + ", ".join(receipt["blocking"])))
     if receipt["applied"]:
@@ -1785,6 +2402,11 @@ def parser() -> argparse.ArgumentParser:
                         "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
+    p.add_argument("--gh-only", action="store_true",
+                   help="only glaeda-gh (the shared GitHub watcher) and glaeda-update, for a lane host with no glaeda "
+                        "hygiene; the updater keeps both on the host's release ring")
+    p.add_argument("--role", choices=("fleet-mini", "devbox"),
+                   help="disk and workspace policy role (default: devbox for hygiene/Linux, fleet-mini otherwise)")
     p.add_argument("--headless", action="store_true",
                    help="install macOS agents as root-owned system LaunchDaemons for a GUI-less host (needs sudo)")
     return p
@@ -1798,9 +2420,44 @@ def run_runner_mode(argv: list[str]) -> int:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner", os.fspath(SCRIPT_DIR / "glaeda-cmux-runner"))
     spec = importlib.util.spec_from_loader("glaeda_cmux_runner", loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
     loader.exec_module(module)
     module.DARWIN_REQUIRED = DARWIN_REQUIRED
     return module.main(argv)
+
+
+def resolve_role(explicit: str | None, hygiene: bool, prior: dict[str, Any] | None,
+                 runner: bool) -> tuple[str, bool]:
+    """(role, install the devbox Projects tidy agent) for this run.
+
+    An explicit --role always wins (OTA reruns carry it in update.json setupArgs). A hygiene or --gh-only
+    install that was never a build host and has no glaeda runner is a personal machine, so it is devbox, even
+    where an earlier release recorded fleet-mini for it: that release migrated every role-less hygiene receipt
+    to fleet-mini and then kept it forever, so Leo's own Mac ran the fleet disk policy (git ls-files over every
+    ~/Projects checkout, fleet-only families) every 15 minutes. A build host, and a hygiene host with a glaeda
+    runner (a headless runner Mac), keep the recorded role as before.
+
+    The tidy agent moves checkouts within ~/Projects, so a host that ran fleet-mini until now does not get it
+    by this migration; `--role devbox` (or a host that was devbox from the start) does.
+    """
+    prior = prior or {}
+    recorded = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
+    if recorded is None and prior.get("profile") in {"build-host", "hygiene"}:
+        # Before roles were recorded, both profiles used the fleet-style disk policy.
+        recorded = "fleet-mini"
+    if explicit:
+        role = explicit
+    elif hygiene and prior.get("profile") in {None, "hygiene", "gh"} and not runner:
+        role = "devbox"
+    else:
+        role = recorded or ("devbox" if hygiene else "fleet-mini")
+    if role != "devbox":
+        return role, False
+    if explicit == "devbox":
+        return role, True
+    if isinstance(prior.get("projectsTidy"), bool):
+        return role, prior["projectsTidy"]
+    return role, recorded != "fleet-mini"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1813,12 +2470,23 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
-    ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
+    home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    try:
+        prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
+    except (OSError, ValueError, TypeError):
+        prior = None
+    role, projects_tidy = resolve_role(args.role, args.hygiene_only or args.gh_only or HOST_PLATFORM == "linux",
+                                       prior if isinstance(prior, dict) else None, glaeda_runner_present(home))
+    ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source, headless=args.headless)
+                  ota_source=args.ota_source, role=role,
+                  role_explicit=args.role is not None,
+                  headless=args.headless, gh_only=args.gh_only,
+                  profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None,
+                  projects_tidy=projects_tidy)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
@@ -1841,7 +2509,9 @@ def main(argv: list[str] | None = None) -> int:
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
-        "profile": "hygiene" if ctx.hygiene_only else "build-host",
+        "profile": "gh" if ctx.gh_only else "hygiene" if ctx.hygiene_only else "build-host",
+        "role": ctx.role,
+        "projectsTidy": ctx.role == "devbox" and ctx.projects_tidy,
         "platform": ctx.platform,
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),

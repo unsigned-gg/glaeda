@@ -173,9 +173,110 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(record["state"], "error")
         self.assertIn("refused", record["reason"])
 
+    def test_a_seed_that_reads_eio_is_quarantined_not_a_crash(self):
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        bad = self.archive / (KEYS[0] + archive.SUFFIX)
+        real = archive.os.scandir
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name = entry, entry.name
+            def is_file(self, follow_symlinks=True):
+                if self.name == bad.name:
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        archive.os.scandir = lambda path: Listing(Entry(e) for e in real(path))
+        try:
+            record = self.run_archive()
+        finally:
+            archive.os.scandir = real
+        self.assertEqual(record["state"], "applied", record)
+        [item] = record["unreadable"]
+        self.assertEqual((item["key"], item["quarantined"]), (KEYS[0], True))
+        self.assertIn("errno 5", item["error"])
+        self.assertTrue((self.archive / f".corrupt-{bad.name}").exists())
+        self.assertFalse(archive.quiet(record))
+        # The good seed is untouched, and the quarantined one is fetched again in the same run.
+        self.assertTrue((self.archive / (KEYS[1] + archive.SUFFIX)).exists())
+        self.assertEqual([f["outcome"] for f in record["fetched"]], ["fetched"])
+
+    def test_a_quarantine_that_fails_too_is_reported_and_not_fetched_over(self):
+        self.keep(KEYS[0], 100)
+        unreadable = {KEYS[0]: "OSError errno 5: Input/output error"}
+        [item] = archive.quarantine(self.archive, unreadable, True)  # nothing to rename: fails like a bad entry
+        self.assertFalse(item["quarantined"])
+        self.assertIn("quarantine_error", item)
+
+    def test_an_eio_anywhere_in_a_run_is_an_error_record(self):
+        real = archive.run
+        archive.run = lambda apply: (_ for _ in ()).throw(OSError(5, "Input/output error", "/Volumes/x"))
+        try:
+            out = io.StringIO()
+            real_stdout, sys.stdout = sys.stdout, out
+            try:
+                self.assertEqual(archive.main(["--apply"]), 1)
+            finally:
+                sys.stdout = real_stdout
+        finally:
+            archive.run = real
+        self.assertEqual(json.loads(out.getvalue())["state"], "error")
+
+    def test_the_job_is_a_system_daemon_for_this_user_and_install_migrates_the_agent(self):
+        plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
+        self.assertEqual(plist["UserName"], archive.pwd.getpwuid(os.getuid()).pw_name)
+        self.assertIn("HOME", plist["EnvironmentVariables"])
+        self.assertTrue(plist["AbandonProcessGroup"])
+        base = Path(self.tmp.name)
+        calls = base / "calls"
+        sudo = base / "sudo"
+        sudo.write_text(f'#!/bin/sh\necho "$@" >>{calls}\n[ "$1" = chown ] && exit 0\nexec "$@"\n')
+        sudo.chmod(0o755)
+        launchctl = base / "launchctl"
+        launchctl.write_text(f'#!/bin/sh\necho "launchctl $@" >>{calls}\n[ "$1" = print ] && exit 113\nexit 0\n')
+        launchctl.chmod(0o755)
+        home = base / "home"
+        (home / "Library/LaunchAgents").mkdir(parents=True)
+        agent = home / "Library/LaunchAgents" / f"{archive.LABEL}.plist"
+        agent.write_text("old")
+        saved = (archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE)
+        archive.HOME, archive.DAEMON_DIR = home, base / "daemons"
+        archive.DAEMON_DIR.mkdir()
+        archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = [os.fspath(sudo)], os.fspath(launchctl), base / "st/x"
+        try:
+            report = {}
+            archive.install_daemon(report, b"want")
+            self.assertEqual(report["daemon"], "installed", report)
+            self.assertFalse(agent.exists())
+            self.assertEqual((archive.DAEMON_DIR / f"{archive.LABEL}.plist").read_bytes(), b"want")
+            log = calls.read_text()
+            self.assertIn(f"launchctl bootout gui/{os.getuid()}/{archive.LABEL}", log)
+            self.assertIn(f"launchctl bootstrap system {archive.DAEMON_DIR}", log)
+            # No sudo and no loaded daemon: the root commands, never an agent.
+            archive.SUDO_PREFIX = ["/usr/bin/false"]
+            (archive.DAEMON_DIR / f"{archive.LABEL}.plist").unlink()
+            report = {}
+            archive.install_daemon(report, b"want")
+            self.assertFalse(report["loaded"])
+            self.assertIn("no passwordless sudo", report["error"])
+            self.assertFalse(agent.exists())
+        finally:
+            archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = saved
+
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
-        self.assertEqual(plist["ProgramArguments"][:2], ["/usr/bin/python3", "-I"])
+        self.assertEqual(plist["ProgramArguments"][:len(archive.LAN_PARENT) + 2],
+                         [*archive.LAN_PARENT, "/usr/bin/python3", "-I"])
+        self.assertEqual(plist["ProgramArguments"][0], "/bin/sh")
+        # The archive installs itself without glaeda-mini-setup, so it keeps its own copy of the wrapper.
+        setup = load("glaeda_mini_setup_for_archive", ROOT / "scripts/glaeda-mini-setup")
+        self.assertEqual(archive.LAN_PARENT, setup.LAN_PARENT)
         self.assertEqual(plist["StartInterval"], 15)
         self.assertEqual(plist["StandardOutPath"], "/dev/null")
 

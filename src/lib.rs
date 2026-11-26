@@ -45,6 +45,8 @@ pub mod disposable_attempt_state;
 pub mod disposable_clone_runtime;
 #[cfg(unix)]
 pub(crate) mod disposable_host_storage;
+#[cfg(unix)]
+pub(crate) mod disposable_host_yield;
 /// Exact plan plus explicitly approved macOS apply boundary for the disposable-worker LaunchAgent.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub mod disposable_launchd_service;
@@ -324,6 +326,8 @@ pub mod personal_worker_tick;
 pub mod personal_worker_verification_plan;
 pub mod plan;
 pub mod process;
+/// Report-only production recovery lifecycle with a synthetic apply projection.
+pub mod production_recovery_adapter;
 /// Pure, strict logical project catalog identities and alias resolution.
 pub mod project_catalog;
 /// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
@@ -380,6 +384,10 @@ pub mod resource;
 pub mod reusable_state_hot_state_policy;
 /// Pure evidence-driven lifecycle and retention policy for expensive reusable state.
 pub mod reusable_state_lifecycle;
+/// Append-only rolling-tip build observations and compare-and-swap promotion pointers.
+pub mod rolling_tip_ledger;
+/// Crash-safe JSONL persistence and replay adapter for one rolling-tip ledger.
+pub mod rolling_tip_ledger_store;
 #[cfg(target_os = "linux")]
 pub mod rootless_podman_config;
 /// Strict, bounded, nonblocking, descriptor-relative, identity-bound observation of reviewed Podman sources.
@@ -394,6 +402,12 @@ pub mod rootless_podman_preflight;
 pub mod runner_account_observation;
 #[cfg(target_os = "linux")]
 pub mod runner_account_plan;
+/// Bounded, authority-bound macOS runner diagnostics observation and reclaim.
+pub mod runner_log_reclaim;
+// The descriptor-bound store is compiled in production so the typed admission adapter can
+// keep the mutation boundary available to the crate.  Its raw transaction methods remain
+// crate-private; callers must use `production_recovery_adapter`'s typed admission surface.
+pub mod runner_log_reclaim_store;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
 #[cfg(target_os = "linux")]

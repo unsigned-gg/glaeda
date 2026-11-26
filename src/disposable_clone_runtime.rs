@@ -2573,6 +2573,257 @@ mod tests {
         assert_eq!(bridge.capacities, [1]);
     }
 
+    /// Storage with room for `self.0` new workers whatever is occupied.
+    struct RoomHostStorage(u16);
+
+    impl DisposableHostStorageSource for RoomHostStorage {
+        fn admits_new_worker(&self) -> Result<bool, DisposableHostStorageError> {
+            Ok(self.0 > 0)
+        }
+
+        fn new_worker_room(&self, _: u16) -> Result<u16, DisposableHostStorageError> {
+            Ok(self.0)
+        }
+    }
+
+    fn three_worker_policy() -> ScaleSetDeliveryConsumerPolicy {
+        let resources = DisposableWorkerResources::new(4_000, 8 * GIB, TARGET_DISK).unwrap();
+        ScaleSetDeliveryConsumerPolicy::new(
+            7,
+            "repo",
+            "owner",
+            &["self-hosted".to_owned()],
+            resources,
+            &current_disposable_prepared_template().unwrap(),
+        )
+        .unwrap()
+        .with_host_budget(
+            crate::disposable_worker_reconciler::DisposableHostBudget::new(
+                3,
+                DisposableWorkerResources::new(12_000, 24 * GIB, 3 * TARGET_DISK).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn available_job(runner_request_id: u64, job: &str) -> ScaleSetBridgeEvent {
+        ScaleSetBridgeEvent::Available(ScaleSetBridgeJobEvidence {
+            runner_request_id,
+            repository: "repo".to_owned(),
+            owner: "owner".to_owned(),
+            job_id: ScaleSetJobId::parse(job).unwrap(),
+            workflow_run_id: 7,
+            request_labels: vec!["self-hosted".to_owned()],
+        })
+    }
+
+    #[test]
+    fn coordinator_takes_two_jobs_on_a_three_worker_host_and_leaves_one_slot() {
+        let root = TempRoot::new("coordinator-three-worker-host");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-coordinator-three-worker-host",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let runner_runtime = runner_runtime(&host);
+        let executor = executor(&host, false);
+        install_ready_generation(&root, &host, &clone_runtime);
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        DisposableAttemptCatalog::new(store).initialize().unwrap();
+
+        let poll = ScaleSetBridgePoll::Message {
+            message_id: 9,
+            statistics: ScaleSetStatistics {
+                available_jobs: 2,
+                acquired_jobs: 0,
+                assigned_jobs: 0,
+                running_jobs: 0,
+                registered_runners: 0,
+                busy_runners: 0,
+                idle_runners: 0,
+            },
+            events: vec![available_job(41, "job-one"), available_job(42, "job-two")],
+        };
+        let coordinator = DisposableWorkerCoordinator::new(
+            root.path(),
+            three_worker_policy(),
+            Box::new(RoomHostStorage(9)),
+        );
+        let mut bridge = FakeCoordinatorBridge {
+            runner: None,
+            capacities: Vec::new(),
+            polls: std::collections::VecDeque::from([poll]),
+            acknowledged: vec![41, 42],
+        };
+
+        // The empty three-worker host advertises three; two jobs arrive and both are reserved.
+        assert_eq!(
+            coordinator
+                .supervise_with_bridge(
+                    &mut bridge,
+                    &clone_runtime,
+                    &runner_runtime,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableWorkerCoordinatorDisposition::DeliverySettled { acquired: 2 }
+        );
+        assert_eq!(bridge.capacities, [3]);
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        let catalog = DisposableAttemptCatalog::new(store).load().unwrap();
+        assert_eq!(catalog.active().len(), 2);
+        assert_eq!(catalog.host_usage().unwrap().workers(), 2);
+        assert!(
+            catalog.active().iter().all(
+                |reservation| reservation.attempt().phase() == DisposableAttemptPhase::Reserved
+            )
+        );
+
+        // The next step polls with the one free slot before it advances the first reservation.
+        // This fixture's fake Lima host knows only its own VM name, so authorizing a job-derived
+        // VM stops at its target observation; clone authorization itself is covered by
+        // `coordinator_drives_reserved_worker_through_runner_and_scale_to_zero_cleanup`.
+        let step = coordinator.supervise_with_bridge(
+            &mut bridge,
+            &clone_runtime,
+            &runner_runtime,
+            &executor,
+            &FixedClock,
+        );
+        assert!(match step {
+            Ok(DisposableWorkerCoordinatorDisposition::PrecloneCheckpointed { .. }) => true,
+            Err(error) => error.code() == "clone_target_absence_unavailable",
+            Ok(_) => false,
+        });
+        assert_eq!(bridge.capacities, [3, 1]);
+    }
+
+    #[test]
+    fn coordinator_on_a_one_worker_host_reserves_only_one_of_two_jobs() {
+        let root = TempRoot::new("coordinator-one-worker-host");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-coordinator-one-worker-host",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let runner_runtime = runner_runtime(&host);
+        let executor = executor(&host, false);
+        install_ready_generation(&root, &host, &clone_runtime);
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        DisposableAttemptCatalog::new(store).initialize().unwrap();
+        let policy = ScaleSetDeliveryConsumerPolicy::new(
+            7,
+            "repo",
+            "owner",
+            &["self-hosted".to_owned()],
+            DisposableWorkerResources::new(4_000, 8 * GIB, TARGET_DISK).unwrap(),
+            &current_disposable_prepared_template().unwrap(),
+        )
+        .unwrap();
+        let coordinator =
+            DisposableWorkerCoordinator::new(root.path(), policy, Box::new(RoomHostStorage(9)));
+        let mut bridge = FakeCoordinatorBridge {
+            runner: None,
+            capacities: Vec::new(),
+            polls: std::collections::VecDeque::new(),
+            acknowledged: Vec::new(),
+        };
+        // Storage with room for many still leaves the default host at one.
+        assert_eq!(
+            coordinator
+                .supervise_with_bridge(
+                    &mut bridge,
+                    &clone_runtime,
+                    &runner_runtime,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableWorkerCoordinatorDisposition::Idle
+        );
+        assert_eq!(bridge.capacities, [1]);
+    }
+
+    #[test]
+    fn coordinator_advertises_zero_capacity_while_the_host_yields() {
+        struct FixedHostYield(Option<crate::disposable_host_yield::HostYieldReason>);
+
+        impl crate::disposable_host_yield::DisposableHostYieldSource for FixedHostYield {
+            fn host_yield(&self) -> Option<crate::disposable_host_yield::HostYieldReason> {
+                self.0
+            }
+        }
+
+        let root = TempRoot::new("coordinator-host-yield");
+        let host = LimaHostIdentityFixture::new_with_disk_bytes(
+            "clone-runtime-coordinator-host-yield",
+            SOURCE,
+            SOURCE_DISK,
+        );
+        let clone_runtime = runtime(&root, &host);
+        let runner_runtime = runner_runtime(&host);
+        let executor = executor(&host, false);
+        install_ready_generation(&root, &host, &clone_runtime);
+        let prepared = current_disposable_prepared_template().unwrap();
+        let policy = ScaleSetDeliveryConsumerPolicy::new(
+            7,
+            "repo",
+            "owner",
+            &["self-hosted".to_owned()],
+            DisposableWorkerResources::new(4_000, 8 * GIB, TARGET_DISK).unwrap(),
+            &prepared,
+        )
+        .unwrap();
+        let store =
+            UnixPersonalWorkerStore::open_or_create_disposable_catalog(root.path()).unwrap();
+        DisposableAttemptCatalog::new(store).initialize().unwrap();
+        let mut bridge = FakeCoordinatorBridge {
+            runner: None,
+            capacities: Vec::new(),
+            polls: std::collections::VecDeque::new(),
+            acknowledged: Vec::new(),
+        };
+
+        let nightly = crate::disposable_host_yield::HostYieldReason::NightlyJobRunning { jobs: 1 };
+        let yielding = DisposableWorkerCoordinator::new_for_test(root.path(), policy.clone())
+            .with_host_yield(Box::new(FixedHostYield(Some(nightly))));
+        assert_eq!(
+            yielding
+                .supervise_with_bridge(
+                    &mut bridge,
+                    &clone_runtime,
+                    &runner_runtime,
+                    &executor,
+                    &FixedClock,
+                )
+                .unwrap(),
+            DisposableWorkerCoordinatorDisposition::HostYielding(nightly)
+        );
+        assert_eq!(bridge.capacities, [0]);
+
+        let free = DisposableWorkerCoordinator::new_for_test(root.path(), policy)
+            .with_host_yield(Box::new(FixedHostYield(None)));
+        assert_eq!(
+            free.supervise_with_bridge(
+                &mut bridge,
+                &clone_runtime,
+                &runner_runtime,
+                &executor,
+                &FixedClock,
+            )
+            .unwrap(),
+            DisposableWorkerCoordinatorDisposition::Idle
+        );
+        assert_eq!(bridge.capacities, [0, 1]);
+    }
+
     #[test]
     fn runner_transaction_checkpoints_jit_registration_and_start_before_one_command() {
         let root = TempRoot::new("runner-transaction");

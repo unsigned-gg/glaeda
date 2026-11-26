@@ -1575,14 +1575,19 @@ mod tests {
         Ok(())
     }
 
+    // PID and clock alone collided between two tests of one binary (glaeda#2244's CI): a counter keeps each
+    // fixture path distinct (router review of glaeda#2249, F1).
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn timeout_fixture_directory() -> io::Result<PathBuf> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "smolrunner-process-timeout-{}-{nonce}",
-            std::process::id()
+            "smolrunner-process-timeout-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&path)?;
         Ok(path)

@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""glaeda-nightly-only-admit: the admission of the nightly-only dedicated runners (runner.dedicated, label
+glaeda-nightly-only-m4pro).
+
+    {python} ~/glaeda-runner/scripts/glaeda-nightly-only-admit --hook {runnerDir}/glaeda-hooks/glaeda-cmux-runner-hook
+
+The runner's job-started hook runs it, as dedicated-admit.sh, after glaeda's own checks (event, repository, fork,
+disk floor) with the job's environment. Exit 0 admits the job; exit 1 refuses it (the reason is printed for the job's
+log); exit 2 is a usage error, which refuses too.
+
+Leo, 2026-11-01: "ok just dedicate at least one m4 pro mini just completely to the nightly situation idgaf anymore",
+then "i thought 7 and 15 were both capable of being dedicated". Those two minis then run only the NEXT nightly, so
+this admits only:
+
+  - every job of nightly.yml of manaflow-ai/cmux on refs/heads/nightly-next or refs/heads/main (push, schedule or
+    workflow_dispatch), from that same ref's own copy of nightly.yml. A reusable workflow nightly.yml calls (its
+    required children) runs under the caller's GITHUB_WORKFLOW_REF, so it is admitted with the caller and only then;
+  - the Release compile (release-compile) of cmux-next.yml on a feat-cmux-next push, which gates nightly-next's
+    promotion;
+  - the two key-free jobs (preflight, verify-stapled: the hook's AUTO_RESUME_LIGHT_JOBS, light) of main's
+    auto-resume-nightly-notarization.yml, on its workflow_run after main's own nightly.yml run on main or its dispatch
+    from main (the hook's auto_resume_refusal). The jobs that do work with a release key are signing jobs (refused
+    below: the trusted signing runner takes them); its three Apple-queue poll jobs are refused here too and keep
+    their hosted route, and every other job is refused.
+
+It refuses everything else the hook's FEED_FIRST nightly tier (job_tier) ranks first: main's DEV daily publish
+(cmux-next-dev-daily.yml), main's nightly-next canary and launch smoke, and every PR, DEV compile and side job. It
+also refuses a signing job (the hook's exclusive class, SIGNING_JOBS): such a job must hold the whole mini through
+the capacity ledger (GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never takes, so it keeps its existing
+route and claim instead of running here beside other nightly jobs.
+
+With --trusted-ref REF --trusted-repo OWNER/NAME it is instead the admission of a trusted runner.dedicated entry (one
+that serves a trusted pool's labels on a second host, such as main's DerivedData seed and the trusted nightly app
+build): it admits what the hook's trusted_refusal admits for that ref and repository (that repository's push and
+schedule jobs on that branch, never PR code), which the hook has already checked with the same arguments, and of those
+only TRUSTED_WORKFLOWS: the nightly itself (nightly.yml) and the trusted DerivedData seed (seed-derived-data.yml, the
+job CI_SEED_TRUSTED_POOL names, which warms the trusted nightly app build). Every other main push or schedule job is
+refused, so a host dedicated to the nightly runs no side work here. It still refuses a signing job, for the same
+reason as above.
+
+On attempt 1 of a nightly-next push it also lets an overtaken run yield to a newer one (newest run first,
+newest_first_refusal): a pre-publish job of a run whose build is already below the cmux NEXT feed's highest is refused
+in seconds, so the runner takes the next queued job instead. See the block above newest_first_refusal.
+
+It reuses the hook's own pieces (job_tier, dev_compile_refusal, job_class, load_event) by loading the hook file the
+runner actually runs, so the two never disagree on what a nightly job is, and the hook's bytes (pinned by the
+signing-hook trust list) do not change.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+PREFIX = "glaeda-nightly-only-admit"
+NIGHTLY_ONLY_LABEL = "glaeda-nightly-only-m4pro"
+WHAT = ("NEXT nightly work only: nightly.yml of manaflow-ai/cmux on nightly-next, main or an rc/* branch (and the workflows it "
+        "calls), cmux-next.yml's release-compile on a feat-cmux-next push, and the key-free jobs of main's "
+        "auto-resume-nightly-notarization.yml")
+
+
+def load_hook(path: Path) -> Any:
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_nightly_only", os.fspath(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
+    loader.exec_module(module)
+    return module
+
+
+def refusal(hook: Any, event_name: str | None, ref: str | None, repository: str | None, event: Any,
+            workflow_ref: str | None, job: str | None) -> str | None:
+    """Why the nightly-only runner refuses this job, or None to admit it. Pure (given the hook module)."""
+    if hook.rc_nightly_push(event_name, ref, repository, event, workflow_ref):
+        # RC_NIGHTLY: an rc/* push of cmux's own nightly.yml (Classic RC, the cmux-next RC). rc/* is admin-only on
+        # manaflow-ai/cmux; its signing jobs still keep their own route (below).
+        if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, "nightly.yml")[0] == hook.EXCLUSIVE_CLASS:
+            return (f"nightly.yml {job} is a signing job: it takes the whole mini through the capacity ledger "
+                    "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
+        return None
+    tier = hook.job_tier(event_name, ref, repository, event, workflow_ref, job)
+    if tier != hook.TIER_NIGHTLY:
+        return f"this runner takes {WHAT}; this job is not nightly work"
+    workflow = hook.workflow_file(workflow_ref)
+    nightly = ref in hook.NIGHTLY_REFS and workflow_ref == f"{hook.NIGHTLY_WORKFLOW}@{ref}"
+    promote = (job == hook.PROMOTE_COMPILE and event_name == "push"
+               and hook.dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None)
+    # AUTO_RESUME: the classic continuation's key-free jobs (job_tier already checked it is main's exact one)
+    resume = workflow == hook.AUTO_RESUME_FILE \
+        and hook.auto_resume_refusal(event_name, ref, repository, event, workflow_ref) is None
+    if resume and job not in hook.AUTO_RESUME_LIGHT_JOBS and ("auto-resume-nightly-notarization.yml", job) \
+            not in hook.SIGNING_JOBS:
+        return (f"this runner takes only {', '.join(hook.AUTO_RESUME_LIGHT_JOBS)} of {workflow}; {job or 'this job'} "
+                "is not one")
+    if not (nightly or promote or resume):
+        # job_tier's other nightly-tier jobs: main's DEV daily publish and main's nightly-next canary and launch smoke
+        return f"this runner takes {WHAT}; {workflow or 'this workflow'} is nightly-tier but not the nightly itself"
+    if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, workflow)[0] == hook.EXCLUSIVE_CLASS:
+        return (f"{workflow} {job} is a signing job: it takes the whole mini through the capacity ledger "
+                "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
+    return None
+
+
+# The workflows a trusted nightly-only runner takes (--trusted-ref): the nightly and the trusted seed it is warmed by.
+TRUSTED_WORKFLOWS = ("nightly.yml", "seed-derived-data.yml")
+
+
+def trusted_refusal(hook: Any, event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None, job: str | None, run_attempt: str | None, trusted_ref: str,
+                    trusted_repo: str) -> str | None:
+    """Why the trusted dedicated runner refuses this job, or None to admit it. Pure (given the hook module)."""
+    why = hook.trusted_refusal(event_name, ref, repository, event, trusted_ref, trusted_repo,
+                               workflow_ref=workflow_ref, job=job, run_attempt=run_attempt)
+    if why:
+        return why
+    workflow = hook.workflow_file(workflow_ref)
+    if workflow not in TRUSTED_WORKFLOWS:
+        return (f"this trusted runner is dedicated to the nightly: it takes only {', '.join(TRUSTED_WORKFLOWS)}; "
+                f"{workflow or 'this workflow'} is not one")
+    if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, workflow)[0] == hook.EXCLUSIVE_CLASS:
+        return (f"{workflow} {job} is a signing job: it takes the whole mini through the capacity ledger "
+                "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
+    return None
+
+
+# Newest run first (claude-sr2-coord, 2026-11-03). nightly-next is promoted about every 6 minutes and a run takes 40-55,
+# so 5-6 runs share these minis' slots at once, and GitHub hands an idle runner the oldest queued job: run 41655282358
+# (#15807) took 39 min from landing to the feed, about 6 of them queued behind older runs. The runners cannot pick a
+# job, so the admission refuses, in seconds, the jobs of an older run that is certain not to publish, and the slot goes
+# to the next queued job. Only attempt 1 of a nightly-next push of the nightly is ever refused this way (a re-run is
+# someone's deliberate choice), and only when it is overtaken: the cmux NEXT feed already lists a build above this
+# run's (CFBundleVersion is the run id then the attempt in two digits, nightly_version.py). Publication is
+# latest-wins, so this run can never publish, and cmux's own sign-pick-overtaken.sh already skips its signing for the
+# same reason. Every job up to publish-nightly that takes these runners (BEFORE_PUBLISH_JOBS) yields; post-publication
+# jobs (legacy identity, deltas, reports) never do.
+#
+# A newer push, or a newer build merely running, never makes a run yield: that newer build may still fail, and when
+# every run skipped for a newer push, promotions outran the pre-build phase and nothing built (cmux #28961). Started
+# jobs are never touched; the admission sees only a job about to start. The read is bounded and any doubt (feed
+# unreadable, an id that is not a number) admits as before.
+NIGHTLY_NEXT_FEED_URL = "https://files-next.cmux.com/nightly-next/next/appcast-arm64.xml"
+FEED_URL_ENV = "GLAEDA_NIGHTLY_NEXT_FEED_URL"  # tests point it at a file:// feed
+FEED_FETCH_S = 8
+FEED_MAX_BYTES = 4 << 20
+BEFORE_PUBLISH_JOBS = frozenset({
+    "resolve-nightly-cmux-tui-client", "pick-nightly-build-runner", "build-nightly-app", "find-nightly-next-recovery",
+    "resolve-nightly-ghostty-cli-helper", "build-nightly-ghostty-cli-helper", "build-nightly-inputs",
+    "check-nightly-webviews", "await-nightly-tree-marker", "prepare-nightly-variant-primary", "prepare-nightly-variant",
+    "signer-dmg-image", "verify-signed-nightly", "verify-final-dmg-nightly", "launch-smoke-nightly"})
+YIELD_REPOSITORY = "manaflow-ai/cmux"
+NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
+SPARKLE_VERSION = re.compile(r"<sparkle:version>\s*([0-9]{1,18})\s*</sparkle:version>")
+
+
+def run_build(run_id: str | None, attempt: str | None) -> int | None:
+    """This run's CFBundleVersion (run id, then the attempt in two digits), or None when either is not a number."""
+    if not run_id or not attempt or not run_id.isdigit() or not attempt.isdigit() or len(run_id) > 16:
+        return None
+    return int(run_id) * 100 + int(attempt)
+
+
+def yield_scope(event_name: str | None, ref: str | None, repository: str | None, workflow_ref: str | None,
+                job: str | None, run_attempt: str | None) -> bool:
+    """Whether this job may yield to a newer run: attempt 1 of a nightly-next push of the nightly, a pre-publish job."""
+    return (event_name == "push" and ref == NIGHTLY_NEXT_REF and repository == YIELD_REPOSITORY
+            and workflow_ref == f"{YIELD_REPOSITORY}/.github/workflows/nightly.yml@{NIGHTLY_NEXT_REF}"
+            and run_attempt == "1" and job in BEFORE_PUBLISH_JOBS)
+
+
+def feed_highest(text: str) -> int | None:
+    """The highest sparkle:version an appcast lists, or None."""
+    versions = [int(found) for found in SPARKLE_VERSION.findall(text)]
+    return max(versions) if versions else None
+
+
+def yield_refusal(job: str | None, run_id: str | None, run_attempt: str | None, highest: int | None) -> str | None:
+    """Why this in-scope job yields to a newer run (the feed already has a newer build), or None. Pure."""
+    build = run_build(run_id, run_attempt)
+    if build is None or job not in BEFORE_PUBLISH_JOBS or highest is None or highest <= build:
+        return None
+    return (f"yielded to a newer run: the cmux NEXT feed already has build {highest}, above this run's {build}, so this "
+            "run can never publish (latest-wins); its slot goes to a newer run's job")
+
+
+def read_feed_highest(hook: Any) -> int | None:
+    """The cmux NEXT feed's highest build (curl, bounded), or None when it cannot be read."""
+    url = os.environ.get(FEED_URL_ENV) or NIGHTLY_NEXT_FEED_URL
+    protocols = "=https,file" if os.environ.get(FEED_URL_ENV) else "=https"
+    try:
+        fetched = subprocess.run([getattr(hook, "CURL", "curl"), "-fsSL", "--proto", protocols, "--max-time",
+                                  str(FEED_FETCH_S), "--max-filesize", str(FEED_MAX_BYTES), "-A",
+                                  "glaeda-nightly-only-admit/1", url],
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                                 timeout=FEED_FETCH_S + 5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return feed_highest(fetched.stdout) if fetched.returncode == 0 else None
+
+
+def newest_first_refusal(hook: Any, env: Any) -> str | None:
+    """yield_refusal for the job in env, reading the feed only when the job is in scope. Never raises: any failure
+    admits."""
+    try:
+        if not yield_scope(env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"),
+                           env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ATTEMPT")):
+            return None
+        return yield_refusal(env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"),
+                             read_feed_highest(hook))
+    except Exception:  # noqa: BLE001  (an ordering hint must never refuse a job by failing)
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog=PREFIX, description="admit only NEXT nightly work (exit 0), else refuse (1)")
+    p.add_argument("--hook", type=Path, required=True, help="the runner's glaeda-cmux-runner-hook")
+    p.add_argument("--trusted-ref", help="admit as a trusted runner on this branch ref (with --trusted-repo)")
+    p.add_argument("--trusted-repo", help="the trusted repository, owner/name (with --trusted-ref)")
+    args = p.parse_args(argv)
+    if (args.trusted_ref is None) != (args.trusted_repo is None):
+        print(f"{PREFIX}: refused: --trusted-ref and --trusted-repo go together", flush=True)
+        return 2
+    try:
+        hook = load_hook(args.hook)
+    except Exception as error:  # noqa: BLE001  (a hook we cannot load refuses: never admit unchecked)
+        print(f"{PREFIX}: refused: cannot load the runner hook {args.hook.name} ({type(error).__name__})", flush=True)
+        return 1
+    env = os.environ
+    event = hook.load_event(env.get("GITHUB_EVENT_PATH"))
+    if args.trusted_ref is not None:
+        why = trusted_refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"),
+                              event, env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"), env.get("GITHUB_RUN_ATTEMPT"),
+                              args.trusted_ref, args.trusted_repo)
+    else:
+        why = refusal(hook, env.get("GITHUB_EVENT_NAME"), env.get("GITHUB_REF"), env.get("GITHUB_REPOSITORY"), event,
+                      env.get("GITHUB_WORKFLOW_REF"), env.get("GITHUB_JOB"))
+    if not why:
+        why = newest_first_refusal(hook, env)
+    if why:
+        print(f"{PREFIX}: refused: {why}", flush=True)
+        print(f"::error::{PREFIX}: refused: {why}", flush=True)
+        return 1
+    print(f"{PREFIX}: admitted: {hook.workflow_file(env.get('GITHUB_WORKFLOW_REF'))} {env.get('GITHUB_JOB')} on "
+          f"{env.get('GITHUB_REF')} ({'trusted ' + args.trusted_ref if args.trusted_ref else NIGHTLY_ONLY_LABEL})",
+          flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

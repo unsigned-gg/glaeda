@@ -4,6 +4,8 @@
 
 Accepted for the local preview prototype.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 Preview-slot planning decides whether a verified artifact creates, renews, or replaces a live preview. The next layer needs an exact local container specification without granting repository code a Podman socket or allowing raw image, limit, name, label, or command strings to reach an executor.

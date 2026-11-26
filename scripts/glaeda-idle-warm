@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""glaeda-idle-warm: while an owned cmux mini is idle, build main's head into a root whose kept build is far.
+"""glaeda-idle-warm: while an owned cmux mini is idle, build NEXT's tip (feat-cmux-next) into a root whose kept build is far.
 
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
     glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
@@ -54,6 +54,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -69,6 +70,13 @@ from typing import Any
 FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
 HOME = Path.home()
 REPO_URL = os.environ.get("GLAEDA_IDLE_WARM_REPO", "https://github.com/manaflow-ai/cmux.git")
+# The branch an idle root keeps building: cmux NEXT's tip. Classic `main` is no longer maintained, and every PR
+# the owned minis compile now merges onto feat-cmux-next, so a root warmed at main's head was far for all of them.
+# An idle Mac that keeps building the tip is also the simple fallback that the tip still builds between nightlies
+# (Leo, 2026-11-12: "we still want to ensure that things work. there is the fallback simple route of 'this one just
+# keeps building that shit'"). "main" in the names below means this branch.
+BRANCH = os.environ.get("GLAEDA_IDLE_WARM_BRANCH") or "feat-cmux-next"
+BRANCH_REFSPEC = f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"
 # Hostnames (lowercase, no .local) this never runs on: cmux-mac-mini (production iOS soak, hostname
 # cmuxs-Mac-mini-5) and Lawrence's machines (the fleet coordinator and subrouter).
 NEVER_HOSTS = ("cmuxs-mac-mini-5",)
@@ -144,6 +152,7 @@ def load_hook(runner_dir: Path) -> Any:
     loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_warm", os.fspath(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -198,7 +207,7 @@ def running() -> str:
 
 # Job classes (glaeda-cmux-runner-hook) whose start or end restarts the quiet window: the compiles and the
 # simulator builds, which a catch-up would slow most. Light, product and gui test jobs no longer do.
-QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated")
+QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated", "tour")
 
 
 def compile_state(path: Path = JOB_LOG, now: float | None = None) -> tuple[float | None, str]:
@@ -283,8 +292,11 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     level = hook.thermal_pressure_level()
     if level is None or level > 0:
         return f"thermal pressure {level if level is not None else 'unknown'}"
-    # No free-disk gate of its own: a catch-up rebuilds a kept root in place, and disk-pressure keeps the
-    # fleet's free-space policy (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming).
+    # No free-disk floor of its own (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming),
+    # but the nightly reserve every PR runner keeps (nightly_reserve_refusal) holds here too.
+    why = nightly_reserve_refusal(hook)
+    if why:
+        return why
     host_lock = os.fspath(FLEET_DIR / "host.lock")
     held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
     if held:
@@ -294,12 +306,71 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     return ""
 
 
+def nightly_reserve(hook: Any) -> tuple[float, float] | None:
+    """(the dedicated nightly builder's disk floor here, one job's growth) in GiB from the runners' own hook
+    (builder_reserve_gib, job_disk_gib); (0, 0) with no dedicated builder or a hook that predates those helpers;
+    None when they fail or answer something that is not a finite number, which keeps a catch-up from starting."""
+    if not (hasattr(hook, "builder_reserve_gib") and hasattr(hook, "job_disk_gib")):
+        return 0.0, 0.0
+    try:
+        builder = float(hook.builder_reserve_gib(HOME))
+        growth = float(hook.job_disk_gib())
+    except Exception:  # noqa: BLE001 - a reserve we cannot read is not a reserve we may ignore
+        return None
+    if not (math.isfinite(builder) and math.isfinite(growth)) or builder < 0 or growth < 0:
+        return None
+    return (builder, growth) if builder > 0 else (0.0, 0.0)
+
+
+def nightly_waiter_refusal(hook: Any) -> str:
+    """Why a nightly job's wait for free disk keeps a catch-up off (it waits, or its markers cannot be read), or ''.
+    A hook without nightly_disk_waiter predates the reserve: nothing to read."""
+    if not hasattr(hook, "nightly_disk_waiter"):
+        return ""
+    try:
+        # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
+        with os.scandir(FLEET_DIR / "capacity"):
+            pass
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    try:
+        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+    except Exception as error:  # noqa: BLE001
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    return f"a nightly job waits here for free disk ({waiter})" if waiter else ""
+
+
+def nightly_reserve_refusal(hook: Any) -> str:
+    """Why a catch-up must not start for the nightly builder's disk, or ''. A PR runner on a mini with a dedicated
+    nightly builder listens only with the builder's floor plus one job's growth free, and none starts while a
+    nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
+    On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
+    listener was held off and every PR runner with it."""
+    why = nightly_waiter_refusal(hook)
+    if why:
+        return why
+    reserve = nightly_reserve(hook)
+    if reserve is None:
+        return "cannot read the dedicated nightly builder's disk reserve"
+    builder, growth = reserve
+    if builder <= 0:
+        return ""
+    free = free_bytes(FLEET_DIR)
+    need = (builder + growth) * 1024 ** 3
+    if free is None or free < need:
+        return (f"{(free or 0) / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's {builder:g} GiB "
+                f"floor + {growth:g} GiB for a build")
+    return ""
+
+
 # ---------------------------------------------------------------- which root
 
 
 def mirror_head(mirror: Path) -> str:
     try:
-        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
+        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", f"refs/remotes/origin/{BRANCH}"],
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -310,7 +381,7 @@ def mirror_head(mirror: Path) -> str:
 def remote_head() -> str:
     """Main's head on GitHub (one unauthenticated ls-remote, no API quota), or '' when it cannot say."""
     try:
-        out = subprocess.run([GIT, "ls-remote", REPO_URL, "refs/heads/main"], capture_output=True, text=True,
+        out = subprocess.run([GIT, "ls-remote", REPO_URL, f"refs/heads/{BRANCH}"], capture_output=True, text=True,
                              timeout=LS_REMOTE_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -335,7 +406,7 @@ def main_head(state: Path) -> str:
         lock = os.open(mirror.parent / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         subprocess.run([GIT, "-C", os.fspath(mirror), "fetch", "-q", "--filter=blob:none",
-                        f"--depth={MIRROR_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                        f"--depth={MIRROR_DEPTH}", "origin", BRANCH_REFSPEC],
                        capture_output=True, timeout=MIRROR_FETCH_TIMEOUT_S,
                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.SubprocessError):
@@ -478,22 +549,35 @@ def own_group() -> bool:
         return False
 
 
-def kill_build(passes: int = 3) -> None:
-    """SIGKILL every other process in our group (the build and anything it started)."""
+def kill_build(passes: int = 3) -> bool:
+    """SIGKILL every other process in our group (the build and anything it started); whether the group was seen
+    empty (False when ps failed or members outlived every pass)."""
     me = os.getpid()
     for _ in range(passes):
         try:
-            out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=2).stdout
+            ps = subprocess.Popen(["/bin/ps", "-axo", "pid=,pgid="], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return False
+        try:
+            out, _ = ps.communicate(timeout=2)
         except (OSError, subprocess.SubprocessError):
-            return
+            with contextlib.suppress(OSError):
+                ps.kill()
+            with contextlib.suppress(OSError, subprocess.SubprocessError):  # bounded: the caller escalates
+                ps.wait(timeout=2)
+            return False
+        if ps.returncode != 0:  # a failed ps lists nothing, which is not an empty group
+            return False
+        # ps runs in our group too: it is not a member to kill or to wait for
         members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
-                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) != me]
+                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) not in (me, ps.pid)]
         if not members:
-            return
+            return True
         for pid in members:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         time.sleep(0.05)
+    return False
 
 
 def stop_fuzz_child() -> None:
@@ -557,6 +641,65 @@ def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
 
 
+# The catch-up checkout reads cmux's objects through the mini's one full mirror (glaeda-git-mirror) instead of
+# keeping its own copy. Leo, 2026-11-18: seeds and shared caches are read through, not copied to the internal disk.
+# Without it the checkout held every blob of the tip it built (1.21 GB for a feat-cmux-next tip, cmuxterm-hq RFD
+# 0008) and each later head's changed blobs, beside a mirror on the same disk that already had them all. The mirror
+# never removes an object (gc.auto 0, `repack --geometric`), which is what makes borrowing it safe; a rebuilt
+# mirror (a reseed is a new directory) may lack an object the checkout relied on, so the checkout records which
+# mirror it borrowed (as the runner hook's borrowers do) and starts over when that changes. A mini with no usable
+# mirror clones from GitHub as before.
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+BORROW_REPACK_TIMEOUT_S = 300
+
+
+def git_mirror() -> Path:
+    return Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git") / "cmux.git"
+
+
+def mirror_identity(mirror: Path) -> dict[str, Any] | None:
+    """The mirror's objects directory when it is a usable full mirror (glaeda-git-mirror verified it, no repair
+    pending, not shallow), as {"objects", "ino", "birth"}; else None. The runner hook's test, kept in step."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not os.path.isdir(objects) or objects.is_symlink() or mirror.is_symlink() \
+                or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+    except OSError:
+        return None
+    identity: dict[str, Any] = {"objects": os.fspath(objects), "ino": st.st_ino}
+    if (birth := getattr(st, "st_birthtime", None)) is not None:
+        identity["birth"] = birth
+    return identity
+
+
+def borrowed(git_dir: Path) -> tuple[list[str], Any]:
+    """The checkout's alternates and its borrow record (None when it has none or it cannot be read)."""
+    try:
+        alternates = [line.strip() for line in (git_dir / "objects/info/alternates").read_text().splitlines()
+                      if line.strip()]
+    except OSError:
+        alternates = []
+    try:
+        recorded = json.loads((git_dir / BORROW_RECORD).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    return alternates, recorded
+
+
+def borrow(git_dir: Path, identity: dict[str, Any]) -> None:
+    """Point GIT_DIR's object store at the mirror's and record which mirror that is."""
+    info = git_dir / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(identity["objects"] + "\n")
+    incoming = git_dir / f".{BORROW_RECORD}.{os.getpid()}"
+    incoming.write_text(json.dumps(identity) + "\n")
+    incoming.rename(git_dir / BORROW_RECORD)
+
+
 def prepare_checkout(work: Path, head: str) -> None:
     """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after.
 
@@ -565,20 +708,41 @@ def prepare_checkout(work: Path, head: str) -> None:
     cmux-austin-mini-0 GitHub sent it at about 0.6 MB/s (0.9 GB in 25 minutes, 2026-09-27), so the
     30-minute timeout ended every first clone and the next run started it over. The build reads only the
     checkout, and the seed lookup only main's first 50 first-parent ancestors (CMUX_SEED_GIT_DIR); git fetches
-    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small."""
+    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small.
+
+    Where the mini keeps a usable git mirror, the checkout borrows its objects (BORROW_RECORD above): the clone
+    and each fetch take from GitHub only what the mirror lacks, and the checked-out blobs are read from the
+    mirror, not stored again. A checkout cloned before it borrowed drops its own copies once (`repack -a -d -l`)."""
     checkout = work / "cmux"
-    if not (checkout / ".git").is_dir():
+    git_dir = checkout / ".git"
+    mirror = mirror_identity(git_mirror())
+    if git_dir.is_dir():
+        alternates, recorded = borrowed(git_dir)
+        if alternates and (mirror is None or alternates != [mirror["objects"]] or not isinstance(recorded, dict)
+                           or recorded.get("ino") != mirror["ino"] or recorded.get("birth") != mirror.get("birth")):
+            shutil.rmtree(checkout, ignore_errors=True)  # its mirror went or was rebuilt: start over
+    repack = False
+    if not git_dir.is_dir():
         shutil.rmtree(checkout, ignore_errors=True)
+        reference = ["--reference", os.fspath(git_mirror())] if mirror is not None else []
         subprocess.run([GIT, "clone", "-q", f"--depth={CLONE_DEPTH}", "--filter=blob:none", "--no-checkout",
-                        REPO_URL, os.fspath(checkout)], check=True, capture_output=True, timeout=GIT_TIMEOUT_S,
-                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
-    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main")
+                        *reference, REPO_URL, os.fspath(checkout)], check=True, capture_output=True,
+                       timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+        if mirror is not None:
+            borrow(git_dir, mirror)
+    elif mirror is not None and not borrowed(git_dir)[0]:
+        borrow(git_dir, mirror)
+        repack = True
+    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", BRANCH_REFSPEC)
     git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
     git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
     git(checkout, "clean", "-ffdxq")
     git(checkout, "submodule", "sync", "-q", "--recursive")
     git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force", "--depth=1")
     git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
+    if repack:  # drop the local copies of what the mirror now serves; a failed repack leaves the store as it was
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            git(checkout, "repack", "-a", "-d", "-l", "-q", timeout=BORROW_REPACK_TIMEOUT_S)
 
 
 def last_result(log: Path) -> dict[str, Any]:
@@ -599,8 +763,32 @@ def last_result(log: Path) -> dict[str, Any]:
     return {}
 
 
-def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict[str, Any]:
-    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line."""
+BUILD_DISK_WATCH_S = 15.0
+END_CHILD_WAIT_S = 10.0
+
+
+def end_child() -> None:
+    """Kill the build and reap it, then kill what is left of our group (anything the build started; reaping the
+    child first, so its zombie is not counted). When the child outlives END_CHILD_WAIT_S, or the group cannot be
+    seen empty, our whole group ends, us included, so no build process outlives the locks we hold (as stop() does)."""
+    assert _child is not None
+    with contextlib.suppress(OSError):
+        _child.kill()
+    try:
+        _child.wait(timeout=END_CHILD_WAIT_S)
+    except subprocess.TimeoutExpired:
+        if _grouped:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        raise
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
+
+
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path, stop_below: int | None = None,
+          nightly_waiter: Any = None) -> dict[str, Any]:
+    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
+    stop_below, the build is killed once free disk drops under it, and with nightly_waiter (a callable: why, or
+    ''), once a nightly job waits for free disk; both are read every BUILD_DISK_WATCH_S."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
@@ -609,16 +797,37 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict
         _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
                                    os.fspath(state)], cwd=checkout, env=env, stdin=subprocess.DEVNULL,
                                   stdout=output, stderr=subprocess.STDOUT)
+    deadline = started + BUILD_TIMEOUT_S
     try:
-        code = _child.wait(timeout=BUILD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        kill_build() if _grouped else _child.kill()
-        _child.wait()
-        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s",
-                "wall_seconds": round(time.monotonic() - started, 1)}
+        while True:
+            try:
+                watched = stop_below is not None or nightly_waiter is not None
+                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if watched else BUILD_TIMEOUT_S,
+                                                        deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            free = free_bytes(FLEET_DIR) if stop_below else None
+            low = stop_below is not None and (free is None or free < stop_below)  # unknown free disk is short
+            waiting = nightly_waiter() if nightly_waiter is not None and not low else ""
+            if low or waiting or time.monotonic() >= deadline:
+                end_child()
+                if waiting:
+                    reason = f"stopped: {waiting}"
+                elif not low:
+                    reason = f"timed out after {BUILD_TIMEOUT_S} s"
+                elif free is None:
+                    reason = "stopped: cannot read free disk while the dedicated nightly builder keeps a floor"
+                else:
+                    reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
+                              f"{stop_below / 1024 ** 3:g} GiB floor")
+                return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
         _child = None
-    kill_build()  # anything the build left running in our group (a detached build service)
+    # anything the build left running in our group (a detached build service); a group that cannot be seen
+    # empty ends whole, us included, so nothing of the build outlives the locks (the attempt stays recorded)
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
     result = last_result(log)
     if not result:
         result = {"kept": "false", "reason": f"exit {code}, no result line"}
@@ -829,6 +1038,10 @@ def stage_build(state: Path, root: int, sha: str) -> Path | str:
 
 
 ENGINE_PATHS = ("scripts/fuzz", "dogfood/fuzz")
+# cmux#48852: the engine keeps the app's socket and debug log in a private 0700 dir per session. An engine before it
+# opens /tmp/cmux-debug-<tag>.sock, a world-writable path the signing-guest check refuses (a guest worker read
+# "shared_writes: writable: /private/tmp/cmux-debug-fuzz.sock" on 2026-11-22 with a build 257 commits behind main).
+ENGINE_FLOOR = "51e1abc81c8190e26b2e64e4b90270b5552c2baa"
 
 
 def stage_engine(state: Path, sha: str) -> Path | None:
@@ -838,40 +1051,74 @@ def stage_engine(state: Path, sha: str) -> Path | None:
 
     Exported, not run from the catch-up's checkout: a catch-up now runs beside the fuzzer and checks out a newer
     main under it. git archive reads committed objects only, from the catch-up checkout or the seed prefetch
-    mirror (both blobless clones of cmux; a missing blob is fetched on demand)."""
+    mirror (both blobless clones of cmux; a missing blob is fetched on demand).
+
+    A build older than ENGINE_FLOOR runs the engine at ENGINE_FLOOR instead: the engine only drives the app
+    through its socket, and an older one leaves a world-writable socket in /tmp. A repo that cannot tell
+    (the floor not fetched yet) is skipped, never exported at the old sha."""
     override = os.environ.get("GLAEDA_IDLE_FUZZ_ENGINE")
     if override:
         checkout = Path(override)
         return checkout if (checkout / "scripts" / "fuzz").is_file() and (checkout / "dogfood" / "fuzz").is_dir() else None
     engines = fuzz_dir() / "engines"
     final = engines / sha
-    if (final / ".complete").is_file():
+    if (final / ".complete").is_file() and engine_at_floor(final):
         return final
     engines.mkdir(parents=True, exist_ok=True)
     for stale in engines.glob(".*"):
         shutil.rmtree(stale, ignore_errors=True)
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH}
     for repo in (["-C", os.fspath(state / ".catch-up" / "cmux")], ["--git-dir", os.fspath(state / ".prefetch" / "cmux.git")]):
-        incoming = engines / f".{sha}.{os.getpid()}"
+        at = engine_sha(repo, sha, git_env)
+        if at is None:
+            continue
+        if at != sha and (engines / at / ".complete").is_file():
+            return engines / at
+        incoming = engines / f".{at}.{os.getpid()}"
         incoming.mkdir()
         try:
-            archive = subprocess.run([GIT, *repo, "archive", "--format=tar", sha, "--", *ENGINE_PATHS],
-                                     capture_output=True, timeout=300,
-                                     env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+            archive = subprocess.run([GIT, *repo, "archive", "--format=tar", at, "--", *ENGINE_PATHS],
+                                     capture_output=True, timeout=300, env=git_env)
             if archive.returncode == 0:
                 subprocess.run(["/usr/bin/tar", "-xf", "-", "-C", os.fspath(incoming)], input=archive.stdout,
                                check=True, capture_output=True, timeout=120)
                 if (incoming / "scripts" / "fuzz").is_file() and (incoming / "dogfood" / "fuzz").is_dir():
-                    (incoming / ".complete").write_text(sha + "\n")
-                    shutil.rmtree(final, ignore_errors=True)
-                    incoming.rename(final)
+                    (incoming / ".complete").write_text(at + "\n")
+                    target = engines / at
+                    shutil.rmtree(target, ignore_errors=True)
+                    incoming.rename(target)
                     for old in staged("engines", ".complete")[FUZZ_KEEP_ENGINES:]:
                         shutil.rmtree(old, ignore_errors=True)
-                    return final
+                    return target
         except (OSError, subprocess.SubprocessError):
             pass
         shutil.rmtree(incoming, ignore_errors=True)
-    kept = staged("engines", ".complete")
+    kept = [path for path in staged("engines", ".complete") if engine_at_floor(path)]
     return kept[0] if kept else None
+
+
+def engine_sha(repo: list[str], sha: str, env: dict) -> str | None:
+    """The commit to export the engine from for build SHA in REPO: SHA when ENGINE_FLOOR is in its history, else
+    ENGINE_FLOOR; None when REPO cannot tell (no such commit, git failed)."""
+    try:
+        done = subprocess.run([GIT, *repo, "merge-base", "--is-ancestor", ENGINE_FLOOR, sha],
+                              capture_output=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return sha
+    if done.returncode == 1:
+        return ENGINE_FLOOR
+    return None
+
+
+def engine_at_floor(path: Path) -> bool:
+    """A staged engine exported before ENGINE_FLOOR still writes the shared socket: only a fallback at or past
+    it may run. Its own app.py says which: #48852's private dir is a mkdtemp."""
+    try:
+        return "mkdtemp" in (path / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def pending_replay(now: float | None = None) -> Path | None:
@@ -1167,9 +1414,10 @@ def run_replay(hook: Any, capacity: Path, ours: str, build: Path, request: Path,
 
 def dismiss_crash_dialogs() -> None:
     """A crash the fuzzer caused leaves macOS's crash dialog (not in our process group) on the console, over the
-    next GUI job: close it."""
+    next GUI job: close it. -u: only this user's dialog (the job's own), never another account's."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(["/usr/bin/pkill", "-9", "-x", "Problem Reporter"], capture_output=True, timeout=2)
+        subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-x", "Problem Reporter"],
+                       capture_output=True, timeout=2)
 
 
 # ---------------------------------------------------------------- run
@@ -1280,6 +1528,14 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             busy = running()  # a job that started while the locks were taken: it will ask for them
             if busy:
                 return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            # the reserve and the nightly waiters again, now the locks are ours: either may have changed since
+            why = nightly_reserve_refusal(hook)
+            if why:
+                return {**base, "state": "skip", "reason": why}
+            reserve = nightly_reserve(hook)
+            if reserve is None:
+                return {**base, "state": "skip", "reason": "cannot read the dedicated nightly builder's disk reserve"}
+            builder = reserve[0]
             logs = work / "logs"
             logs.mkdir(exist_ok=True)
             log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
@@ -1287,7 +1543,9 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
             memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
             save_memory(memory_path, memory)
-            result = build(work / "cmux", root, state, scope["xcode"], log)
+            result = build(work / "cmux", root, state, scope["xcode"], log,
+                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None,
+                           nightly_waiter=(lambda: nightly_waiter_refusal(hook)) if builder > 0 else None)
             memory.pop("attempt", None)
             trim_logs(logs)
         finally:

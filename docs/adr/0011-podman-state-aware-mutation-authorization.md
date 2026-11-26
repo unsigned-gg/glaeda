@@ -4,6 +4,8 @@
 
 Accepted for the local preview prototype.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 ADR 0010 binds exact Podman inspection evidence to a successful reviewed command. Exact ownership alone does not make every container operation sensible. A managed container may already be running, paused, stopping, removing, or dead.

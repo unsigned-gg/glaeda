@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -39,13 +40,16 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 
 def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: str | None = "present",
-                   store: str | None = None, stats: dict[str, int] | None = None, **kinds: str) -> str:
+                   store: str | None = None, stats: dict[str, int] | None = None, relay: str | None = None,
+                   **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
              for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
     if store:
         lines.append(f"fleet_cas_store\t{store}")
+    if relay:
+        lines.append(f"fleet_cas_relay\t{relay}")
     lines += [f"fleet_cas_stat\t{k}|{v}" for k, v in (stats or {}).items()]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
@@ -57,7 +61,9 @@ def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: s
 def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordinator", "operator"),
                extra_keys: tuple[str, ...] = (), clone: bool = True, license_: str = "26.3",
                worker: str = "running pid=10", node_id: str | None = "cmux-mac-001",
-               worker_proc: str = "running", fleet_cas: str | None = None) -> str:
+               worker_proc: str = "running", fleet_cas: str | None = None,
+               sudo: str | None = None,
+               glaeda_jobs: tuple[tuple[str, str, str], ...] = ()) -> str:
     lines = [
         "user\tbuilder", "uid\t501", "admin_group\tyes", f"hostname\t{hostname}", "computer_name\tMini",
         "model\tMac16,11", "chip\tApple M4 Pro", "cpus\t14", f"memory_bytes\t{48 * 2**30}",
@@ -67,12 +73,15 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
         f"xcode_license_accepted\t{license_}",
         "disk\t/System/Volumes/Data|460|220",
         f"launchd\t/Library/LaunchDaemons|com.example.build-worker|{worker}",
-        "fleet_root\tpresent", f"fleet_worker_proc\t{worker_proc}",
+        "fleet_root\tpresent", "fleet_host_lock_tool\tpresent", f"fleet_worker_proc\t{worker_proc}",
         "runner_worker\tabsent", "host_lock\tfree",
         "ak_file\tauthorized_keys|600",
     ]
     if node_id is not None:
         lines.append(f"fleet_node_id\t{node_id}")
+    if sudo is not None:
+        lines.append(f"sudo\t{sudo}")
+    lines.extend(f"launchd\t{domain}|{label}|{state}" for domain, label, state in glaeda_jobs)
     if clone:
         lines.append("xcode_app\t/Applications/Xcode_26.3.app|dir|26.3|17C529")
     for key in keys:
@@ -155,6 +164,28 @@ class ManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(mf.Failure, "unknown roles"):
                 mf.load_manifest(path)
 
+    def test_alias_selects_its_host(self) -> None:
+        data = copy.deepcopy(self.manifest)
+        first = next(iter(data["hosts"]))
+        data["hosts"][first]["alias"] = "browser-a"
+        self.assertEqual(mf.select_hosts(data, ["browser-a"]), [first])
+        self.assertEqual(mf.select_hosts(data, [first]), [first])
+
+    def test_bad_or_duplicate_alias_is_refused(self) -> None:
+        names = list(self.manifest["hosts"])
+        cases = [({names[0]: "Browser A"}, "lowercase"),
+                 ({names[0]: "dup", names[1]: "dup"}, "names both"),
+                 ({names[0]: names[1]}, "names both")]
+        for aliases, message in cases:
+            data = copy.deepcopy(self.manifest)
+            for host, alias in aliases.items():
+                data["hosts"][host]["alias"] = alias
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, message):
+                    mf.load_manifest(path)
+
     def test_unknown_key_reference_is_refused(self) -> None:
         data = copy.deepcopy(self.manifest)
         data["defaults"]["authorized_keys"]["allow"].append("ghost")
@@ -185,6 +216,106 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+
+class AdmitTests(unittest.TestCase):
+    """admit: new hosts into the manifest from what the probe saw."""
+
+    M5 = ("model\tMac17,9", "chip\tApple M5 Pro", "cpus\t15", f"memory_bytes\t{64 * 2**30}")
+
+    def m5_probe(self, hostname: str, extra_xcode: bool = True, node_id: str | None = None) -> str:
+        text = probe_text(hostname=hostname, node_id=node_id, sudo="password")
+        text = (text.replace("model\tMac16,11", self.M5[0]).replace("chip\tApple M4 Pro", self.M5[1])
+                .replace("cpus\t14", self.M5[2]).replace(f"memory_bytes\t{48 * 2**30}", self.M5[3]))
+        if extra_xcode:
+            text += "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|18A100\n" \
+                    "xcode_app\t/Applications/Xcode-beta.app|symlink|27.1|18B5\n"
+        return text
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "m.json"
+        shutil.copy(EXAMPLE, self.path)
+        self.manifest = mf.load_manifest(self.path)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_new_class_hosts_node_ids_and_installed_xcode_labels(self) -> None:
+        obs = observed(**{"cmux25": self.m5_probe("cmux25"), "cmux26": self.m5_probe("cmux26", extra_xcode=False)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["cmux25", "cmux26"], "std")
+        self.assertEqual(plan["hardware"], {"m5pro-64": {"model": "Mac17,9", "chip": "Apple M5 Pro", "cpus": 15,
+                                                         "memory_gib": 64}})
+        a, b = plan["hosts"]["cmux25"], plan["hosts"]["cmux26"]
+        self.assertEqual((a["node_id"], b["node_id"]), ("cmux-mac-003", "cmux-mac-004"))
+        self.assertEqual((a["hardware"], a["class"], a["availability"], a["roles"], a["sudo"]),
+                         ("m5pro-64", "std", "dedicated", ["ci-runner"], "password"))
+        # The symlinked beta is not a complete app; the real 27.0 becomes a label source.
+        paths = [x["path"] for x in a["overrides"]["xcode"]["apps"]]
+        self.assertIn("/Applications/Xcode_27.0.app", paths)
+        self.assertNotIn("/Applications/Xcode-beta.app", paths)
+        self.assertNotIn("overrides", b)
+        self.assertTrue(any("onboard --acceptance node" in n for n in notes))
+        raw = json.loads(self.path.read_text())
+        raw["hardware"].update(plan["hardware"])
+        raw["hosts"].update(plan["hosts"])
+        merged = mf.load_manifest(self.path, json.dumps(raw))
+        summary, why = mf.labels.member_labels(merged, "cmux25", lambda app: True)
+        self.assertIsNone(why)
+        self.assertIn("xcode-27.0", summary["labels"])
+        self.assertIn("xcode-26.3", summary["labels"])
+
+    def test_matching_hardware_is_reused_and_members_left_alone(self) -> None:
+        obs = observed(**{"build-mini-9": probe_text(hostname="build-mini-9", node_id=None)})
+        plan, notes = mf.admit_plan(self.manifest, obs, ["build-mini-9", "build-mini-1"], "xl")
+        self.assertEqual(plan["hardware"], {})
+        self.assertEqual(plan["hosts"]["build-mini-9"]["hardware"], "m4pro-48")
+        self.assertIn("build-mini-1: already a member; left alone", notes)
+
+    def test_refuses_unreachable_never_touch_and_wrong_hardware(self) -> None:
+        with self.assertRaisesRegex(mf.Failure, "not reachable"):
+            mf.admit_plan(self.manifest, {"hosts": {"x": {"reachable": False, "error": "timeout"}}}, ["x"], "std")
+        with self.assertRaisesRegex(mf.Failure, "never_touch"):
+            mf.admit_plan(self.manifest, {"hosts": {}}, ["coordinator-mini"], "std")
+        obs = observed(cmux25=self.m5_probe("cmux25"))
+        with self.assertRaisesRegex(mf.Failure, "not hardware m4pro-48"):
+            mf.admit_plan(self.manifest, obs, ["cmux25"], "std", "m4pro-48")
+
+    def test_cli_dry_run_then_yes_writes_a_manifest_that_loads(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"))))
+        before = self.path.read_text()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path)]), 0)
+        self.assertIn('"m5pro-64"', out.getvalue())
+        self.assertIn("dry run", out.getvalue())
+        self.assertEqual(self.path.read_text(), before)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mf.main(["admit", "cmux25", "--manifest", os.fspath(self.path),
+                                      "--observed", os.fspath(obs_path), "--yes"]), 0)
+        self.assertEqual(mf.load_manifest(self.path)["hosts"]["cmux25"]["hardware"], "m5pro-64")
+
+
+    def test_bringup_dry_run_prints_the_seed_sequence_and_changes_nothing(self) -> None:
+        obs_path = Path(self.tmp.name) / "obs.json"
+        obs_path.write_text(json.dumps(observed(cmux25=self.m5_probe("cmux25"), cmux26=self.m5_probe("cmux26"))))
+        before = self.path.read_text()
+        proc = subprocess.run([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-mini-bringup"), "cmux25", "cmux26",
+                               "--manifest", os.fspath(self.path), "--observed", os.fspath(obs_path),
+                               "--registry-out", self.tmp.name], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("onboard cmux25 --manifest", out)
+        self.assertIn("--acceptance node", out)
+        self.assertIn("upgrade cmux25", out)
+        self.assertIn("onboard cmux26 --manifest", out)
+        self.assertIn("--from cmux25", out)
+        self.assertIn("--hosts cmux25,cmux26", out)
+        self.assertEqual(self.path.read_text(), before)
+        entry = json.loads((Path(self.tmp.name) / "cmux25.json").read_text())
+        self.assertEqual((entry["runs"], entry["address"]["manaflow"]), (["ci-runner"], "cmux25.tail137216.ts.net"))
+
 class TransportTests(unittest.TestCase):
     def route_manifest(self) -> dict:
         return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {
@@ -203,6 +334,45 @@ class TransportTests(unittest.TestCase):
         result = mf.ssh_result(manifest, "aws-m4pro-7", proc)
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, "ready\n")
+
+    def test_a_lost_marker_keeps_the_transports_reason_on_the_last_line(self) -> None:
+        # A transport that refuses the hop prints its reason and no marker; the reason must survive, since
+        # observe_host keeps only the last stderr line.
+        manifest = self.route_manifest()
+        refused = "aws-enroll: only aws-m4pro-2..9 are enrollable; refusing cmux-lawrence\n"
+        proc = mf.ssh_result(manifest, "aws-m4pro-7", subprocess.CompletedProcess([], 2, "", refused))
+        last = proc.stderr.strip().splitlines()[-1]
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(mf.REMOTE_STATUS_LOST, last)
+        self.assertIn("ssh exit 2", last)
+        self.assertIn("refusing cmux-lawrence", last)
+        proc = mf.ssh_result(manifest, "aws-m4pro-7", subprocess.CompletedProcess([], 0, "partial\n", ""))
+        self.assertEqual(proc.returncode, 255)
+        self.assertIn("ssh exit 0)", proc.stderr)
+
+    def test_observe_host_says_timed_out_or_status_lost_never_just_unreachable(self) -> None:
+        manifest = self.route_manifest()
+        refused = subprocess.CompletedProcess([], 2, b"", b"aws-enroll: refusing cmux-lawrence\n")
+        with mock.patch.object(mf.subprocess, "run", return_value=refused):
+            obs = mf.observe_host(manifest, "aws-m4pro-7", b"true\n", 5)
+        self.assertFalse(obs["reachable"])
+        self.assertIn(mf.REMOTE_STATUS_LOST, obs["error"])
+        self.assertIn("refusing cmux-lawrence", obs["error"])
+        self.assertIn("refusing cmux-lawrence", obs["transport_stderr"])
+        self.assertTrue(mf.reach_failure(obs["error"]).startswith("status lost: "))
+        late = subprocess.TimeoutExpired([], 180, output=b"", stderr=b"still connecting\n")
+        with mock.patch.object(mf.subprocess, "run", side_effect=late):
+            obs = mf.observe_host(manifest, "aws-m4pro-7", b"true\n", 180)
+        self.assertEqual(obs["error"], "probe timed out after 180s")
+        self.assertEqual(obs["transport_stderr"], "still connecting\n")
+        self.assertEqual(mf.reach_failure(obs["error"]), "timed out: probe timed out after 180s")
+        self.assertEqual(mf.reach_failure("Connection refused"), "unreachable: Connection refused")
+        # An ordinary host whose receipt is lost reads the same way.
+        plain = {"ssh_user": "cmux", "hosts": {"build-mini-1": {}}}
+        with mock.patch.object(mf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"user\tcmux\n", b"")):
+            obs = mf.observe_host(plain, "build-mini-1", b"true\n", 5)
+        self.assertFalse(obs["reachable"])
+        self.assertIn(f"{mf.REMOTE_STATUS_LOST} (no status line; ssh exit 0)", obs["error"])
 
     def test_incomplete_route_fails_closed(self) -> None:
         manifest = self.route_manifest()
@@ -262,7 +432,7 @@ class ClassAndPoolTests(unittest.TestCase):
     def test_pools_publish_manifest_resources_without_host_identity(self) -> None:
         obs = observed(**{"build-mini-1": probe_text()})
         resource = mf.pools(self.manifest, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
-        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 4, "compileSlots": 1,
+        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 14, "compileSlots": 1,
                                     "canonicalRoots": 1, "guiRunners": 0, "simulatorHosts": 0})
 
         data = copy.deepcopy(self.manifest)
@@ -271,6 +441,10 @@ class ClassAndPoolTests(unittest.TestCase):
         data["hosts"]["build-mini-1"]["roles"] = ["ci-runner", "ios-simulators"]
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["simulatorHosts"], 1)
+        # guiRunners counts consoles: a mini with a session runner beside its gui runner still has one gui token
+        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 6, "guiRunners": 2}}}
+        resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource["guiRunners"], 1)
 
     def test_pools_need_an_exact_real_xcode_to_conform(self) -> None:
         for text in (probe_text().replace("|dir|26.3|17C529", "|symlink:/x|26.3|17C529"),
@@ -601,6 +775,43 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(len(ssh), 1, ssh)
             self.assertIn("lacks its declared options", ssh[0]["detail"])
 
+    LOOPBACK = 'from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding'
+
+    def test_a_declared_loopback_key_is_not_drift_and_any_other_option_still_is(self) -> None:
+        self.manifest["defaults"]["authorized_keys"]["loopback_options"] = self.LOOPBACK
+        self.manifest["defaults"]["authorized_keys"]["exclusive"] = True
+        own = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        self.assertFalse([i for i in self.issues(probe_text() + own) if i["area"] == "ssh"])
+        wide = mf.options_digest('from="10.0.0.0/8"')
+        wider = f"ak_key\tauthorized_keys|{wide}|256 {STRAY} x (ED25519)\n"
+        ssh = [i["detail"] for i in self.issues(probe_text() + wider) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+        bare = f"ak_key\tauthorized_keys|no|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        for lines in (own + bare, bare + own):  # the same key on an unrestricted line too, either order
+            ssh = [i["detail"] for i in self.issues(probe_text() + lines) if i["area"] == "ssh"]
+            self.assertEqual(sum("not allowed" in d for d in ssh), 1, ssh)
+        # a listed key restricted to loopback is still drift: it would not reach the host from anywhere else
+        listed = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {FP['coordinator']} c (ED25519)\n"
+        text = "\n".join(l for l in probe_text().splitlines() if FP["coordinator"] not in l) + "\n" + listed
+        ssh = [i["detail"] for i in self.issues(text) if i["area"] == "ssh"]
+        self.assertTrue(any("carries options" in d for d in ssh), ssh)
+        del self.manifest["defaults"]["authorized_keys"]["loopback_options"]
+        ssh = [i["detail"] for i in self.issues(probe_text() + own) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+
+    def test_loopback_options_must_take_keys_only_from_loopback(self) -> None:
+        self.assertTrue(mf.loopback_only(self.LOOPBACK))
+        for bad in ('from="127.0.0.1,10.0.0.1"', 'from="*"', 'from="!10.0.0.1,127.0.0.1"', "no-pty", 'from=""',
+                    'from="127.0.0.1",from="10.0.0.1"', 7, " " + self.LOOPBACK,
+                    'from="127.0.0.1,::1",FROM="10.0.0.1"', 'from=127.0.0.1', 'From="10.0.0.1"'):
+            data = copy.deepcopy(self.manifest)
+            data["defaults"]["authorized_keys"]["loopback_options"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, "loopback_options"):
+                    mf.load_manifest(path)
+
     def test_options_must_be_one_printable_field(self) -> None:
         for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7, 'command="x', 'no-pty, from="x"'):
             data = copy.deepcopy(self.manifest)
@@ -849,6 +1060,33 @@ class CatchUpTests(unittest.TestCase):
                                                                   "up_skipped": 8})
         self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
 
+    def test_reader_through_the_lan_relay_matches_the_relay_target(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "172.20.21.158:7450"}]
+        text = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.158:7450")
+        self.assertEqual(mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]["relay"], "172.20.21.158:7450")
+        self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
+        stale = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.99:7450")
+        (issue,) = [i for i in self.reader(stale) if "configured upstream" in i["detail"]]
+        self.assertIn("172.20.21.99:7450", issue["detail"])
+        # A relay line with a direct store is not followed: the node reads the store it names.
+        direct = fleet_cas_text(store="100.89.140.13:7450", relay="172.20.21.158:7450")
+        self.assertTrue([i for i in self.reader(direct) if "configured upstream" in i["detail"]])
+
+    def test_a_lan_relay_store_needs_the_relay_on_every_reader(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "172.20.21.158:7450",
+                                            "reader_transport": "lan-relay"}]
+        relayed = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.158:7450")
+        loaded = (("gui", mf.FLEET_CAS_RELAY_LABEL, "not running"),)
+        obs = lambda text, jobs=(): mf.check(self.manifest, observed(**{"build-mini-1": probe_text(
+            fleet_cas=text, glaeda_jobs=jobs)}), ["build-mini-1"])
+        self.assertEqual([i for i in obs(relayed, loaded) if "relay" in i["detail"] or "upstream" in i["detail"]], [])
+        (issue,) = [i for i in obs(relayed) if "fleet-cas-relay" in i["detail"]]
+        self.assertIn("not installed", issue["detail"])
+        direct = fleet_cas_text(store="172.20.21.158:7450")
+        (issue,) = [i for i in obs(direct, loaded) if "dials the store directly" in i["detail"]]
+        self.assertIn("--store-lan", issue["fix"])
+        self.assertIsNone(mf.declared_compiler_cas_transport({"cache_services": [{"kind": "compiler-cas"}]}))
+
     def test_orphaned_reader_reports_stale_upstream(self) -> None:
         self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
         self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner"]
@@ -953,6 +1191,19 @@ class IosSimulatorTests(unittest.TestCase):
         fixes = [i["fix"] for i in mf.check(self.manifest, obs, ["build-mini-1"]) if i["area"] == "ios"]
         self.assertEqual(fixes, ["xcrun simctl runtime delete 24A5390f"])
 
+    def test_an_allowed_runtime_beside_an_exclusive_pin_is_no_drift(self) -> None:
+        # The opt-in iOS 27 runtime beside the 26.5 pin (2026-11-17): carried, never required, never deleted.
+        self.manifest["defaults"]["ios_simulator"]["allowed"] = ["24A5390f"]
+        text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                "ios_device\t26.5|iPhone 17 Pro Max\n"
+                "ios_runtime\t27.0|27.0|24A5390f|com.apple.CoreSimulator.SimRuntime.iOS-27-0\n")
+        self.assertEqual(self.ios(text), [])
+        pin_only = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+                    "ios_device\t26.5|iPhone 17 Pro Max\n")
+        self.assertEqual(self.ios(pin_only), [])
+        other = text + "ios_runtime\t26.3|26.3.1|23D8133|com.apple.CoreSimulator.SimRuntime.iOS-26-3\n"
+        self.assertEqual(self.ios(other), ["extra iOS simulator runtime 26.3.1 (23D8133)"])
+
     def test_unavailable_and_malformed_runtimes(self) -> None:
         text = ("ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5|unavailable\n"
                 "ios_device\t26.5|iPhone 17 Pro Max\n"
@@ -967,7 +1218,8 @@ class IosSimulatorTests(unittest.TestCase):
     def test_declaration_is_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             for bad in ({"runtimes": ["26.5"]}, {"runtimes": ["23F77"], "devices": ["iPhone|x"]},
-                        {"exclusive": True}, {"runtimes": ["23F77"], "extra": 1}):
+                        {"exclusive": True}, {"runtimes": ["23F77"], "extra": 1},
+                        {"runtimes": ["23F77"], "allowed": ["27.0"]}, {"runtimes": ["23F77"], "allowed": "24A5390f"}):
                 data = json.loads(EXAMPLE.read_text())
                 data["defaults"]["ios_simulator"] = bad
                 with self.assertRaises(mf.Failure, msg=bad):
@@ -1179,6 +1431,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
                    brew_python3: bool = True, glaeda_lacking: str | None = "", glaeda_dirty: int = 0,
                    pins: tuple[str, ...] = ("rustup|pinned", "zig|pinned", "python@3.13|pinned"),
                    brew_dir: str | None = None, gh: str | None = "/opt/homebrew/bin/gh", secrets: tuple[str, ...] = (),
+                   git: str | None = "/usr/bin/git", submodule_skipped: bool = False,
                    **probe: object) -> str:
     """A probe plus preflight section for a host that is ready unless told otherwise."""
     lines = [probe_text(**probe).rstrip("\n").replace("user\tbuilder", f"user\t{user}"), READY_XCODE.rstrip("\n")]
@@ -1205,6 +1458,10 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
         lines.append("pf_brew_python3\t/opt/homebrew/bin/python3.13")
     if gh is not None:
         lines.append(f"pf_gh\t{gh}")
+    if git is not None:
+        lines.append(f"pf_git\t{git}")
+    if submodule_skipped:
+        lines.append("pf_submodule_skipped\tgit")
     lines += ["pf_cmux\tpresent", "pf_cmux_pin\t26", "pf_zig_min\t0.16.0" if submodules[0][0] == " " else "pf_zig_min\t"]
     lines += [f"pf_submodule\t{s}" for s in submodules]
     lines += [f"pf_setup_artifacts\t{'yes' if artifacts else 'no'}", f"pf_cmux_dirty\t{dirty}"]
@@ -1249,11 +1506,68 @@ class PreflightTests(unittest.TestCase):
     def states(self, text: str, **kwargs: object) -> dict[str, str]:
         return {k: v["state"] for k, v in self.result(text, **kwargs)["checks"].items()}
 
+    def test_a_declared_ios_runtime_missing_is_a_fix_step_never_a_delete(self) -> None:
+        self.manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True}
+        self.assertEqual(self.result(preflight_text())["checks"]["simulator"]["state"], "todo")
+        extra = "ios_runtime\t26.3|26.3.1|23D8133|com.apple.CoreSimulator.SimRuntime.iOS-26-3\n"
+        result = self.result(preflight_text() + extra)
+        check = result["checks"]["simulator"]
+        self.assertTrue(result["ready"], "a host without the runtime is still a build host")
+        self.assertEqual((check["state"], check["group"], check["detail"]), ("todo", "self", "iOS simulator runtime 23F77 missing"))
+        self.assertEqual(check["action"], {"kind": "ios_runtime", "developer": "/Applications/Xcode.app/Contents/Developer",
+                                           "build": "23F77", "need_gib": mf.IOS_RUNTIME_DOWNLOAD_GIB, "floor_gib": 30})
+        mine, _ = mf.planned_actions(result)
+        self.assertEqual([a["kind"] for a in mine], ["ios_runtime"])
+        self.assertNotIn("delete", mf.describe(mine[0]))
+        present = "ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n"
+        self.assertEqual(self.result(preflight_text() + extra + present)["checks"]["simulator"]["state"], "ok")
+        # An unavailable copy of the build is still missing.
+        unavailable = present.rstrip("\n") + "|unavailable\n"
+        self.assertEqual(self.result(preflight_text() + unavailable)["checks"]["simulator"]["state"], "todo")
+        del self.manifest["defaults"]["ios_simulator"]
+        self.assertEqual(self.result(preflight_text())["checks"]["simulator"]["state"], "info")
+
+    def test_an_ios_runtime_download_waits_for_its_disk(self) -> None:
+        self.manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        floor = self.manifest["defaults"]["disk"]["min_free_gib"] if "disk" in self.manifest["defaults"] else 30
+        short = preflight_text().replace("disk\t/System/Volumes/Data|460|220",
+                                         f"disk\t/System/Volumes/Data|460|{floor + mf.IOS_RUNTIME_DOWNLOAD_GIB - 1}")
+        check = self.result(short)["checks"]["simulator"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "person"))
+        self.assertNotIn("action", check)
+        self.assertIn(f"the download needs {floor + mf.IOS_RUNTIME_DOWNLOAD_GIB}", check["detail"])
+
     def test_ready_host_passes_every_check(self) -> None:
         result = self.result(preflight_text())
         self.assertTrue(result["ready"], result)
         self.assertEqual({k for k, v in result["checks"].items() if v["state"] not in {"ok", "info"}}, set())
         self.assertEqual(list(result["checks"]), list(mf.PREFLIGHT_CHECKS))
+
+    def test_headless_host_plan_uses_system_maintenance_agents(self) -> None:
+        # AWS EC2 Macs have no GUI login.  A plain LaunchAgent would disappear after
+        # reboot, leaving disk pressure and OTA maintenance stopped until an operator
+        # creates a GUI session.
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        text = preflight_text().replace("pf_glaeda\tpresent", "pf_glaeda\tmissing")
+        check = self.result(text)["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertIn("glaeda-mini-setup --apply --headless --ota-source", check["fix"])
+
+    def test_existing_gui_agents_are_a_headless_setup_drift(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        jobs = (("/Users/builder/Library/LaunchAgents", mf.GLAEDA_LABEL_PREFIX + "disk-pressure", "running"),)
+        check = self.result(preflight_text(sudo="nopasswd", glaeda_jobs=jobs))["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertEqual(check["state"], "fail")
+        self.assertIn("GUI LaunchAgents", check["detail"])
+        self.assertIn("--apply --headless --ota-source", check["fix"])
+
+    def test_headless_setup_requires_passwordless_sudo(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = self.result(preflight_text(sudo="password"))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["headless_sudo"]["state"], "fail")
+        self.assertEqual(result["checks"]["headless_sudo"]["group"], "person")
 
     def test_missing_rustdoc_is_a_repairable_rust_toolchain_failure(self) -> None:
         text = preflight_text().replace("pf_tool\trustdoc|/opt/homebrew/bin/rustdoc|rustdoc 1.88.0 (abc 2025-06-23)\n", "")
@@ -1373,6 +1687,114 @@ class PreflightTests(unittest.TestCase):
         checks = self.result(preflight_text())["checks"]
         self.assertEqual(checks["secrets"], {"state": "ok", "detail": "none readable by builder", "fix": "", "group": ""})
         self.assertEqual(list(checks)[-1], "secrets")
+
+    # POOL_USER (cmuxterm-hq#18007): PR pool runners run as runner.poolUser, so its reads decide the verdict.
+    POOL = "cmux-pr-runner"
+
+    def pool_text(self, *entries: str, done: str | None = POOL, home: str = "/Users/cmux-pr-runner",
+                  **kwargs: object) -> str:
+        lines = [f"pf_pool_user\t{self.POOL}", f"pf_pool_home\t{home}"]
+        lines += [f"pf_pool_secret\t{e}" for e in entries]
+        if done:
+            lines.append(f"pf_pool_secret_done\t{done}")
+        return preflight_text(**kwargs) + "pf_home\t/Users/builder\n" + "\n".join(lines) + "\n"
+
+    def set_pool(self) -> None:
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["runner"] = {"poolUser": self.POOL}
+
+    def test_pool_probe_lines_parse(self) -> None:
+        text = self.pool_text("/Users/builder/.ssh/id_ed25519|eacces", "/Users/Shared/a|b.token|readable",
+                              "/Users/builder/.netrc|errno-ENOENT")
+        pf = mf.parse_probe(text)["preflight"]
+        self.assertEqual(pf["pool_user"], self.POOL)
+        self.assertEqual(pf["pool_home"], "/Users/cmux-pr-runner")
+        self.assertEqual(pf["pool_secrets"], [{"path": "/Users/builder/.ssh/id_ed25519", "state": "eacces"},
+                                              {"path": "/Users/Shared/a|b.token", "state": "readable"},
+                                              {"path": "/Users/builder/.netrc", "state": "errno-ENOENT"}])
+        self.assertEqual(pf["pool_secrets_done"], self.POOL)
+        plain = mf.parse_probe(preflight_text())["preflight"]
+        self.assertEqual((plain["pool_user"], plain["pool_secrets"], plain["pool_secrets_done"]), (None, [], None))
+
+    def test_preflight_script_passes_the_pool_user(self) -> None:
+        self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        self.set_pool()
+        self.assertIn(b"POOL_USER=cmux-pr-runner\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        for bad in ("root", "Has Space", 3, "x;rm"):
+            self.manifest["hosts"]["build-mini-1"]["overrides"]["runner"]["poolUser"] = bad
+            self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+
+    def test_pool_user_getting_eacces_everywhere_is_ok(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # No login runners: the login user's own read is only shown.
+        result = self.result(self.pool_text(f"{key}|eacces", "/Users/Shared/cmux-build-fleet/secrets/r2.token|eacces",
+                                            secrets=(), runners=()))
+        self.assertEqual(result["checks"]["secrets"], {
+            "state": "ok", "detail": f"none readable by {self.POOL}, the user PR jobs run as (2 files give it EACCES)",
+            "fix": "", "group": ""})
+        self.assertTrue(result["ready"], result)
+
+    def test_a_file_the_pool_user_can_open_fails(self) -> None:
+        self.set_pool()
+        key, token = "/Users/builder/.ssh/id_ed25519", "/Users/cmux-pr-runner/.secrets/gh.token"
+        result = self.result(self.pool_text(f"{key}|eacces", f"{token}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {token}")
+        self.assertIn("cmuxterm-hq#18007", check["fix"])
+        self.assertIn("EACCES", check["fix"])
+        self.assertFalse(result["ready"])
+
+    def test_an_errno_other_than_eacces_fails(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|errno-ENOENT", runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "fail")
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {key} (errno-ENOENT)")
+
+    def test_an_incomplete_pool_read_is_unknown_and_blocks(self) -> None:
+        self.set_pool()
+        for text in (self.pool_text("/Users/builder/.netrc|eacces", done=None, runners=()),
+                     self.pool_text(done="builder", runners=()), preflight_text(runners=())):
+            result = self.result(text)
+            check = result["checks"]["secrets"]
+            self.assertEqual((check["state"], check["group"]), ("unknown", "person"))
+            self.assertEqual(check["detail"],
+                             f"could not read the secret files as {self.POOL} (sudo -n -u {self.POOL} failed?)")
+            self.assertIn("cmuxterm-hq#18007", check["fix"])
+            self.assertFalse(result["ready"], result)
+        self.assertIn("secrets", mf.UNKNOWN_BLOCKS)
+
+    def test_accepted_secrets_cover_the_pool_users_home(self) -> None:
+        self.set_pool()
+        own, shared = "/Users/cmux-pr-runner/.config/gh/hosts.yml", "/Users/Shared/x.token"
+        self.manifest["hosts"]["build-mini-1"]["accepted_secrets"] = ["~/.config/gh/hosts.yml", shared]
+        result = self.result(self.pool_text(f"{own}|readable", f"{shared}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (0 files give it "
+                                          f"EACCES); accepted: {own}, {shared}")
+        self.assertTrue(result["ready"], result)
+
+    def test_login_user_secrets_with_a_pool_user(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # The login user runs no runners: its own reads are information.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,), runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (1 files give it "
+                                          f"EACCES); readable by builder, which runs no PR runners (poolUser "
+                                          f"{self.POOL}): {key}")
+        # The login user still has a runner registered: as today, its reads fail.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
+        self.assertIn("cmuxterm-hq#595", check["fix"])
+
+    def test_without_a_pool_user_the_pool_lines_change_nothing(self) -> None:
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|readable", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
 
     def test_node_id_is_required_before_enrollment(self) -> None:
         checks = self.result(preflight_text(enroll_state=None, acceptance=None, node_id=None), host="small-mini")["checks"]
@@ -1558,6 +1980,209 @@ class PreflightTests(unittest.TestCase):
         old = self.result(preflight_text(gh=None))
         self.assertEqual((old["checks"]["gh"]["state"], old["ready"]), ("unknown", True))
 
+    def test_homebrew_git_policy_installs_git_on_that_host_only(self) -> None:
+        # Xcode's git ran git submodule from inside Xcode.app, where each command waited on an unanswered privacy
+        # prompt (about 100 s per call); hosts with git.source homebrew get Homebrew's git first on the workload PATH.
+        plain = self.result(preflight_text())
+        self.assertEqual((plain["checks"]["git"]["state"], plain["ready"]), ("info", True))
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["git"] = {"source": "homebrew"}
+        result = self.result(preflight_text(brew_owner="admin"))
+        check = result["checks"]["git"]
+        self.assertFalse(result["ready"])
+        self.assertEqual((check["state"], check["group"], check["fix"]),
+                         ("fail", "password", "sudo -u admin brew install git"))
+        self.assertEqual(check["action"], {"kind": "brew", "formula": "git", "owner": "admin"})
+        _, root = mf.planned_actions(result)
+        self.assertEqual([(a["kind"], a["formulas"]) for a in root], [("brew", ["git"])])
+        script = mf.sudo_plan_script(self.manifest, "build-mini-1", result)
+        self.assertIn('[ -e "/opt/homebrew/bin/git" ] || brew_as link git', script)
+        self.assertNotIn("brew_as pin", script)  # no class receipt names git
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        done = self.result(preflight_text(git="/opt/homebrew/bin/git"))
+        self.assertEqual((done["checks"]["git"]["state"], done["ready"]), ("ok", True))
+        old = self.result(preflight_text(git=None))
+        self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("fail", False))
+        del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
+
+    def test_every_brew_command_is_bounded_and_the_bound_kills_the_whole_tree(self) -> None:
+        # A `brew install git` from sudo-plan once sat 8 h 15 min: nothing on either side ever stopped it.
+        for owner_steps in (mf.brew_commands("builder", ["git"], False), mf.brew_commands("admin", ["git"], True, True)):
+            script = "\n".join(owner_steps)
+            brew_as = next(line for line in owner_steps if line.startswith("brew_as()"))
+            self.assertIn(f'/usr/bin/perl -e "$brew_bound" {mf.BREW_COMMAND_TIMEOUT} env HOMEBREW_NO_ASK=1 '
+                          '/opt/homebrew/bin/brew "$@"', brew_as)
+            self.assertEqual(script.count("/opt/homebrew/bin/brew"), 1, script)  # no brew call skips brew_as
+            subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # Run as the Homebrew owner (inside sudo -u), so it may signal what brew starts.
+        self.assertIn('brew_as() { local rc=0; sudo -H -u admin /usr/bin/perl -e "$brew_bound"',
+                      "\n".join(mf.brew_commands("admin", ["git"], True, True)))
+        bound = ["perl", "-e", mf.BREW_BOUND]
+        # Under the limit: the command's own exit code, and its signal as 128+N.
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "exit 3"]).returncode, 3)
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "kill -TERM $$"]).returncode, 128 + 15)
+        # Past the limit: exit 124, and a child in a process group of its own (as Homebrew starts curl) dies too.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            stuck = ("if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } $SIG{TERM} = 'IGNORE'; sleep 300")
+            started = time.monotonic()
+            run = subprocess.run([*bound, "1", "perl", "-e", stuck, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertIn("timed out after 1s", run.stderr)
+            child = int(pidfile.read_text())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout
+                if not state.strip() or state.strip().startswith("Z"):
+                    break
+                time.sleep(0.2)
+            else:
+                os.kill(child, 9)
+                self.fail(f"the bound left pid {child} running")
+        # An orphan: the parent dies on SIGTERM and leaves a child that ignores it, in a group of its own and no
+        # longer under anything of ours; the bound still finds it (same pid, same start) and kills it.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            orphan = ("if (!fork) { setpgrp(0, 0); $SIG{TERM} = 'IGNORE'; open(my $f, '>', $ARGV[0]) or die; "
+                      "print $f $$; close $f; exec 'sleep', '300' } sleep 300")
+            run = subprocess.run([*bound, "1", "perl", "-e", orphan, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
+        # Orphaned before the limit: an intermediate process starts a child in a group of its own and exits.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            early = ("if (!fork) { if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } select(undef, undef, undef, 0.5); exit 0 } wait; sleep 300")
+            run = subprocess.run([*bound, "3", "perl", "-e", early, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
+        # A ps that never answers: it is killed, and the command's own group is still stopped.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "ps"
+            fake.write_text("#!/bin/sh\nexec sleep 300\n")
+            fake.chmod(0o755)
+            # The bound runs /bin/ps by absolute path (never the PATH's); this copy points it at the stuck one.
+            stuck_ps = mf.BREW_BOUND.replace('(-x "/bin/ps" ? "/bin/ps" : "/usr/bin/ps")', repr(os.fspath(fake)))
+            self.assertNotEqual(stuck_ps, mf.BREW_BOUND)
+            env = {**os.environ, "GLAEDA_BREW_BOUND_PS_SECONDS": "1"}
+            started = time.monotonic()
+            run = subprocess.run(["perl", "-e", stuck_ps, "1", "sleep", "300"], capture_output=True, text=True,
+                                 timeout=120, env=env)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 30)
+            # A command that ends while a slow ps runs, before the limit, keeps its own exit code.
+            run = subprocess.run(["perl", "-e", stuck_ps, "5", "sh", "-c", "sleep 1; exit 5"], capture_output=True,
+                                 text=True, timeout=120, env=env)
+            self.assertEqual(run.returncode, 5, run.stderr)
+
+    def assert_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            if not state.strip() or state.strip().startswith("Z"):
+                return
+            time.sleep(0.2)
+        os.kill(pid, 9)
+        self.fail(f"the bound left pid {pid} running")
+
+    def test_a_brew_timeout_ends_the_homebrew_step_with_124_wherever_brew_runs(self) -> None:
+        # brew_as runs in `if !`, in a command substitution and behind `|| true`-style tests; a timeout in any of
+        # them must still fail the step with 124, never read as "not installed" or a plain failure.
+        fake = textwrap.dedent("""\
+            #!/bin/sh
+            case "$*" in
+              *"$HANG"*) exec sleep 300 ;;
+              "--cache") echo "$HOME/cache" ;;
+              "list --versions"*) exit 1 ;;
+            esac
+            exit 0
+            """)
+        with tempfile.TemporaryDirectory() as tmp:
+            brew = Path(tmp) / "opt" / "homebrew" / "bin" / "brew"  # this machine may have a real /opt/homebrew
+            brew.parent.mkdir(parents=True)
+            brew.write_text(fake)
+            brew.chmod(0o755)
+            (Path(tmp) / mf.BREW_STAGE).mkdir(parents=True)
+            (Path(tmp) / mf.BREW_STAGE / "bottle.tar.gz").write_text("")
+            with mock.patch.object(mf, "BREW_COMMAND_TIMEOUT", 1):
+                lines = mf.brew_commands("builder", ["git"], False)
+            script = "\n".join(["set -euo pipefail", *lines]).replace("/opt/homebrew", f"{tmp}/opt/homebrew")
+            for hang in ("--cache", "list --pinned", "list --versions", "install git", "link git"):
+                started = time.monotonic()
+                run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                     env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": hang})
+                self.assertEqual(run.returncode, 124, (hang, run.stdout, run.stderr))
+                self.assertLess(time.monotonic() - started, 30, hang)
+                if hang in ("--cache", "install git", "link git"):  # the list calls send stderr to /dev/null
+                    self.assertIn("timed out after 1s", run.stderr, hang)
+                    self.assertEqual(run.stderr.count("timed out"), 1, run.stderr)  # the bound's line, nothing else
+            # Nothing hangs: the step runs to the end.
+            run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                 env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": "never"})
+            self.assertEqual(run.returncode, 0, (run.stdout, run.stderr))
+
+    def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
+        text = mf.PREFLIGHT_PROBE.read_text()
+        self.assertFalse(re.findall(r"(?<![w$])\bgit -C", text), "every git call goes through wgit (WORKLOAD_PATH)")
+        self.assertIn('wgit() { PATH="$WORKLOAD_PATH" git "$@"; }', text)
+
+    def test_a_homebrew_git_host_without_it_skips_the_checkout_walk_and_repairs_git_first(self) -> None:
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["git"] = {"source": "homebrew"}
+        self.assertIn(b"GIT_SOURCE=homebrew\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        result = self.result(preflight_text(submodule_skipped=True))
+        self.assertEqual(result["checks"]["cmux"]["state"], "todo")
+        self.assertEqual(result["checks"]["git"]["state"], "fail")
+        self.assertEqual(mf.FIX_NEEDS["submodules"], ("git",))
+        self.assertLess(mf.FIX_ORDER.index("brew"), mf.FIX_ORDER.index("cmux_clone"))
+        self.assertLess(mf.FIX_ORDER.index("brew"), mf.FIX_ORDER.index("submodules"))
+        action = {"kind": "submodules", "root": "~/cmux", "depth": 1}
+        self.assertEqual(mf.waiting_on(action, result["checks"], set()), "git (fix)")
+        self.assertIsNone(mf.waiting_on(action, result["checks"], {"git"}))
+        # A host with no policy is not held: its git check is info.
+        del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertIn(b"GIT_SOURCE=system\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        plain = self.result(preflight_text())
+        self.assertIsNone(mf.waiting_on(action, plain["checks"], set()))
+
+    def test_the_probe_skips_the_walk_only_for_a_homebrew_host_without_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cmux"
+            (root / ".git").mkdir(parents=True)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            calls = Path(tmp) / "calls"
+            (bin_dir / "git").write_text(f"#!/bin/sh\necho \"$@\" >> {calls}\n")
+            (bin_dir / "git").chmod(0o755)
+            for source, walked in (("homebrew", False), ("system", True)):
+                calls.unlink(missing_ok=True)
+                header = (f"CMUX_ROOT={root}\nXCODE_PIN=''\nWORKLOAD_PATH={bin_dir}:/usr/bin:/bin\nWORKLOAD_TOOLS=''\n"
+                          f"PYTHONS=''\nCANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\nGIT_SOURCE={source}\n")
+                script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
+                out = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                     env={"HOME": tmp, "PATH": "/usr/bin:/bin"}, timeout=60).stdout
+                ran = calls.read_text() if calls.exists() else ""
+                self.assertEqual("submodule status" in ran, walked, (source, ran))
+                self.assertEqual("pf_submodule_skipped\tgit" in out, not walked)
+
+    def test_git_policy_is_validated(self) -> None:
+        data = json.loads(EXAMPLE.read_text())
+        host = next(iter(data["hosts"].values()))
+        host.setdefault("overrides", {})["git"] = {"source": "brew"}
+        with self.assertRaisesRegex(mf.Failure, "git takes source"):
+            mf.load_manifest(EXAMPLE, json.dumps(data))
+        host["overrides"]["git"] = {"source": "homebrew", "note": "until the privacy grant is made"}
+        mf.load_manifest(EXAMPLE, json.dumps(data))
+        # A note-only override still inherits a bad default: the merged policy is what is checked.
+        data["defaults"]["git"] = {"source": "bogus"}
+        host["overrides"]["git"] = {"note": "only a note"}
+        with self.assertRaisesRegex(mf.Failure, "git takes source"):
+            mf.load_manifest(EXAMPLE, json.dumps(data))
+
     def test_an_old_glaeda_checkout_is_moved_before_enrolling(self) -> None:
         # An old ~/glaeda failed onboard with "unrecognized arguments: --class-receipt ...".
         lacking = "--class-receipt --class-receipt-sha256 --fleet-class"
@@ -1648,6 +2273,12 @@ class PreflightScriptTests(unittest.TestCase):
                 if line.strip() and not line.strip().startswith("#")]
         # The update check reports the softwareupdate command line, not the sudo wrapper around it.
         body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body if not line.startswith("applying='")]
+        # The poolUser read (cmuxterm-hq#18007) is the one escalation: sudo -n (never a prompt) down to a
+        # non-admin account, running a read-only Python that opens and closes files.
+        pool = [line for line in body if "sudo" in line]
+        self.assertEqual(pool, ["(cd / && printf '%s\\0' \"${login_secrets[@]}\" | sudo -n -u \"$POOL_USER\" -H "
+                                "/usr/bin/python3 -I -c '"])
+        body = [line for line in body if line not in pool]
         for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
             self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
                              word)
@@ -1759,6 +2390,47 @@ class PreflightSecretsScriptTests(unittest.TestCase):
         self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", later)
         self.assertNotIn(f"{tmp}/.docker/config.json", later)
         self.assertNotIn("sekrit", out + again)
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a mode-0 file")
+    def test_reads_as_the_pool_user_through_sudo(self) -> None:
+        # cmuxterm-hq#18007. A fake sudo runs the read as this user, with the pool home as HOME (what -H gives).
+        with tempfile.TemporaryDirectory() as tmp:
+            login, pool, bin_dir = Path(tmp) / "login", Path(tmp) / "pool", Path(tmp) / "bin"
+            for rel, text in ((login / ".secrets/open.env", "sekrit-open\n"), (login / ".secrets/locked.env", "sekrit-locked\n"),
+                              (pool / ".secrets/own.token", "sekrit-own\n"), (pool / ".ssh/id_rsa.pub", "ssh-rsa AAAA\n"),
+                              (pool / ".config/glaeda/.hidden.key", "sekrit-key\n"), (pool / ".netrc", "")):
+                rel.parent.mkdir(parents=True, exist_ok=True)
+                rel.write_text(text)
+            bin_dir.mkdir()
+            calls = Path(tmp) / "calls"
+            (bin_dir / "fake-sudo").write_text(
+                f"#!/bin/bash\necho \"$*\" >> {calls}\n[ \"$1 $2 $3 $4\" = '-n -u cmux-pr-runner -H' ] || exit 1\n"
+                f"shift 4\nexec env HOME={pool} \"$@\"\n")
+            (bin_dir / "fake-sudo").chmod(0o755)
+            header = ("CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=/usr/bin\nWORKLOAD_TOOLS=''\nPYTHONS=''\n"
+                      "CANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\nPOOL_USER=cmux-pr-runner\n")
+            body = mf.PREFLIGHT_PROBE.read_text()
+            self.assertEqual(body.count("| sudo -n -u"), 1)
+            body = body.replace("| sudo -n -u", f"| {bin_dir}/fake-sudo -n -u")
+            # The login user reads locked.env during its walk; the pool user does not, by the time it looks.
+            body = body.replace('  login_secrets+=("$f")\n',
+                                f'  login_secrets+=("$f")\n  case "$f" in */locked.env) chmod 000 "$f" ;; esac\n')
+            script = mf.PROBE.read_text() + "\n" + header + body
+            run = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                 env={"HOME": os.fspath(login), "PATH": "/usr/bin:/bin"}, timeout=60)
+            (login / ".secrets/locked.env").chmod(0o600)
+            pf = mf.parse_probe(run.stdout)["preflight"]
+            ran = calls.read_text() if calls.exists() else ""
+        if not ran:
+            self.skipTest("no developer directory: the probe skips /usr/bin/python3")
+        self.assertEqual(pf["pool_user"], "cmux-pr-runner")
+        self.assertEqual(pf["pool_home"], os.fspath(pool))
+        import pwd
+        self.assertEqual(pf["pool_secrets_done"], pwd.getpwuid(os.geteuid()).pw_name)
+        self.assertEqual(sorted((e["path"], e["state"]) for e in pf["pool_secrets"] if e["path"].startswith(tmp)), sorted([
+            (f"{login}/.secrets/open.env", "readable"), (f"{login}/.secrets/locked.env", "eacces"),
+            (f"{pool}/.secrets/own.token", "readable"), (f"{pool}/.config/glaeda/.hidden.key", "readable")]))
+        self.assertNotIn("sekrit", run.stdout)
 
 
 def morning_text() -> str:
@@ -1940,6 +2612,36 @@ class FixPlanTests(unittest.TestCase):
             mf.fix_host(self.manifest, "build-mini-1", self.result, True, Path(tmp))
         self.assertEqual(seen["glaeda"]["python"], "~/.local/bin/python3")
 
+    def test_glaeda_repair_passes_headless_mode_for_gui_less_hosts(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        action = {"kind": "glaeda", "python": "/opt/homebrew/bin/python3.13"}
+        with mock.patch.object(mf, "routed_fix_call", return_value=0) as call:
+            ok, _ = mf.run_repair(self.manifest, "build-mini-1", action, None)
+        self.assertTrue(ok)
+        self.assertEqual(call.call_args.args[2:4], ("glaeda", ["/opt/homebrew/bin/python3.13", "--headless"]))
+
+    def test_headless_fix_dry_run_describes_the_mode(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = {"checks": {
+            "python": {"state": "ok", "detail": "python at /opt/homebrew/bin/python3.13", "fix": "", "group": ""},
+            "rust": {"state": "ok", "detail": "", "fix": "", "group": ""},
+            "glaeda": {"state": "fail", "detail": "", "fix": "", "group": "self",
+                        "action": {"kind": "glaeda"}},
+            "headless_sudo": {"state": "ok", "detail": "", "fix": "", "group": ""},
+        }}
+        out = mf.fix_host(self.manifest, "build-mini-1", result, False, None)
+        self.assertEqual(len(out["planned"]), 1)
+        self.assertIn("glaeda-mini-setup --apply --headless", out["planned"][0])
+
+    def test_headless_fix_waits_for_sudo_before_setup(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        obs = observed(**{"build-mini-1": preflight_text(sudo="password")})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+        with mock.patch.object(mf, "run_repair") as run:
+            out = mf.fix_host(self.manifest, "build-mini-1", result, True, None)
+        run.assert_not_called()
+        self.assertTrue(any("waits for headless_sudo (a person)" in item for item in out["waiting"]), out)
+
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with mock.patch.object(mf, "observe", return_value=obs) as probe, mock.patch.object(mf, "run_repair") as run, \
@@ -1969,7 +2671,7 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
                                            "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
@@ -2030,7 +2732,7 @@ class SudoPlanTests(unittest.TestCase):
         # The only sudo left drops to the Homebrew owner.
         self.assertEqual([line for line in body if re.search(r"(^|[\s;|&(])sudo (?!-H -u admin )", line)], [])
         for step in ("xcode-select -s /Applications/Xcode.app", "env DEVELOPER_DIR=", "pmset -c sleep 0",
-                     "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
+                     "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
                      'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"',
                      'cp -nP "$staged"/* "$cache"/', 'chown -h admin "$cache"/*', 'visudo -cf "$rule"',
                      "install -m 0440 -o root"):
@@ -2172,10 +2874,29 @@ class FixLibraryTests(unittest.TestCase):
         self.assertEqual([line for line in body if "sudo -n launchctl" in line],
                          ['    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;'])
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
-        self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
+        # (an rm command, not the "rm " that ends -downloadPlatform)
+        self.assertEqual([line.strip() for line in body if re.search(r"(^|[\s;('])rm ", line) and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
                           'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
+        # ...and perl's unlink of the drain waiter entry ios_runtime itself published, and host_drain's own entry.
+        self.assertEqual([line.strip() for line in body if "unlink" in line],
+                         ['$SIG{$_} = sub { unlink $waiter; exit 0 } for qw(TERM INT HUP);', 'unlink $waiter;',
+                          'sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\\n" if $_[1]; exit $_[0] }'])
+        self.assertFalse([line for line in body if "simctl runtime delete" in line or "simctl delete" in line])
+
+    def test_glaeda_setup_preserves_headless_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "glaeda/scripts").mkdir(parents=True)
+            (home / "glaeda/scripts/cmux_fleet.py").write_text("")
+            setup = home / "glaeda/scripts/glaeda-mini-setup"
+            setup.write_text("#!/bin/bash\n# --ota-source\nprintf '%s\\n' \"$@\" > \"$HOME/setup-args\"\n")
+            setup.chmod(0o755)
+            result = self.call(home, "glaeda", "/bin/bash", "--headless")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / "setup-args").read_text().splitlines(),
+                             ["--apply", "--headless", "--ota-source", "manaflow-ai/glaeda"])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
     def test_candidate_is_placed_only_when_its_digest_matches(self) -> None:
@@ -2217,6 +2938,188 @@ class FixLibraryTests(unittest.TestCase):
             self.assertEqual(os.readlink(home / ".local/bin/python3"), f"{dist}/python3")
             # Idempotent: its own link is replaced, not refused.
             self.assertEqual(self.call(home, "python_link", "~/.local/python-3.14", "3.13").returncode, 0)
+
+    def ios_sandbox(self, home: Path, available: bool = False, booted: bool = False, free_gib: int = 220,
+                    yields: str = "23F77") -> Path:
+        """Stand-ins for xcrun, xcodebuild, pgrep and df on the workload PATH; the download records its argv."""
+        bin_dir = home / "bin"
+        bin_dir.mkdir()
+        state = home / "runtime"
+        if available:
+            state.write_text(yields)
+        scripts = {
+            "xcrun": f"""#!/bin/sh
+[ "$1 $2 $3" = "simctl list runtimes" ] || exit 2
+echo "== Runtimes =="
+[ -f {state} ] && echo "iOS 26.5 (26.5 - $(cat {state})) - com.apple.CoreSimulator.SimRuntime.iOS-26-5"
+exit 0
+""",
+            "xcodebuild": f"""#!/bin/sh
+echo "$DEVELOPER_DIR $*" >> {home}/download-argv
+ls {home}/fleet/host.lock.waiters >> {home}/waiters-seen
+echo {yields} > {state}
+""",
+            "pgrep": f"#!/bin/sh\n{'exit 0' if booted else 'exit 1'}\n",
+            "df": f"""#!/bin/sh
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/disk3s1 482344960 1000 $(( {free_gib} * 1048576 - $(cat {home}/download-argv 2>/dev/null | wc -l) * 8388608 )) 1% $2"
+""",
+        }
+        for tool, text in scripts.items():
+            (bin_dir / tool).write_text(text)
+            (bin_dir / tool).chmod(0o755)
+        (home / "fleet/host.lock.waiters").mkdir(parents=True)
+        (home / "fleet/host.lock").write_text("")
+        return bin_dir
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_downloads_once_and_never_beside_a_build_or_a_simulator(self) -> None:
+        dev = "/Applications/Xcode_26.6.app/Contents/Developer"
+        args = (dev, "23F77", "20", "30", "3")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                import fcntl
+                with open(home / "fleet/host.lock") as held:  # a build holds the fleet host lock
+                    fcntl.flock(held, fcntl.LOCK_EX)
+                    refused = self.call(home, "ios_runtime", *args)
+                self.assertEqual(refused.returncode, mf.HELD_EXIT, refused.stderr)
+                with open(home / "fleet/host.lock") as step:  # a ci-step holds it shared: still refused
+                    fcntl.flock(step, fcntl.LOCK_SH)
+                    refused = self.call(home, "ios_runtime", *args)
+                self.assertEqual(refused.returncode, mf.HELD_EXIT, refused.stderr)
+                self.assertFalse((home / "download-argv").exists())
+                self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])  # a refusal leaves no waiter
+                # A step that ends within the wait is drained: the download runs once it has the lock alone.
+                step = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1]); "
+                                         "fcntl.flock(f, fcntl.LOCK_SH); print('held', flush=True); time.sleep(1.5)",
+                                         os.fspath(home / "fleet/host.lock")], stdout=subprocess.PIPE, text=True)
+                self.assertEqual(step.stdout.readline(), "held\n")
+                done = self.call(home, "ios_runtime", *args)
+                step.wait()
+                step.stdout.close()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("waiting for the jobs holding", done.stdout)
+                self.assertEqual((home / "download-argv").read_text(), f"{dev} -downloadPlatform iOS\n")
+                self.assertIn("iOS simulator runtime 23F77 available; used 8589934592 bytes", done.stdout)
+                # The worker saw a drain waiter during the download, and it is gone after.
+                self.assertRegex((home / "waiters-seen").read_text(), r"\A[0-9]+-ios-runtime\n\Z")
+                self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+                again = self.call(home, "ios_runtime", *args)
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn("unchanged", again.stdout)
+                self.assertEqual(len((home / "download-argv").read_text().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_keeps_the_lock_until_a_signalled_download_has_ended(self) -> None:
+        import fcntl
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            # A download that ignores the first TERM for a moment, the way a busy xcodebuild finishes a write.
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+trap 'sleep 1; echo stopped > {home}/download-end; exit 143' TERM
+echo started > {home}/download-start
+while :; do sleep 0.1; done
+""")
+            with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    mf.fix_call("h", "u", "ios_runtime", ["/dev", "23F77", "20", "30", "3"], None, 10)
+            proc = subprocess.Popen(["bash", "-c", ssh.call_args.args[2]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                         "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
+            deadline = time.monotonic() + 20
+            while not (home / "download-start").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((home / "download-start").exists())
+            # The guardian is the pid its own waiter entry in this test's fleet dir names.
+            waiters = [e.name for e in (home / "fleet/host.lock.waiters").iterdir()]
+            self.assertEqual(len(waiters), 1, waiters)
+            guardian = int(waiters[0].split("-", 1)[0])
+            self.assertEqual(subprocess.run(["ps", "-o", "ppid=", "-p", str(guardian)], capture_output=True,
+                                            text=True).stdout.split(), [str(proc.pid)])
+            os.kill(guardian, signal.SIGTERM)
+            with open(home / "fleet/host.lock") as build:
+                fcntl.flock(build, fcntl.LOCK_EX)  # a build gets the lock only once the download has ended
+                self.assertTrue((home / "download-end").exists())
+            proc.communicate(timeout=20)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_kills_a_download_that_ignores_term_and_holds_the_lock_until_it_is_gone(self) -> None:
+        import fcntl
+        import signal
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            # The download and a helper it starts both ignore TERM; only the group KILL ends them.
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+trap '' TERM
+(trap '' TERM; while :; do sleep 0.1; done) &
+echo $! > {home}/helper-pid
+echo started > {home}/download-start
+while :; do sleep 0.1; done
+""")
+            with mock.patch.object(mf, "ssh_stream", return_value=0) as ssh:
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    mf.fix_call("h", "u", "ios_runtime", ["/dev", "23F77", "20", "30", "3", "1"], None, 10)
+            proc = subprocess.Popen(["bash", "-c", ssh.call_args.args[2]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env={"HOME": os.fspath(home), "PATH": "/usr/bin:/bin",
+                                         "GLAEDA_FLEET_DIR": os.fspath(home / "fleet")})
+            deadline = time.monotonic() + 20
+            while not (home / "download-start").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            guardian = int(next((home / "fleet/host.lock.waiters").iterdir()).name.split("-", 1)[0])
+            helper = int((home / "helper-pid").read_text())
+            os.kill(guardian, signal.SIGTERM)
+            with open(home / "fleet/host.lock") as build:
+                fcntl.flock(build, fcntl.LOCK_EX)  # granted only once the whole group is gone
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(helper, 0)
+            proc.communicate(timeout=20)
+            self.assertIn(proc.returncode, (128 + signal.SIGTERM, 128 + signal.SIGKILL))
+            self.assertEqual(list((home / "fleet/host.lock.waiters").iterdir()), [])
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_creates_an_absent_host_lock_and_holds_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            bin_dir = self.ios_sandbox(home)
+            (home / "fleet/host.lock").unlink()
+            # The download tries the lock the way a worker starting meanwhile would (it creates the file too).
+            (bin_dir / "xcodebuild").write_text(f"""#!/bin/sh
+/usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", shift) or exit 2; exit(flock($f, LOCK_SH | LOCK_NB) ? 1 : 0)' \
+  {home}/fleet/host.lock && echo excluded > {home}/worker-saw
+echo 23F77 > {home}/runtime
+""")
+            with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                done = self.call(home, "ios_runtime", "/dev", "23F77", "20", "30", "3")
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual((home / "worker-saw").read_text(), "excluded\n")
+            self.assertEqual((home / "fleet/host.lock").stat().st_mode & 0o777, 0o660 & ~self.umask())
+
+    @staticmethod
+    def umask() -> int:
+        mask = os.umask(0)
+        os.umask(mask)
+        return mask
+
+    @unittest.skipUnless(shutil.which("perl"), "needs perl")
+    def test_ios_runtime_refuses_a_booted_simulator_short_disk_and_a_wrong_build(self) -> None:
+        dev = "/Applications/Xcode_26.6.app/Contents/Developer"
+        for kwargs, code, words in (({"booted": True}, mf.HELD_EXIT, "a simulator is running"),
+                                    ({"free_gib": 49}, 3, "49 GiB free on the Data volume; the download needs 50"),
+                                    ({"yields": "23F5"}, 3, "runtime 23F77 is not available")):
+            with self.subTest(kwargs), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                bin_dir = self.ios_sandbox(home, **kwargs)
+                with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{bin_dir}:/usr/bin:/bin"):
+                    result = self.call(home, "ios_runtime", dev, "23F77", "20", "30", "3")
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertIn(words, result.stderr)
 
     def test_a_running_step_holds_the_host_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2380,7 +3283,7 @@ class FixLibraryTests(unittest.TestCase):
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 locked = self.call(home, "host_check")
                 self.assertEqual(locked.returncode, 20)
-                self.assertIn("held by another build (fleet host lock", locked.stdout)
+                self.assertIn(mf.BUSY_HOST_LOCK, locked.stdout)  # the reason fix reads as "busy, no reservation"
                 # A drain honors only reservations: it waits out the job that holds the lock.
                 gate = subprocess.run(["bash", "-c", 'say() { :; }; eval "$(sed -n "/^# >>> host gate/,/^# <<< host gate/p" '
                                        f'{mf.FIX_LIBRARY})"; host_held reservation || echo free'],
@@ -2447,12 +3350,28 @@ esac
             (home / "loaded/actions.runner.x").write_text("")
             held = home / ".local/state/glaeda/mini-fleet/runner-held/actions-runner-x"
             with mock.patch.object(mf.bootstrap, "CMUX_WORKLOAD_TOOL_PATH", f"{shims}:/usr/bin:/bin"):
-                (home / "worker-running").write_text("")
+                # no glaeda hook to ask (neither the runner's nor the fleet copy's): it cannot tell, so a job
                 busy = self.call(home, "runner_hold", "0")
                 self.assertEqual(busy.returncode, 3)
                 self.assertIn("still running a job", busy.stderr)
                 self.assertFalse(held.exists())
-                (home / "worker-running").unlink()
+                self.assertTrue((home / "loaded/actions.runner.x").exists(), "never booted out")
+                # the fleet copy's hook decides: a self-updated runner's bin.<version> Worker is a job
+                fleet_copy = home / "glaeda-runner/scripts"
+                fleet_copy.mkdir(parents=True)
+                shutil.copy(Path(mf.FIX_LIBRARY).parent / "glaeda-cmux-runner-hook", fleet_copy)
+                (shims / "python3").symlink_to(sys.executable)  # the hook's python, as ~/.local/bin/python3 on a mini
+                worker = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60',
+                                           f"{runner}/bin.2.338.0/Runner.Worker"])
+                time.sleep(0.2)  # exec'd
+                try:
+                    busy = self.call(home, "runner_hold", "0")
+                    self.assertEqual(busy.returncode, 3, busy.stderr)
+                    self.assertIn("still running a job", busy.stderr)
+                    self.assertTrue((home / "loaded/actions.runner.x").exists(), "never booted out")
+                finally:
+                    worker.kill()
+                    worker.wait()
                 stopped = self.call(home, "runner_hold", "60")
                 self.assertEqual(stopped.returncode, 0, stopped.stderr)
                 self.assertTrue(held.exists())
@@ -2671,7 +3590,8 @@ class ShareTests(unittest.TestCase):
             self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
             mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
         (host, command, options), (_, plain, plain_options) = calls
-        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        # ControlPath=none: a multiplexed master opened without -A forwards no agent.
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A", "-o", "ControlPath=none"), ()))
         self.assertTrue(remote_call(command).endswith(
             f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
         self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
@@ -2686,6 +3606,76 @@ class ShareTests(unittest.TestCase):
         self.assertIn("waits for --from HOST, a host that has it", waiting[0])
         planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
+
+    def test_every_declared_xcode_is_provisioned_beside_the_pin(self) -> None:
+        # Leo, 2026-11-26: "and also just have more xcode versions installed". A workflow asking for xcode-27.0
+        # waited with no carrier (cmux run 45717448413): an Xcode declared beside the pin is copied like the pin.
+        extra = {"path": "/Applications/Xcode_27.0.app", "version": "27.0", "build": "27A266a"}
+        self.manifest["defaults"]["xcode"]["apps"].append(dict(extra))
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        check = result["checks"]["xcode 27.0"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "self"))
+        self.assertEqual(check["action"], {"kind": "xcode_share", **extra})
+        self.assertEqual(result["checks"]["xcode"]["state"], "ok")  # the pin is unchanged
+        self.assertTrue(result["ready"])  # a missing extra Xcode never blocks the host's pin work
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", side_effect=lambda m, src, thing, log, yes=True, args=None:
+                                  (calls.append(("seed", thing, args)), None)[1]), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes:
+                                  (calls.append(("share", thing, a)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), \
+                mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        self.assertIn(("seed", "xcode", args), calls)
+        self.assertIn(("share", "xcode", args), calls)
+        # Short of disk: a person frees it first, and fix copies nothing.
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|35")
+        tight = mf.preflight_host(self.manifest, "build-mini-1",
+                                  observed(**{"build-mini-1": low})["hosts"]["build-mini-1"])["checks"]["xcode 27.0"]
+        self.assertEqual((tight["state"], tight["group"]), ("todo", "person"))
+        self.assertNotIn("action", tight)
+        self.assertIn(f"needs {mf.XCODE_COPY_GIB + 30}", tight["detail"])
+        # Installed but unlicensed: sudo-plan accepts its licence with its own developer directory.
+        have = preflight_text() + "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|27A266a\n" \
+            "xcode_ready\t/Applications/Xcode_27.0.app|needed|done\n"
+        checks = mf.preflight_host(self.manifest, "build-mini-1",
+                                   observed(**{"build-mini-1": have})["hosts"]["build-mini-1"])["checks"]
+        self.assertEqual(checks["xcode 27.0"]["action"],
+                         {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
+
+    def test_an_xcode_copy_runs_beside_a_build_and_a_busy_seed_still_seeds(self) -> None:
+        # 2026-11-26: fix --wait for Xcode 27.0 on four busy fleet minis copied nothing for an hour: the targets'
+        # build workers free the host lock only between jobs, and every seed that had 27.0 was busy too
+        # (share_prepare exit 20). An Xcode lands on its own path, staged and moved in whole, which no job reads.
+        self.assertIn("xcode_share", mf.BUSY_HOST_REPAIRS)
+        self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
+            commands, options_seen = [], []
+            with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
+                    mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                      (commands.append(c), options_seen.extend(options),
+                                       1 if remote_call(c).startswith("share_have ") else 0)[2]):
+                ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
+            self.assertTrue(ok, thing)
+            # Every command carries the whole library; the call line is what names the step and its gate.
+            have, pipeline, finish = commands
+            self.assertTrue(remote_call(have).startswith("share_have " + thing), remote_call(have))
+            self.assertIn(gate + "share_recv " + thing, pipeline, thing)
+            self.assertTrue(remote_call(finish).startswith(gate + "share_finish " + thing), (thing, remote_call(finish)))
+            self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
+        # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
+        for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
+            seen = []
+            mf.SEEDS_READY.clear()
+            with mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                   (seen.append(remote_call(c)), 0)[1]):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", thing, None, True, args=args))
+            self.assertTrue(seen[0].startswith(func if thing == "xcode" else "lock; " + func), seen)
+        mf.SEEDS_READY.clear()
 
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
@@ -2776,6 +3766,37 @@ class OnboardTests(unittest.TestCase):
     def run_onboard(self, texts: dict[str, str], *extra: str, **kwargs: object) -> tuple[int, str, list]:
         return run_command(texts, *extra, **kwargs)
 
+    def test_a_preflight_failure_leaves_the_log_the_table_names(self) -> None:
+        lost = {"host": "build-mini-1", "reachable": False,
+                "error": "glaeda-mini-fleet: remote status lost (no status line; ssh exit 2; it said: refused)",
+                "transport_stderr": "aws-enroll: refusing the jump\n"}
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(mf, "observe", return_value={"hosts": {"build-mini-1": lost}}), \
+                mock.patch.object(mf, "host_check", return_value=None), \
+                mock.patch.object(mf, "ssh_stream", side_effect=AssertionError("nothing runs past preflight")):
+            code = mf.main(["onboard", "build-mini-1", "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, "--yes"])
+            log = Path(tmp) / "build-mini-1.log"
+            self.assertTrue(log.exists(), out.getvalue())
+            text = log.read_text()
+        self.assertEqual(code, 1)
+        row = [line for line in out.getvalue().splitlines() if line.startswith("build-mini-1")][-1]
+        self.assertIn("status lost: glaeda-mini-fleet: remote status lost", row)
+        self.assertTrue(row.endswith(os.fspath(log)), row)
+        self.assertIn("gate: free; preflight", text)
+        self.assertIn("probe: glaeda-mini-fleet: remote status lost", text)
+        self.assertIn("aws-enroll: refusing the jump", text)  # the transport's own words, not just the summary
+        self.assertIn("preflight: status lost:", text)
+        self.assertIn("done: preflight: status lost:", text)
+
+    def test_a_held_host_has_a_log_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(mf, "observe", side_effect=AssertionError("a held host is not probed")), \
+                mock.patch.object(mf, "host_check", return_value="reserved by someone"):
+            code = mf.main(["onboard", "build-mini-1", "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, "--yes"])
+            text = (Path(tmp) / "build-mini-1.log").read_text()
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("gate: held: reserved by someone, skipped", text)
+
     def test_dry_run_prints_the_plan_and_touches_nothing(self) -> None:
         code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": morning_text()})
         self.assertEqual((code, calls), (0, []))
@@ -2824,6 +3845,62 @@ class OnboardTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("is not the recorded", out)
         self.assertFalse(calls_to(calls, ENROLL))
+
+    def test_a_relative_class_receipt_is_read_beside_the_manifest(self) -> None:
+        receipt = {"schema": "glaeda-cmux-fleet-class-acceptance/v1", "fleetClass": "m4pro-48",
+                   "receiptSha256": "sha256:" + "c" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "class-acceptance").mkdir()
+            receipt_path = Path(tmp) / "class-acceptance" / "m4pro-48.json"
+            receipt_path.write_text(json.dumps(receipt))
+            data = copy.deepcopy(self.manifest)
+            data["hardware"]["m4pro-48"]["acceptance"].update(receipt="class-acceptance/m4pro-48.json",
+                                                             receipt_sha256=receipt["receiptSha256"])
+            path = write_manifest(tmp, data)
+            fetch = mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("read locally"))
+            with fetch, mock.patch.object(mf, "MANIFEST_PATH", path), contextlib.chdir("/"):
+                code, out, calls = self.run_onboard({"build-mini-1": self.fresh()}, "--yes", manifest=path)
+            self.assertEqual(code, 0, out)
+            enroll = calls_to(calls, ENROLL)
+            self.assertEqual(enroll[0][2], receipt_path.read_bytes())
+
+    def test_class_receipt_resolution(self) -> None:
+        receipt = json.dumps({"fleetClass": "m6-16", "receiptSha256": "sha256:" + "e" * 64})
+        recorded = {"receipt": "class-acceptance/m6-16.json", "receipt_sha256": "sha256:" + "e" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            copy_path = Path(tmp) / "mini-fleet.json"  # an operator's synced copy: no class-acceptance/ beside it
+            with mock.patch.object(mf, "fetch_hq_file", return_value=(receipt, "hq main")) as fetch:
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertEqual((data, why), (receipt.encode(), "ok"))
+            fetch.assert_called_once_with("build-fleet/class-acceptance/m6-16.json")
+            # The digest is still checked on what main returns.
+            with mock.patch.object(mf, "fetch_hq_file", return_value=(receipt.replace("e" * 64, "f" * 64), "hq")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn("is not the recorded", why)
+            # Main unreachable: blocked with both places named.
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=mf.Failure("no gh")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn(f"not in {Path(tmp).resolve()}", why)
+            # A relative path never climbs out of the manifest's directory.
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("not fetched")):
+                data, why = mf.class_receipt_bytes({**recorded, "receipt": "../../etc/x.json"}, "m6-16", copy_path)
+            self.assertIsNone(data)
+            self.assertIn("inside the manifest's directory", why)
+            # Nor through a symlink that leads out of it.
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "m6-16.json").write_text(receipt)
+            (Path(tmp) / "fleet").mkdir()
+            (Path(tmp) / "fleet" / "class-acceptance").symlink_to(outside)
+            with mock.patch.object(mf, "fetch_hq_file", side_effect=AssertionError("not fetched")):
+                data, why = mf.class_receipt_bytes(recorded, "m6-16", Path(tmp) / "fleet" / "mini-fleet.json")
+            self.assertIsNone(data)
+            self.assertIn("outside the manifest's directory", why)
+        self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/a/b/class-acceptance/k.json")),
+                         "class-acceptance/k.json")
+        self.assertEqual(mf.recorded_receipt(Path("/a/b/m.json"), Path("/elsewhere/k.json")), "/elsewhere/k.json")
 
     def test_node_mode_accepts_and_the_registration_hook_gets_the_token_on_stdin(self) -> None:
         minted: list = []
@@ -2948,6 +4025,32 @@ class HostGateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"held: {why}, skipped", out)
         self.assertEqual({c[0] for c in calls}, {"build-mini-1"})
+
+    def test_fix_runs_only_the_draining_repairs_on_a_host_the_host_lock_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = json.loads(EXAMPLE.read_text())
+            data["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+            manifest = Path(tmp) / "m.json"
+            manifest.write_text(json.dumps(data))
+            busy = mf.BUSY_HOST_LOCK + "/Users/Shared/cmux-build-fleet/host.lock)"
+            reserved = "reserved by cache-bench for measurement until 2100-01-01T00:00:00Z"
+            # build-mini-1 lacks the runtime and Metal; build-mini-2 lacks only Metal; build-mini-3 is reserved.
+            texts = {"build-mini-1": preflight_text(metal=False),
+                     "build-mini-2": preflight_text(metal=False, node_id="cmux-mac-002")
+                     + "ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n",
+                     "build-mini-3": preflight_text(node_id="cmux-mac-003")}
+            data["hosts"]["build-mini-3"] = {**data["hosts"]["build-mini-2"], "node_id": "cmux-mac-003"}
+            manifest.write_text(json.dumps(data))
+            code, out, calls = run_command(texts, "--yes", command="fix", manifest=manifest, after=texts,
+                                           held={"build-mini-1": busy, "build-mini-2": busy, "build-mini-3": reserved})
+        ran = [(c[0], remote_call(c[1]).split()[-6:][0]) for c in calls if "ios_runtime" in c[1] or "metal" in remote_call(c[1])]
+        self.assertEqual([c[0] for c in calls if remote_call(c[1]).startswith("lock")], ["build-mini-1"])
+        self.assertTrue(remote_call(calls_to(calls, "ios_runtime")[0][1]).startswith("lock reservation; ios_runtime "), ran)
+        self.assertFalse(calls_to(calls, "lock; metal"))
+        self.assertIn("metal: xcodebuild -downloadComponent MetalToolchain (about 700 MB) (waits for the fleet host lock", out)
+        self.assertIn(f"build-mini-2: skipped (held: {busy})", out)
+        self.assertIn(f"build-mini-3: skipped (held: {reserved})", out)
+        self.assertEqual(code, 1)
 
     def test_wait_polls_until_the_host_is_free(self) -> None:
         answers = iter(["held by another build", "held by another build", None])
@@ -3157,8 +4260,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertNotIn("—", out)
 
     def test_the_seed_accepts_records_the_class_and_the_rest_adopt_it(self) -> None:
-        after = {"build-mini-1": on_candidate(generation=NEW_GEN),
-                 "build-mini-2": on_candidate(generation=NEW_GEN, node_id="cmux-mac-002")}
+        class_accepted = lambda text: text.replace("pf_acceptance\taccepted",
+                                                   "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        after = {"build-mini-1": class_accepted(on_candidate(generation=NEW_GEN)),
+                 "build-mini-2": class_accepted(on_candidate(generation=NEW_GEN, node_id="cmux-mac-002"))}
         code, out, calls, export = self.upgrade(self.fleet(), "--yes", after=after)
         self.assertEqual(code, 0, out)
         enrolls = calls_to(calls, ENROLL)
@@ -3172,8 +4277,11 @@ class UpgradeTests(unittest.TestCase):
         acceptance = data["hardware"]["m4pro-48"]["acceptance"]
         self.assertEqual((acceptance["candidate"], acceptance["node"], acceptance["receipt_sha256"]),
                          ("3809eed51fdd", "cmux-mac-001", RECEIPT_SHA))
-        self.assertEqual(Path(acceptance["receipt"]).read_bytes(), self.receipt)
-        self.assertEqual(Path(acceptance["receipt"]).stat().st_mode & 0o777, 0o600)
+        # Recorded relative to the manifest's directory, so a committed manifest names no operator's home.
+        self.assertEqual(acceptance["receipt"], "class-acceptance/m4pro-48-3809eed51fdd.json")
+        receipt_file = self.manifest.parent / acceptance["receipt"]
+        self.assertEqual(receipt_file.read_bytes(), self.receipt)
+        self.assertEqual(receipt_file.stat().st_mode & 0o777, 0o600)
         self.assertEqual(data["candidate"], {**self.RUN, "sha256": "a" * 64})
         self.assertIn(f"+  \"candidate\": {{", out)  # the diff is printed
         rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("build-mini-")}
@@ -3183,6 +4291,23 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual((code, export.call_count), (0, 0), out)
         self.assertEqual(calls_to(calls, ENROLL), [])
         self.assertIn("ok: already on 3809eed51fdd", out)
+
+    def test_upgrade_relinks_a_current_node_missing_the_class_link(self) -> None:
+        # A prior local acceptance can leave the enrollment eligible while the class receipt
+        # link required by every runner hook is absent. Upgrade must repair that link instead
+        # of treating the current candidate as already done.
+        self.manifest = pinned_manifest(self.tmp.name)
+        current = on_candidate(generation=NEW_GEN)
+        code, out, calls, _ = self.upgrade({"build-mini-1": current}, "--yes", after={"build-mini-1": current})
+        self.assertEqual(code, 0, out)
+        relink = calls_to(calls, "transition-apply")
+        self.assertEqual(len(relink), 1)
+        self.assertIn("--to quarantined --reason stale_glaeda_generation", relink[0][1])
+        enroll = calls_to(calls, ENROLL)
+        self.assertEqual(len(enroll), 1)
+        self.assertIn("--class-receipt - --class-receipt-sha256", enroll[0][1])
+        self.assertIn("--fleet-class m4pro-48", enroll[0][1])
+        self.assertIn("eligible", out)
 
     def test_an_old_glaeda_checkout_is_synced_by_the_renewal_not_refused(self) -> None:
         lacking = "--class-receipt --class-receipt-sha256 --fleet-class"
@@ -3482,6 +4607,12 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
         self.assertIn("host-lock", [i["area"] for i in self.issues("host_lock\tunknown\n")])
         self.assertNotIn("host-lock", [i["area"] for i in self.issues("host_lock\tfree\n")])
 
+    def test_missing_host_lock_tool_names_controller_repair(self) -> None:
+        issues = self.issues("fleet_host_lock_tool\tmissing\n")
+        [issue] = [i for i in issues if i["area"] == "host-lock-tool"]
+        self.assertIn("with-host-lock", issue["detail"])
+        self.assertIn("cmux-lawrence", issue["fix"])
+
     def test_cli_exit_and_summary_ignore_reserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             obs = Path(tmp) / "obs.json"
@@ -3533,7 +4664,8 @@ class ReserveReleaseTests(unittest.TestCase):
 
     def main(self, *argv: str) -> tuple[int, str]:
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
-            code = mf.main([*argv, "--manifest", os.fspath(EXAMPLE)])
+            cut = argv.index("--") if "--" in argv else len(argv)
+            code = mf.main([*argv[:cut], "--manifest", os.fspath(EXAMPLE), *argv[cut:]])
         return code, out.getvalue() + err.getvalue()
 
     def marker(self) -> dict | None:
@@ -3590,6 +4722,34 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         code, out = self.main("reserve", "build-mini-1", "--for", "x", "--until", str(now + 72 * 3600 - 5), "--yes")
         self.assertEqual(code, 0, out)
+
+    def test_a_reservation_for_a_command_ends_when_the_command_does(self) -> None:
+        # A copy that reserved a CI host for hours held it long after the copy ended: `-- CMD` holds the host
+        # only while CMD runs here, then releases it, whatever CMD's exit.
+        seen = self.root / "seen"
+        for status in (0, 3):
+            probe = f"test -f {self.root}/reservation.json && echo held >> {seen}; exit {status}"
+            code, out = self.main("reserve", "build-mini-1", "--for", "xcode copy", "--hours", "2", "--yes",
+                                  "--", "bash", "-c", probe)
+            self.assertEqual(code, status, out)
+            self.assertIsNone(self.marker(), out)
+            self.assertIn("released", out)
+        self.assertEqual(seen.read_text(), "held\nheld\n")
+
+    def test_a_command_never_runs_without_the_reservation(self) -> None:
+        ran = self.root / "ran"
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--", "touch", os.fspath(ran))
+        self.assertEqual(code, 0, out)  # dry run
+        self.assertIn("would run: touch", out)
+        self.assertFalse(ran.exists())
+        theirs = self.put("lawrence@studio", 3600)
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--yes", "--",
+                              "touch", os.fspath(ran))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(ran.exists())
+        self.assertEqual(self.marker(), theirs)  # never released someone else's hold
+        self.assertEqual(self.main("release", "build-mini-1", "--yes", "--", "true")[0], 2)  # reserve only
+        self.assertEqual(self.main("reserve", "build-mini-1", "--for", "x", "--hours", "1", "--")[0], 2)  # no command
 
     def test_foreign_active_reservation_is_refused_and_printed(self) -> None:
         theirs = self.put("lawrence@studio", 3600)
@@ -3996,8 +5156,13 @@ class ReservationScriptShapeTests(unittest.TestCase):
             subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     def test_ssh_command_is_batch_mode_and_quoted(self) -> None:
-        with mock.patch.object(mf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"absent\n", b"")) as run:
+        done = subprocess.CompletedProcess([], 0, b"absent\n\n__GLAEDA_REMOTE_STATUS__:0\n", b"")
+        with mock.patch.object(mf.subprocess, "run", return_value=done) as run:
             self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "absent")
+        # Tailscale SSH exits 0 whatever ran: an answer without its receipt is never read as one.
+        lost = subprocess.CompletedProcess([], 0, b"absent\n", b"")
+        with mock.patch.object(mf.subprocess, "run", return_value=lost):
+            self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "error")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:8], [mf.SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", "cmux", "build-mini-1"])
         self.assertTrue(argv[8].startswith("( /bin/bash -c "))
@@ -4009,6 +5174,26 @@ class RemoteStatusTests(unittest.TestCase):
     def test_remote_status_overrides_a_transport_zero(self) -> None:
         output = b"remote output\n__GLAEDA_REMOTE_STATUS__:7\n"
         self.assertEqual(mf.remote_result(output, 0), (7, b"remote output"))
+
+    def test_a_missing_receipt_is_never_a_success(self) -> None:
+        self.assertEqual(mf.remote_result(b"half an answer\n", 0), (255, b"half an answer\n"))
+        self.assertEqual(mf.remote_result(b"", 3), (3, b""))
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "h.log", "w+b") as log:
+            code = mf.run_remote_logged(["/bin/sh", "-c", "echo partial"], log)
+            log.seek(0)
+            text = log.read().decode()
+        self.assertEqual(code, 255)
+        self.assertIn("partial", text)
+        self.assertIn(f"{mf.REMOTE_STATUS_LOST} (no status line; ssh exit 0)", text)
+
+    def test_a_late_receipt_is_a_timeout_in_the_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "h.log", "w+b") as log:
+            code = mf.run_remote_logged(["/bin/sh", "-c", "echo started; sleep 30"], log, timeout=0.5)
+            log.seek(0)
+            text = log.read().decode()
+        self.assertEqual(code, 124)
+        self.assertIn("started", text)  # written as it came, before the bound ended the step
+        self.assertIn("timed out after 0.5s", text)
 
     def test_ssh_stream_adds_a_remote_status_receipt(self) -> None:
         with mock.patch.object(mf, "run_remote_logged", return_value=0) as run:

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""glaeda-mini-bringup: new minis to running CI runners, one command from the operator Mac.
+
+    glaeda-mini-bringup HOST ... [--class std] [--hardware KEY] [--candidate-run RUN]
+                        [--registry-out DIR] [--lane-host] [--yes]
+
+Dry run by default: it probes the hosts and prints every step with the exact command. --yes runs them
+in order and stops at the first that fails:
+
+  0. reach     every host answers SSH as the fleet user (tailnet up, Remote Login on). A host that
+               does not is the human step: Tailscale logged in with a tag:mac-mini-cluster key
+               (Lawrence holds the tag), Remote Login and Remote Management on at the screen.
+  1. admit     glaeda-mini-fleet admit: hardware class, node ids, sudo mode and one Xcode label per
+               installed Xcode into the manifest.
+  2. seed      a new hardware class proves itself once: onboard SEED --acceptance node, then
+               upgrade SEED --candidate-run RUN records the class receipt (RUN: --candidate-run, else
+               the newest successful fleet-candidate.yml run on main).
+  3. onboard   onboard the rest on that receipt (preflight, fix, sudo-plan, enroll), --from SEED so
+               Xcode and caches copy over the LAN.
+  4. runners   glaeda-cmux-runner-fleet --apply --hosts ALL: one runner per host with the labels.
+  5. check     glaeda-mini-fleet check: drift, disk floor, runner state.
+
+--registry-out DIR also writes each host's leo-workspace machines/fleet/machines/NAME.json (and
+lanes for --lane-host) for the registry PR; `reach enroll NAME --apply` then installs the
+tailscale-self-heal component the ci-runner role needs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FLEET = HERE / "glaeda-mini-fleet"
+RUNNER_FLEET = HERE / "glaeda-cmux-runner-fleet"
+CANDIDATE_WORKFLOW = "fleet-candidate.yml"
+TAILNET = "tail137216.ts.net"
+
+
+def load_fleet():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("glaeda_mini_fleet", os.fspath(FLEET))
+    spec = importlib.util.spec_from_loader("glaeda_mini_fleet", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["glaeda_mini_fleet"] = module
+    loader.exec_module(module)
+    return module
+
+
+def registry_entry(name: str, host: dict, shape: dict, lane_host: bool) -> dict:
+    """A machines/fleet/machines/NAME.json in the shape of cmux17's."""
+    chip = str(shape.get("chip") or "Mac").removeprefix("Apple ").strip()
+    use = f"CI runners on {chip} ({shape.get('memory_gib')} GiB), glaeda node {host['node_id']}"
+    entry = {
+        "aliases": [], "hardware": chip, "owner": "manaflow", "kind": "mac-mini", "roles": [],
+        "purpose": f"CI runner: {use}.", "created": __import__("datetime").date.today().isoformat(),
+        "keep_until": "standing", "runs": ["ci-runner"], "capabilities": ["inspect", "fix"],
+        "approval": "manaflow-fleet", "user": "cmux", "gui_session": "cmux", "key": "fleet",
+        "address": {"manaflow": f"{name}.{TAILNET}"}, "uses": [use],
+    }
+    if lane_host:
+        memory = int(shape.get("memory_gib") or 16)
+        entry["lanes"] = {"rank": 3, "build": "fallback", "reserved_gb": 8, "per_lane_gb": 2, "disk_per_lane_gb": 3,
+                          "cores_per_lane": 0.5, "max_lanes": max(2, min(14, (memory - 8) // 4)),
+                          "max_swap_used_fraction": 0.5}
+        entry["lane_tools"] = ["gh", "wt"]
+    return entry
+
+
+def newest_candidate_run(repo: str) -> str:
+    proc = subprocess.run(["gh", "run", "list", "--repo", repo, "--workflow", CANDIDATE_WORKFLOW, "--branch", "main",
+                           "--status", "success", "--limit", "1", "--json", "databaseId", "--jq", ".[0].databaseId"],
+                          capture_output=True, text=True, timeout=60, check=False)
+    run = proc.stdout.strip()
+    if proc.returncode or not run.isdigit():
+        raise SystemExit(f"glaeda-mini-bringup: no successful {CANDIDATE_WORKFLOW} run on {repo} main; pass --candidate-run")
+    return run
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    parser.add_argument("hosts", nargs="+", metavar="HOST")
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--class", dest="klass", default="std", choices=("xl", "std", "light"))
+    parser.add_argument("--hardware", metavar="KEY")
+    parser.add_argument("--observed", type=Path, help="reuse an observe output instead of probing")
+    parser.add_argument("--candidate-run", metavar="RUN")
+    parser.add_argument("--seed", metavar="HOST", help="the host that proves a new class (default: the first)")
+    parser.add_argument("--registry-out", type=Path, metavar="DIR")
+    parser.add_argument("--lane-host", action="store_true", help="registry entries also host agent lanes")
+    parser.add_argument("--yes", action="store_true", help="run the steps instead of printing them")
+    args = parser.parse_args(argv)
+
+    mf = load_fleet()
+    manifest_path = args.manifest or mf.DEFAULT_MANIFEST
+    manifest = mf.load_manifest(manifest_path)
+    common = ["--manifest", os.fspath(manifest_path)]
+    new = [h for h in args.hosts if h not in manifest["hosts"]]
+
+    # 1. reach, and the observation admit reuses.
+    if args.observed:
+        observed = mf.read_observed(args.observed)
+    else:
+        scratch = {**manifest, "hosts": {**manifest["hosts"], **{h: {} for h in new}}}
+        observed = mf.observe(scratch, new)
+    down = {h: o.get("error", "?") for h, o in observed["hosts"].items() if not o.get("reachable")}
+    print(f"reach: {len(new) - len(down)}/{len(new)} new hosts answer SSH as {manifest['ssh_user']}")
+    for host, why in down.items():
+        print(f"   {host}: {why}\n   -> at the screen: Tailscale login (tag:mac-mini-cluster key from Lawrence), "
+              "Remote Login and Remote Management on; then rerun")
+    if down:
+        return 1
+
+    # 2. admit.
+    try:
+        plan, notes = mf.admit_plan(manifest, observed, args.hosts, args.klass, args.hardware)
+    except mf.Failure as error:
+        print(f"glaeda-mini-bringup: admit: {error}", file=sys.stderr)
+        return 2
+    print(f"admit plan: {len(plan['hosts'])} hosts, new hardware {sorted(plan['hardware']) or 'none'}")
+    for note in notes:
+        print(f"   {note}")
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        json.dump(observed, handle)
+        observed_file = handle.name
+    admit = [os.fspath(FLEET), "admit", *args.hosts, *common, "--observed", observed_file, "--class", args.klass,
+             *(["--hardware", args.hardware] if args.hardware else []), "--yes"]
+
+    hosts = args.hosts
+    new_class = bool(plan["hardware"])
+    seed = args.seed or (next(iter(plan["hosts"])) if new_class else None)
+    rest = [h for h in hosts if h != seed]
+    steps: list[tuple[str, list[str]]] = [("admit", admit)]
+    if new_class:
+        run = args.candidate_run or ("RUN" if not args.yes else
+                                     newest_candidate_run(manifest.get("candidate_repo") or mf.CANDIDATE_REPO))
+        steps += [("seed onboard", [os.fspath(FLEET), "onboard", seed, *common, "--acceptance", "node", "--yes"]),
+                  ("seed receipt", [os.fspath(FLEET), "upgrade", seed, *common, "--candidate-run", run, "--yes"])]
+    if rest:
+        steps.append(("onboard", [os.fspath(FLEET), "onboard", *rest, *common, "--yes",
+                                  *(["--from", seed] if seed else [])]))
+    steps += [("runners", [os.fspath(RUNNER_FLEET), "--apply", "--manifest", os.fspath(manifest_path),
+                           "--hosts", ",".join(hosts)]),
+              ("check", [os.fspath(FLEET), "check", *hosts, *common])]
+    for number, (label, command) in enumerate(steps, start=1):
+        print(f"{number}. {label}: {shlex.join(command)}")
+
+    if args.registry_out:
+        args.registry_out.mkdir(parents=True, exist_ok=True)
+        shapes = {**manifest["hardware"], **plan["hardware"]}
+        for name, host in plan["hosts"].items():
+            path = args.registry_out / f"{name}.json"
+            path.write_text(json.dumps(registry_entry(name, host, shapes[host["hardware"]], args.lane_host),
+                                       indent=2) + "\n")
+            print(f"   registry: {path}")
+        print("   registry: add them to leo-workspace machines/fleet/machines/, the names to "
+              "role_holders/ci-runner.json, then `reach enroll NAME --apply` per host")
+
+    if not args.yes:
+        os.unlink(observed_file)
+        print("dry run; --yes runs these steps in order")
+        return 0
+    for label, command in steps:
+        print(f"== {label}", flush=True)
+        code = subprocess.run(command, check=False).returncode
+        if code:
+            print(f"glaeda-mini-bringup: {label} exited {code}; fix it and rerun (finished steps are no-ops)",
+                  file=sys.stderr)
+            return code
+    print("glaeda-mini-bringup: done; the runners take jobs now")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,37 @@
+{
+  "schema": "glaeda-macos-daemons/v1",
+  "note": "Desired state for macOS system daemons on every glaeda macOS host: none of these holds hot_cores for longer than hot_hours. scripts/glaeda-daemon-heal (a root LaunchDaemon) converges to it by restarting the daemon (launchd starts a fresh one); glaeda-mini-health keeps that LaunchDaemon installed and reports what it sees. A daemon with wait_idle waits for an idle host (no process named in busy) until busy_hot_hours. Seen 10-20: fseventsd at 1.0-1.7 cores for days with 13-30 GiB RSS on cmux 3/7/9/11/12/13/14 (a restart on idle cmux9 took it from 100% / 27 GiB to 1.5% / 4 MiB); audiomxd and WirelessRadioManagerd at 1.0-1.1 cores on headless aws-m4pro-5..9. A daemon at footprint_gib or more (top MEM, counting compressed and swapped pages) restarts at once, busy or not: seen 10-25, fseventsd at 102 GiB on cmuxs-mac-mini-6 with 65 GiB of swap files and 3 GiB of its 460 GiB disk free, and 54 GiB on cmuxs-mac-mini-5.",
+  "every_s": 120,
+  "hot_cores": 0.9,
+  "hot_hours": 2,
+  "busy_hot_hours": 8,
+  "footprint_gib": 16,
+  "max_restarts_per_day": 4,
+  "stop_wait_s": 10,
+  "report_stale_passes": 3,
+  "sandbox_probe": {
+    "note": "sandboxd self-heal (scripts/glaeda-daemon-heal; fleet decision by claude-sr2 (coordinator), 2026-10-28): on an idle, registry-opted-in fleet mini holding the fleet host.lock, an ad-hoc signed /bin/date under (deny mach-lookup) that takes slow_s or longer twice, confirm_after_s to confirm_within_s apart, reboots the mini (launchctl kickstart of sandboxd is refused under SIP). At most one reboot per reboot_every_s; a mini that would need a second within repeat_window_s is not rebooted and becomes an HQ fleet-alert issue. Seen 2026-10-27/28 on austin-0 and austin-1: a sandboxd stuck on one tccd request hung brew's bottle pour for 8 h; the probe took 0.1 s on healthy minis and never returned there, and a reboot cleared it.",
+    "enabled": true,
+    "slow_s": 5,
+    "confirm_after_s": 240,
+    "confirm_within_s": 1800,
+    "reboot_every_s": 86400,
+    "repeat_window_s": 604800
+  },
+  "release": {
+    "note": "The root copy keeps itself on the stable release: every every_s it reads the channel from the first of sources that answers, and replaces its script and this policy when the release's differ (hash chain channel, release.json, archive). stale_s: how long it may lag its channel, or go without reading it, before glaeda-mini-health and glaeda-fleet-status call it daemon_heal_stale.",
+    "every_s": 600,
+    "stale_s": 3600,
+    "sources": ["teamleaderleo/glaeda", "manaflow-ai/glaeda"]
+  },
+  "busy": ["Runner.Worker", "xcodebuild", "xctest", "swift-build", "swift-test"],
+  "daemons": [
+    {
+      "name": "fseventsd",
+      "path": "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd",
+      "wait_idle": true
+    },
+    {"name": "audiomxd", "path": "/usr/libexec/audiomxd", "wait_idle": false},
+    {"name": "WirelessRadioManagerd", "path": "/usr/sbin/WirelessRadioManagerd", "wait_idle": false}
+  ]
+}

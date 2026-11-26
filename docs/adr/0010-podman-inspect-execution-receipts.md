@@ -4,6 +4,8 @@
 
 Accepted for the local preview prototype.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 ADR 0008 decodes Podman inspect output and authorizes existing-container mutations from exact ownership evidence. Its first API accepted a decoded observation directly. That left the caller responsible for proving the bytes came from the reviewed inspect command and a successful process execution.

@@ -2,6 +2,7 @@
 name = "xtask"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 description = "Estate workspace automation, verification pipeline (xwork), and GitButler/stacked-PR workflow helper for glaeda"
 

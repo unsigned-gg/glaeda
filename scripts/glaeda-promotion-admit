@@ -1,0 +1,1277 @@
+#!/usr/bin/env python3
+"""glaeda-promotion-admit: lease a whole owned Mac for one exact cmux nightly promote job.
+
+    ~/.local/bin/glaeda-promotion-admit --request-stdin
+
+HQ's protected fleet workflow runs this over the fleet's ssh as the build user. stdin is one JSON request, stdout one
+JSON receipt (nothing on a refusal), stderr diagnostics. Exit 0 with a receipt; 1 when the lease could not be made
+ready or has ended; 2 for an invalid request; 3 for a request that conflicts with an earlier one for the same lease.
+
+Request (version 1): lease_id (24 hex), repository "manaflow-ai/cmux", run_id, run_attempt, source_sha (40 hex),
+job "promote-nightly-next", created_at and expires_at (RFC3339), runner_label
+"cmux-promotion-<lease_id>-promote-nightly-next", runner_name "cmux-promotion-<lease_id>", encoded_jit_config (a
+repo-scoped ephemeral JIT runner config HQ minted), controller_url, status_path
+"/v1/nightly-promotion-admission/<lease_id>". It carries no release credential.
+
+Receipt: lease_id, repository, run_id, run_attempt, source_sha, ready_at, runners {"promote-nightly-next":
+runner_label}, exclusive_claim (the lease id), runner_name.
+
+What it does, in order (the hook's PROMOTION_LEASE has the job side):
+1. Validates the request and binds it: the labels and status path are the lease id's, the job is nightly.yml's
+   promote-nightly-next (a SIGNING_JOBS entry), the controller is an allowed authority (below). Keyed by lease id:
+   a repeat of the same request returns the same receipt (or waits for the lease already being made ready); a
+   different request for a known lease is refused.
+2. A detached supervisor (its own session, so it outlives the ssh session) takes the mini's existing exclusive
+   claim the way a signing job does (the hook's take_capacity, exclusive class: every unit, fast, gateway and gui
+   token), waiting for the mini to drain as a nightly waiter until expires_at. Only then does it start the JIT
+   listener, from a copy of an installed runner tree, serving only the lease's unique label. The JIT config reaches
+   the listener through its environment (ACTIONS_RUNNER_INPUT_JITCONFIG, which the runner reads and scrubs), never
+   argv, a file or a log.
+3. The receipt is written, and printed, only once the listener logged "Listening for Jobs" while the claim's holder
+   holds the locks.
+4. The matching job's job-started hook adopts the claim under the lease lock: the holder process never changes, so
+   there is no gap, and the job sees GLAEDA_JOB_CLAIM=exclusive. Any other job on the runner is refused.
+5. Before a receipt, past expires_at with no readiness, it withdraws only its own listener, and only while that
+   listener has no session yet (frozen while it looks), then lets the claim go. After a receipt the deadline never
+   releases anything: it reads the controller's status (plain GET over the tailnet). "overflow" lets it withdraw its
+   unassigned listener; "fleet" keeps listener and claim, unless parent_completed is true and the listener is still
+   unassigned; anything else (unreachable, a non-2xx, bad or future-dated JSON) keeps the claim. A Runner.Worker of
+   the lease runner keeps the claim whatever the status, until it ends. The claim is let go after the adopted
+   Runner.Worker has exited.
+6. "Unassigned" is proved, never assumed (glaeda#1782): under the lease lock, with the listener frozen, its process
+   table, its own log and its _diag trace must all be read and show no Runner.Worker, no "Running job" and no
+   acknowledged runner request. Anything unreadable keeps the listener and the claim. Any sign of a job is first
+   persisted in state.json as "assigned", and from then on no withdrawal stops that listener, even if the job-start
+   log is late or never comes; only the listener's own exit (an ephemeral runner ends after its one job) lets go.
+   A message the broker delivered but the listener has not yet acknowledged is not assigned: until the acknowledge
+   the broker redelivers it (glaeda-cmux-runner-hook LISTENER_TAKES).
+
+It never cancels a GitHub run or job, and makes no GitHub call at all.
+
+Controller authority: HTTPS with normal certificate checks, or plain HTTP only to a numeric address that a Running
+local Tailscale daemon lists as an Online peer. No redirects are followed and no proxy environment is used.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import hashlib
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+PREFIX = "glaeda-promotion-admit"
+VERSION = 1
+REPOSITORY = "manaflow-ai/cmux"
+JOB = "promote-nightly-next"
+WORKFLOW = "nightly.yml"
+LEASE_RE = re.compile(r"[0-9a-f]{24}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+JIT_RE = re.compile(r"[A-Za-z0-9+/=_.-]{16,65536}")
+FIELDS = ("version", "lease_id", "repository", "run_id", "run_attempt", "source_sha", "job", "created_at", "expires_at",
+          "runner_label", "runner_name", "encoded_jit_config", "controller_url", "status_path")
+# a request names no release credential: any other field that looks like one refuses it
+CREDENTIAL_WORDS = re.compile(r"secret|password|passphrase|private|credential|token|p12|cert|key", re.I)
+MAX_REQUEST = 256 * 1024
+ROOT_ENV = "GLAEDA_PROMOTION_ROOT"  # tests; default ~/.local/state/glaeda/promotion
+SOURCE_ENV = "GLAEDA_PROMOTION_SOURCE_RUNNER"  # tests; default the installed runner tree (source_runner)
+POLL_ENV = "GLAEDA_PROMOTION_POLL_S"
+TAILSCALE_ENV = "GLAEDA_PROMOTION_TAILSCALE"  # tests: a fake tailscale CLI
+TAILSCALE_CLIS = ("/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                  "/opt/homebrew/bin/tailscale")
+TAILSCALE_TIMEOUT_S = 10
+STATUS_POLL_S = 15.0  # the controller's status after a receipt
+TICK_S = 1.0  # listener, Worker and deadline checks
+CLAIM_POLL_S = 2.0  # the hook's ADMIT_POLL_S
+CLOCK_SKEW_S = 30.0  # a controller timestamp later than now by more than this is future-dated
+HTTP_TIMEOUT_S = 10
+MAX_BODY = 64 * 1024
+STOP_WAIT_S = 30.0
+ADMIT_LOCK_S = 30.0
+ANSWER_GRACE_S = 60.0  # the foreground waits for readiness until expires_at plus this
+TERMINAL = ("expired", "withdrawn", "released", "failed")
+LISTENING = "Listening for Jobs"  # glaeda-cmux-runner LISTENING
+RUNNING_JOB = "Running job: "  # the listener's terminal line when it hands a job to a Runner.Worker
+WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+JIT_ENV = "ACTIONS_RUNNER_INPUT_JITCONFIG"
+COPY_SKIP = {"_work", "_diag", "glaeda-hooks", ".env", ".path", ".runner", ".runner_migrated", ".service", "svc.sh"}
+KEEP_TERMINAL_S = 7 * 86400  # finished lease records kept this long for repeat requests
+TMP_RE = re.compile(r"\.[0-9a-f]{24}\.tmp-[0-9]+")  # a lease dir being made (admit), renamed into place whole
+TMP_KEEP_S = 600.0
+
+
+class Refusal(Exception):
+    def __init__(self, why: str, code: int = 1) -> None:
+        super().__init__(why)
+        self.code = code
+
+
+class Superseded(Exception):
+    """This supervisor is not the one supervisor.json names: it must end without writing the lease's state."""
+
+
+def log(message: str) -> None:
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{stamp} {PREFIX}: {message}", file=sys.stderr, flush=True)
+
+
+def parse_time(text: Any) -> float | None:
+    """An RFC3339 timestamp with a zone as Unix seconds, or None."""
+    if not isinstance(text, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})",
+                                                      text):
+        return None
+    head, frac, zone = re.fullmatch(r"(.{19})(\.\d+)?(.*)", text).groups()
+    try:
+        value = datetime.datetime.fromisoformat(head + ("+00:00" if zone == "Z" else zone))
+    except ValueError:
+        return None
+    return value.timestamp() + (float("0" + frac[:7]) if frac else 0.0)
+
+
+def rfc3339(at: float) -> str:
+    return datetime.datetime.fromtimestamp(at, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2 ** 63
+
+
+# ---------------------------------------------------------------- controller authority
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None  # urllib then raises the 3xx as an HTTPError: never followed
+
+
+def opener() -> urllib.request.OpenerDirector:
+    """No proxy (ProxyHandler({}) ignores HTTP(S)_PROXY), no redirect, normal certificate checks."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+                                       urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+
+
+def tailscale_cli() -> list[str]:
+    override = os.environ.get(TAILSCALE_ENV)
+    if override:
+        return [override]
+    return [path for path in TAILSCALE_CLIS if os.access(path, os.X_OK)]
+
+
+def tailnet_peer_online(ip: str) -> tuple[bool, str]:
+    """Whether a Running local Tailscale daemon lists ip as an Online peer's address."""
+    for cli in tailscale_cli():
+        try:
+            out = subprocess.run([cli, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                 timeout=TAILSCALE_TIMEOUT_S, check=False,
+                                 env={"PATH": WORKLOAD_PATH, "TAILSCALE_BE_CLI": "1", "LC_ALL": "C"})
+            doc = json.loads(out.stdout) if out.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("BackendState") != "Running":
+            return False, f"the local Tailscale daemon is {str(doc.get('BackendState'))[:20]!r}, not Running"
+        for peer in (doc.get("Peer") or {}).values() if isinstance(doc.get("Peer"), dict) else ():
+            if isinstance(peer, dict) and ip in (peer.get("TailscaleIPs") or []):
+                return (peer.get("Online") is True,
+                        "" if peer.get("Online") is True else f"tailnet peer {ip} is not Online")
+        return False, f"{ip} is not a tailnet peer"
+    return False, "no local Tailscale daemon answered"
+
+
+def verify_authority(url: str) -> str | None:
+    """Why url is not an allowed controller authority, or None."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises on a bad port
+    except ValueError:
+        return "the controller URL does not parse"
+    if parts.username or parts.password or parts.query or parts.fragment or not host:
+        return "the controller URL has user info, a query or a fragment, or no host"
+    if parts.scheme == "https":
+        return None
+    if parts.scheme != "http":
+        return f"the controller URL's scheme is {parts.scheme!r}"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return "plain HTTP is allowed only to a numeric tailnet address"
+    online, why = tailnet_peer_online(str(ip))
+    return None if online else f"plain HTTP to {ip} refused: {why}"
+
+
+def exchange(url: str) -> dict[str, Any]:
+    """One GET answered with a JSON object. Raises OSError (every transport or policy failure) or ValueError."""
+    why = verify_authority(url)
+    if why:
+        raise PermissionError(why)
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    with opener().open(request, timeout=HTTP_TIMEOUT_S) as response:
+        if not 200 <= response.status < 300:
+            raise OSError(f"HTTP {response.status}")
+        doc = json.loads(response.read(MAX_BODY + 1)[:MAX_BODY + 1])
+    if not isinstance(doc, dict):
+        raise ValueError("not a JSON object")
+    return doc
+
+
+def controller_status(controller_url: str, status_path: str, lease_id: str, now: float | None = None) -> dict[str, Any]:
+    """{"status": "fleet" | "overflow" | "unreachable", "parent_completed": bool, "why": str}. Anything that is not a
+    well-formed, present-dated answer for this lease is unreachable, which keeps the claim."""
+    try:
+        doc = exchange(controller_url.rstrip("/") + status_path)
+    except urllib.error.HTTPError as error:
+        return {"status": "unreachable", "parent_completed": False, "why": f"HTTP {error.code}"}
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        return {"status": "unreachable", "parent_completed": False, "why": f"{type(error).__name__}: {error}"[:200]}
+    now = time.time() if now is None else now
+    if doc.get("lease_id") not in (None, lease_id):
+        return {"status": "unreachable", "parent_completed": False, "why": "the answer names another lease"}
+    for name, value in doc.items():
+        if name.endswith("_at") and isinstance(value, str):
+            at = parse_time(value)
+            if at is not None and at > now + CLOCK_SKEW_S:
+                return {"status": "unreachable", "parent_completed": False, "why": f"{name} is dated in the future"}
+    status = doc.get("status")
+    if status not in ("fleet", "overflow"):
+        return {"status": "unreachable", "parent_completed": False, "why": f"status {str(status)[:40]!r}"}
+    return {"status": status, "parent_completed": doc.get("parent_completed") is True, "why": ""}
+
+
+# ---------------------------------------------------------------- the request
+
+
+def validate(request: Any, now: float) -> dict[str, Any]:
+    """The request, checked, or Refusal (code 2)."""
+    def bad(why: str) -> Refusal:
+        return Refusal(f"invalid request: {why}", 2)
+
+    if not isinstance(request, dict):
+        raise bad("not a JSON object")
+    missing = [name for name in FIELDS if name not in request]
+    if missing:
+        raise bad(f"missing {', '.join(missing)}")
+    extra = [name for name in request if name not in FIELDS]
+    if any(CREDENTIAL_WORDS.search(name) for name in extra):
+        raise bad("it names a credential field; a promotion lease carries none")
+    if request["version"] != VERSION or isinstance(request["version"], bool):
+        raise bad(f"version must be {VERSION}")
+    lease = request["lease_id"]
+    if not isinstance(lease, str) or not LEASE_RE.fullmatch(lease):
+        raise bad("lease_id must be 24 lowercase hex")
+    if request["repository"] != REPOSITORY:
+        raise bad(f"repository must be {REPOSITORY}")
+    if request["job"] != JOB:
+        raise bad(f"job must be {JOB}")
+    for name in ("run_id", "run_attempt"):
+        if not positive_int(request[name]):
+            raise bad(f"{name} must be a positive integer")
+    if not isinstance(request["source_sha"], str) or not SHA_RE.fullmatch(request["source_sha"]):
+        raise bad("source_sha must be 40 lowercase hex")
+    if request["runner_name"] != f"cmux-promotion-{lease}":
+        raise bad("runner_name is not the lease's")
+    if request["runner_label"] != f"cmux-promotion-{lease}-{JOB}":
+        raise bad("runner_label is not the lease's")
+    if request["status_path"] != f"/v1/nightly-promotion-admission/{lease}":
+        raise bad("status_path is not the lease's")
+    created, expires = parse_time(request["created_at"]), parse_time(request["expires_at"])
+    if created is None or expires is None:
+        raise bad("created_at and expires_at must be RFC3339")
+    if created > now + CLOCK_SKEW_S:
+        raise bad("created_at is in the future")
+    if expires <= created:
+        raise bad("expires_at is not after created_at")
+    if not isinstance(request["encoded_jit_config"], str) or not JIT_RE.fullmatch(request["encoded_jit_config"]):
+        raise bad("encoded_jit_config is not an encoded JIT config")
+    if not isinstance(request["controller_url"], str) or len(request["controller_url"]) > 2048:
+        raise bad("controller_url must be a URL")
+    return request
+
+
+def identity(request: dict[str, Any], policy: Any = None) -> dict[str, Any]:
+    """Every field but the JIT config: what a repeat request must match, and what the hook reads (lease.json)."""
+    return {name: request[name] for name in (policy.fields if policy else FIELDS) if name != "encoded_jit_config"}
+
+
+def fingerprint(request: dict[str, Any], policy: Any = None) -> str:
+    return hashlib.sha256(json.dumps(identity(request, policy), sort_keys=True).encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- the host
+
+
+def promotion_root() -> Path:
+    override = os.environ.get(ROOT_ENV)
+    return Path(override) if override else Path.home() / ".local/state/glaeda/promotion"
+
+
+def source_runner() -> Path:
+    """The installed runner tree a lease runner is copied from: instance 0's, else the lowest instance's."""
+    override = os.environ.get(SOURCE_ENV)
+    if override:
+        return Path(override)
+    home = Path.home()
+
+    def instance(path: Path) -> int:
+        tail = path.name[len("actions-runner-glaeda"):]
+        return int(tail[1:]) if tail.startswith("-") and tail[1:].isdigit() else (0 if not tail else 1 << 30)
+
+    for candidate in sorted(home.glob("actions-runner-glaeda*"), key=instance):
+        if (candidate / "run.sh").is_file() and (candidate / "glaeda-hooks/glaeda-cmux-runner-hook").is_file():
+            return candidate
+    raise Refusal("no installed glaeda runner tree on this host to start a lease runner from")
+
+
+def load_hook(source: Path) -> Any:
+    path = source / "glaeda-hooks/glaeda-cmux-runner-hook"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_promotion", os.fspath(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    if not hasattr(module, "promotion_adopt"):
+        raise Refusal("the installed runner hook predates promotion leases")
+    return module
+
+
+def runner_settings(source: Path) -> dict[str, Any]:
+    """The source runner's capacity settings and interpreter, from its generated job-started.sh."""
+    text = (source / "glaeda-hooks/job-started.sh").read_text()
+    line = next((line for line in text.splitlines() if line.startswith("exec ")), "")
+    words = shlex.split(line)[1:]
+    if len(words) < 3 or words[2] != "job-started":
+        raise Refusal("the installed runner's job-started.sh is not a glaeda hook call")
+    settings: dict[str, Any] = {"python": words[0], "capacity_units": 0, "reserve_cores": 0, "compile_slots": 1,
+                                "canonical_roots": 1,
+                                "gui_token": "gui", "capacity_dir": None}
+    flags = {"--capacity-units": ("capacity_units", int), "--compile-slots": ("compile_slots", int),
+             "--canonical-roots": ("canonical_roots", int), "--gui-token": ("gui_token", str),
+             "--capacity-dir": ("capacity_dir", str), "--reserve-cores": ("reserve_cores", int)}
+    for at, word in enumerate(words):
+        if word in flags and at + 1 < len(words):
+            name, kind = flags[word]
+            settings[name] = kind(words[at + 1])
+    developer = None
+    with contextlib.suppress(OSError):
+        for line in (source / "glaeda-hooks/listen.sh").read_text().splitlines():
+            if line.startswith("export DEVELOPER_DIR="):
+                developer = shlex.split(line[len("export DEVELOPER_DIR="):])[0]
+    settings["developer_dir"] = developer
+    return settings
+
+
+def ps_table() -> list[tuple[int, int, str]] | None:
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,pgid=,command="], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=30, check=True, env={"LC_ALL": "C"}).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), parts[2] if len(parts) == 3 else ""))
+    return rows
+
+
+# ---------------------------------------------------------------- the lease
+
+
+class Lease:
+    def __init__(self, root: Path, lease_id: str) -> None:
+        self.dir = root / lease_id
+        self.receipt_path = self.dir / "receipt.json"
+        self.runner_dir = self.dir / "runner"
+        self.listener_log = self.dir / "listener.log"
+
+    def state(self) -> dict[str, Any]:
+        try:
+            doc = json.loads((self.dir / "state.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def lease(self) -> dict[str, Any]:
+        try:
+            doc = json.loads((self.dir / "lease.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def receipt(self) -> dict[str, Any] | None:
+        try:
+            doc = json.loads(self.receipt_path.read_text())
+        except (OSError, ValueError):
+            return None
+        return doc if isinstance(doc, dict) else None
+
+
+def write_json(path: Path, doc: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        json.dump(doc, out, sort_keys=True)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def admit_lock(root: Path):
+    import fcntl
+    fd = os.open(root / "admit.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + ADMIT_LOCK_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise Refusal("another promotion request on this host is stuck") from None
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
+def process_identity(pid: int) -> str | None:
+    """The hook's process_identity without loading the hook (the foreground's own checks)."""
+    proc = Path(f"/proc/{pid}/stat")
+    with contextlib.suppress(OSError, UnicodeDecodeError, IndexError):
+        fields = proc.read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if len(fields) > 19:
+            return "proc:" + fields[19]
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    token = out.stdout.strip()
+    return "ps:" + token if out.returncode == 0 and token else None
+
+
+def supervisor_alive(lease_dir: Path) -> bool:
+    try:
+        doc = json.loads((lease_dir / "supervisor.json").read_text())
+    except (OSError, ValueError):
+        return False
+    pid, ident = (doc.get("pid"), doc.get("identity")) if isinstance(doc, dict) else (None, None)
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    if not ident:  # its start token could not be read when it was recorded: a live pid counts as alive
+        return True
+    current = process_identity(pid)
+    return current is None or current == ident
+
+
+def recorded_supervisor(lease_dir: Path) -> int | None:
+    try:
+        doc = json.loads((lease_dir / "supervisor.json").read_text())
+    except (OSError, ValueError):
+        return None
+    pid = doc.get("pid") if isinstance(doc, dict) else None
+    return pid if isinstance(pid, int) else None
+
+
+def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int] | None:
+    """A dead supervisor's listener: its group while the leader's start token matches, otherwise a group with
+    remaining members running the lease runner's tree. Unidentified survivors are unknown, not absence."""
+    if not isinstance(pgid, int) or pgid <= 1:
+        return []
+    rows = ps_table()
+    if rows is None:
+        return None
+    tree = os.fspath(runner_dir)
+    current = process_identity(pgid)
+    if any(pid == pgid for pid, _, _ in rows):
+        if not ident or current is None:
+            return None
+        if current != ident:
+            return []  # the recorded group leader's PID has been reused
+    leader = bool(ident) and current == ident
+    members = [(pid, command) for pid, group, command in rows if group == pgid]
+    if members and not leader and not any(tree in command for _, command in members):
+        return None
+    return sorted({pid for pid, _ in members})
+
+
+def promotion_claim_owner(hook: Any, lease: Lease, owner: Any, policy: Any = None) -> Any:
+    """The existing holder follows this exact supervisor, then its recorded listener group until recovery proves
+    it safe to stop. This also covers acknowledgement before the assigned marker or job-started adoption. The
+    capture policy additionally keeps ownership until its exact cleanup receipt exists."""
+    class PromotionOwner(hook.JobOwner):
+        __slots__ = ()
+        retain_without_deadline = bool(policy)
+
+        def gone(self) -> bool:
+            if not super().gone():
+                return False
+            try:
+                state = json.loads((lease.dir / "state.json").read_text())
+                if not state or state.get("phase") not in ("claiming", "starting", "ready", *TERMINAL):
+                    return False
+                if policy and (state.get("adopted") or state.get("assigned")) and not policy.cleaned(lease):
+                    return False  # a crashed supervisor cannot free a possibly credential-bearing capture
+                group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            except (OSError, ValueError, AttributeError):
+                return False  # unknown lease state must not release a possibly active claim
+            return group == []
+
+    return PromotionOwner(owner.pid, owner.identity)
+
+
+def recover(lease: Lease, hook: Any, policy: Any = None) -> str:
+    """Recover only a proven-unassigned listener after its supervisor dies. Assigned or unknown listeners keep
+    their runner tree and exclusive claim; an acknowledged job may not have reached job-started adoption yet."""
+    with hook.promotion_locked(lease.dir, wait_s=60.0):
+        if supervisor_alive(lease.dir):
+            return "its supervisor lives"
+        state = lease.state()
+        if not state:
+            return "its lease state is unknown; keeping the listener and claim"
+        if state.get("phase") in TERMINAL:
+            if policy:
+                if (state.get("adopted") or state.get("assigned")) and not policy.cleaned(lease):
+                    return "capture cleanup is not proven; retaining durable reservation"
+                policy.unreserve(lease, hook)
+            return f"already {state.get('phase')}"
+        if hook.promotion_adopted_alive(lease.dir):
+            return "its adopted Runner.Worker still runs; its holder keeps the claim until that ends"
+        if policy and (state.get("adopted") or state.get("assigned") or state.get("phase") == "quarantined"):
+            if not policy.cleaned(lease):
+                return "capture quarantined: no matching successful cleanup receipt; keeping the claim"
+        group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+        if group is None:
+            return "its listener process state is unknown; keeping the listener and claim"
+        if group:
+            if isinstance(state.get("assigned"), dict):
+                # A previous recovery may have died after marking assignment while the group was frozen.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(state["listener_pid"], signal.SIGCONT)
+                return "its listener was assigned; keeping the listener and claim until it exits"
+            stop_allowed = False
+            try:
+                # Freeze the whole verified group, including a child forked since ps_table().
+                os.killpg(state["listener_pid"], signal.SIGSTOP)
+                # Same frozen proof as normal withdrawal; a crash can precede the sticky marker write.
+                probe = object.__new__(Supervisor)
+                probe.hook, probe.lease = hook, lease
+                verdict, evidence = probe.assignment()
+                if verdict == "assigned":
+                    state = {**state, "assigned": {"at": time.time(), "evidence": evidence[:300]}}
+                    hook.promotion_write_state(lease.dir, state)
+                if verdict not in ("unassigned", "no-session"):
+                    return f"its listener assignment is {verdict}; keeping the listener and claim"
+                stop_allowed = True
+            except OSError:
+                return "could not freeze its listener; keeping the listener and claim"
+            finally:
+                # Keep proven-unassigned listeners frozen through termination below, but never leave
+                # a retained listener frozen after an unreadable proof, failed marker write or signal.
+                if not stop_allowed:
+                    with contextlib.suppress(OSError):
+                        os.killpg(state["listener_pid"], signal.SIGCONT)
+        for signum in (signal.SIGTERM, signal.SIGCONT):
+            if group:
+                with contextlib.suppress(OSError):
+                    os.killpg(state["listener_pid"], signum)
+        deadline = time.monotonic() + STOP_WAIT_S
+        while group and time.monotonic() < deadline:
+            time.sleep(0.2)
+            group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            if group is None:
+                return "listener exit is unknown; keeping its runner tree and claim"
+        if group:
+            with contextlib.suppress(OSError):
+                os.killpg(state["listener_pid"], signal.SIGKILL)
+        if group:
+            group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            if group is None or group:
+                return "listener exit is not yet proven; keeping its runner tree and claim"
+        runner = str(lease.lease().get("runner_name") or "")
+        released = hook.release_holder(hook.holder_file(Path.home() / ".local/state/glaeda/cmux-runner", runner)) \
+            if runner else "no runner name to release"
+        if policy:
+            policy.unreserve(lease, hook)
+        shutil.rmtree(lease.runner_dir, ignore_errors=True)
+        phase = "released" if isinstance(state.get("adopted"), dict) else "failed"
+        hook.promotion_write_state(lease.dir, {**state, "phase": phase, "ended_at": time.time(),
+                                               "reason": f"its supervisor died in {state.get('phase')}; recovered"})
+    return f"recovered ({released})"
+
+
+def prune(root: Path, now: float, policy: Any = None) -> None:
+    """Finished lease records older than KEEP_TERMINAL_S (only ours: lease-id names with a terminal state), lease
+    dirs a request left half made (TMP_RE), and leases whose supervisor died while starting or ready (recover)."""
+    hook: Any = None
+    for path in sorted(root.iterdir()) if root.is_dir() else ():
+        if TMP_RE.fullmatch(path.name) and path.is_dir():
+            with contextlib.suppress(OSError):
+                if now - path.stat().st_mtime > TMP_KEEP_S:
+                    shutil.rmtree(path, ignore_errors=True)
+            continue
+        if not LEASE_RE.fullmatch(path.name) or not path.is_dir():
+            continue
+        lease = Lease(root, path.name)
+        state = lease.state()
+        with contextlib.suppress(OSError):
+            if state.get("phase") in TERMINAL and now - (path / "state.json").stat().st_mtime > KEEP_TERMINAL_S:
+                if policy:
+                    try:
+                        policy.recover(lease)
+                        # An unremoved owned marker keeps the only cleanup identity available.
+                        hook = policy.load_frozen_hook(lease.dir / "runtime", lease.lease())
+                        if Path(hook.RESERVATION).exists():
+                            continue
+                    except Exception:
+                        continue
+                shutil.rmtree(path, ignore_errors=True)
+                continue
+        if state.get("phase") in ("starting", "ready") and not supervisor_alive(path):
+            try:
+                if policy:
+                    reason = policy.recover(lease)
+                else:
+                    hook = hook or load_hook(source_runner())
+                    reason = recover(lease, hook)
+                log(f"lease {path.name}: {reason}")
+            except Exception as error:  # noqa: BLE001 - one bad record never stops a request
+                log(f"lease {path.name}: could not recover ({type(error).__name__}: {str(error)[:160]})")
+
+
+def half_made(lease: Lease) -> bool:
+    """A lease dir with no readable lease.json and no supervisor record: a request died while making it."""
+    return not lease.lease() and not (lease.dir / "supervisor.json").exists()
+
+
+def spawn_supervisor(lease: Lease, request: dict[str, Any], policy: Any = None) -> subprocess.Popen:
+    log_fd = os.open(lease.dir / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        entrypoint = policy.freeze(lease, request) if policy else Path(__file__).resolve()
+        child = subprocess.Popen([sys.executable, os.fspath(entrypoint), "--supervise", os.fspath(lease.dir)],
+                                 stdin=subprocess.PIPE, stdout=log_fd, stderr=log_fd, cwd="/", close_fds=True,
+                                 start_new_session=True)
+    finally:
+        os.close(log_fd)
+    # its own file, written before the request reaches it: only the supervisor named here may write the lease's
+    # state, so a second one started by mistake ends without touching it
+    write_json(lease.dir / "supervisor.json", {"pid": child.pid, "identity": process_identity(child.pid)})
+    assert child.stdin is not None
+    child.stdin.write(json.dumps(request).encode())  # the JIT config, through a pipe only
+    child.stdin.close()
+    return child
+
+
+def answer(lease: Lease, deadline: float, child: subprocess.Popen | None = None) -> int:
+    """Wait for the supervisor's receipt (printed) or its end. child: the supervisor this run started (its exit is
+    read from the Popen, never a zombie's pid)."""
+    while True:
+        receipt = lease.receipt()
+        if receipt is not None:
+            ready = parse_time(receipt.get("ready_at"))
+            if ready is None or ready > time.time() + CLOCK_SKEW_S:
+                raise Refusal("the lease's receipt is not present-dated")
+            print(json.dumps(receipt, sort_keys=True), flush=True)
+            return 0
+        state = lease.state()
+        if state.get("phase") in TERMINAL:
+            raise Refusal(f"the lease is {state['phase']}: {str(state.get('reason') or '')[:300]}")
+        if (child.poll() is not None) if child is not None else not supervisor_alive(lease.dir):
+            time.sleep(0.2)  # its last write may land after its exit is seen
+            if lease.receipt() is None and lease.state().get("phase") not in TERMINAL:
+                raise Refusal("the lease's supervisor exited before the lease was ready")
+            continue
+        if time.time() >= deadline:
+            raise Refusal("the lease did not become ready before it expired")
+        time.sleep(0.2)
+
+
+def admit(text: str, policy: Any = None) -> int:
+    now = time.time()
+    try:
+        request = json.loads(text)
+    except ValueError:
+        raise Refusal("invalid request: not JSON", 2) from None
+    request = policy.validate(request, now) if policy else validate(request, now)
+    expires = parse_time(request["expires_at"]) or now
+
+    def authority() -> None:  # only before a claim: a repeat of an accepted request never fails on the tailnet
+        why = policy.authority(request) if policy else verify_authority(request["controller_url"])
+        if why:
+            raise Refusal(f"invalid request: {why}", 2)
+
+    child: subprocess.Popen | None = None
+    root = policy.root() if policy else promotion_root()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lease = Lease(root, request["lease_id"])
+    with admit_lock(root):
+        prune(root, now, policy)
+        if lease.dir.exists() and half_made(lease):
+            log(f"lease {request['lease_id']}: a half-made lease dir; starting it again")
+            shutil.rmtree(lease.dir)
+        if lease.dir.exists():
+            known = lease.lease()
+            if known.get("fingerprint") != fingerprint(request, policy):
+                raise Refusal(f"lease {request['lease_id']} is known with another request; refused", 3)
+            state = lease.state()
+            if lease.receipt() is None and state.get("phase") not in TERMINAL and not supervisor_alive(lease.dir):
+                if state.get("phase", "claiming") == "claiming":  # nothing started: resume from the claim
+                    if expires <= now:
+                        raise Refusal("the lease expired before it was ready")
+                    authority()
+                    log(f"lease {request['lease_id']}: resuming its claim")
+                    child = spawn_supervisor(lease, request, policy)
+                else:  # prune recovers these; one it could not is tried once more, and the request then ends
+                    reason = policy.recover(lease) if policy else recover(lease, load_hook(source_runner()))
+                    log(f"lease {request['lease_id']}: {reason}")
+            else:
+                log(f"lease {request['lease_id']}: a repeat request")
+        else:
+            if expires <= now:
+                raise Refusal("invalid request: expires_at has passed", 2)
+            authority()
+            made = root / f".{request['lease_id']}.tmp-{os.getpid()}"  # whole or not at all: renamed in place
+            shutil.rmtree(made, ignore_errors=True)
+            made.mkdir(mode=0o700)
+            write_json(made / "lease.json", {**identity(request, policy), "fingerprint": fingerprint(request, policy)})
+            write_json(made / "state.json", {"phase": "claiming", "since": now})
+            os.rename(made, lease.dir)
+            child = spawn_supervisor(lease, request, policy)
+    return answer(lease, expires + ANSWER_GRACE_S, child)
+
+
+# ---------------------------------------------------------------- the supervisor
+
+
+class Supervisor:
+    def __init__(self, lease_dir: Path, request: dict[str, Any], policy: Any = None) -> None:
+        self.policy = policy
+        self.job = request["job"] if policy else JOB
+        self.repository = request["repository"] if policy else REPOSITORY
+        self.workflow = request["workflow"] if policy else WORKFLOW
+        self.lease = Lease(lease_dir.parent, lease_dir.name)
+        self.request = request
+        self.lease_id = request["lease_id"]
+        self.expires = parse_time(request["expires_at"]) or time.time()
+        self.source = source_runner()
+        self.hook = (policy.load_frozen_hook(self.lease.dir / "runtime", request)
+                     if policy else load_hook(self.source))
+        self.settings = runner_settings(self.source)
+        self.hook_digest = hashlib.sha256((self.lease.dir / "runtime/glaeda-cmux-runner-hook" if policy else
+                                           self.source / "glaeda-hooks/glaeda-cmux-runner-hook").read_bytes()).hexdigest()
+        if policy and not hasattr(self.hook, "capture_identity_refusal"):
+            raise Refusal("the installed runner hook predates capture leases")
+        self.state_dir = Path.home() / ".local/state/glaeda/cmux-runner"  # the hook's default --state-dir
+        self.capacity_dir = Path(self.settings["capacity_dir"] or Path(self.hook.FLEET_DIR) / "capacity")
+        self.poll = float(os.environ.get(POLL_ENV) or STATUS_POLL_S)
+        self.tick = min(TICK_S, self.poll)
+        self.listener: subprocess.Popen | None = None
+        # holder_file() and the waiter marker's who are this lease runner's
+        os.environ.update(RUNNER_NAME=request["runner_name"], GITHUB_JOB=self.job, GITHUB_RUN_ID=str(request["run_id"]))
+
+    def say(self, message: str) -> None:
+        log(f"lease {self.lease_id}: {message}")
+
+    def owned(self) -> None:
+        """Only the supervisor supervisor.json names writes the lease's state (call under the lease lock)."""
+        if recorded_supervisor(self.lease.dir) != os.getpid():
+            raise Superseded("supervisor.json names another supervisor")
+
+    def update(self, **fields: Any) -> dict[str, Any]:
+        with self.hook.promotion_locked(self.lease.dir):
+            self.owned()
+            state = {**self.lease.state(), **fields}
+            self.hook.promotion_write_state(self.lease.dir, state)
+            return state
+
+    def holder_pid_file(self) -> Path:
+        return self.hook.holder_file(self.state_dir, self.request["runner_name"])
+
+    def release_claim(self) -> str:
+        return self.hook.release_holder(self.holder_pid_file())
+
+    # -- 2: the claim, then the listener
+
+    def claim(self) -> bool:
+        hook = self.hook
+        total = int(self.settings["capacity_units"])
+        measured = getattr(hook, "capacity_cores", None)  # the runners' own total (CAPACITY_ARITHMETIC), so the
+        if measured is not None:  # lease takes every unit they scan
+            total = measured(total, int(self.settings.get("reserve_cores") or 0))
+        if total <= 0:
+            self.update(phase="failed", reason="this mini has no weighted capacity ledger to take whole")
+            return False
+        hook_sha = hashlib.sha256((self.source / "glaeda-hooks/glaeda-cmux-runner-hook").read_bytes()).hexdigest()
+        if not self.policy and hook.signing_hook_listed(REPOSITORY, self.request["source_sha"], hook_sha) is False:
+            self.update(phase="failed", reason=f"{hook.SIGNING_HOOKS_PATH} at the source sha does not list this hook")
+            return False
+        me = hook.JobOwner.of(os.getpid())
+        if me is None:
+            self.update(phase="failed", reason="cannot pin the supervisor's own identity")
+            return False
+        me = promotion_claim_owner(hook, self.lease, me, self.policy)
+        since = time.time()
+        marker = self.capacity_dir / f"{hook.ADMIT_WANT}{os.getpid()}"
+        shown = ""
+        try:
+            while True:
+                if self.policy and (why := self.policy.host_refusal(hook, total)):
+                    self.update(phase="failed", reason=why)
+                    return False
+                taken: dict[str, Any] = {}
+                held, note = hook.take_capacity(
+                    hook.HOST_LOCK, self.capacity_dir, total, self.job, me, self.state_dir,
+                    int(self.settings["compile_slots"]), int(self.settings["canonical_roots"]), self.repository,
+                    hook.DEFAULT_HOME_REPO, workflow=self.workflow, taken_out=taken, klass=hook.EXCLUSIVE_CLASS,
+                    since=since, gui_token=self.settings["gui_token"], tier="" if self.policy else hook.TIER_NIGHTLY,
+                    keep_while=self.lease.dir)  # the holder also stays while an adopted Runner.Worker lives
+                if held:
+                    stray = hook.stray_job_processes(Path.home(), os.getpid())
+                    if self.policy and (why := self.policy.host_refusal(hook, total)):
+                        hook.release_host_lock(self.state_dir)
+                        self.update(phase="failed", reason=why)
+                        return False
+                    if stray is None or stray:
+                        hook.release_host_lock(self.state_dir)
+                        held, note = False, "an earlier job's processes still run in a runner's _work"
+                if held:
+                    break
+                if hook.LEDGER_FINAL_MARK in note:  # waiting until expires_at cannot clear it, and would hold the mini
+                    self.update(phase="failed", reason=note[:300])
+                    return False
+                if time.time() >= self.expires:
+                    self.update(phase="expired", reason=f"no whole-mini claim before expires_at ({note[:200]})")
+                    return False
+                if note != shown:
+                    self.say(f"waiting for the whole mini: {note[:300]}")
+                    shown = note
+                hook.write_want(marker, since, list(taken.get("wants") or ["units"]),
+                                "" if self.policy else hook.TIER_NIGHTLY)
+                time.sleep(min(CLAIM_POLL_S, max(0.0, self.expires - time.time())))
+        finally:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+        try:
+            holder = int(self.holder_pid_file().read_text().strip())
+        except (OSError, ValueError):
+            self.release_claim()
+            self.update(phase="failed", reason="the claim's holder did not record itself")
+            return False
+        if self.policy:
+            self.policy.reserve(self.lease, hook)
+        self.update(phase="starting", holder_pid=holder, units=int(taken["units"]), units_total=total,
+                    claimed_at=time.time())
+        self.say(f"holding the whole mini ({note[:300]})")
+        return True
+
+    def prepare_runner(self) -> None:
+        dest = self.lease.runner_dir
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(mode=0o700)
+        for entry in sorted(self.source.iterdir()):
+            if entry.name in COPY_SKIP or entry.name.startswith(".credentials") or entry.name.endswith(".log"):
+                continue
+            target = dest / entry.name
+            if sys.platform == "darwin":  # an APFS clone: the runner's binaries cost no disk
+                subprocess.run(["/bin/cp", "-cRP", os.fspath(entry), os.fspath(target)], check=True, timeout=600,
+                               stdin=subprocess.DEVNULL, capture_output=True)
+            elif entry.is_dir() and not entry.is_symlink():
+                shutil.copytree(entry, target, symlinks=True)
+            else:
+                shutil.copy2(entry, target, follow_symlinks=False)
+        hooks = dest / "glaeda-hooks"
+        hooks.mkdir()
+        for name in ("glaeda-cmux-runner-hook", "glaeda_reservation.py"):
+            source = (self.lease.dir / "runtime" if self.policy else self.source / "glaeda-hooks") / name
+            if source.exists():
+                shutil.copy2(source, hooks / name)
+        python = shlex.quote(self.settings["python"])
+        hook = shlex.quote(os.fspath(hooks / "glaeda-cmux-runner-hook"))
+        lease_flag = "--capture-lease" if self.policy else "--promotion-lease"
+        common = (f" {lease_flag} {shlex.quote(os.fspath(self.lease.dir))} --no-disk"
+                  f" --state-dir {shlex.quote(os.fspath(self.state_dir))}")
+        started = ("#!/bin/bash\n"
+                   "# glaeda-promotion-admit lease runner job-started hook (generated). It adopts the lease's exclusive\n"
+                   "# claim for the one matching job and refuses any other; a non-zero exit fails the job first.\n"
+                   f"exec {python} {hook} job-started{common} --allowed-repo {shlex.quote(self.repository)}"
+                   f" --capacity-dir {shlex.quote(os.fspath(self.capacity_dir))}"
+                   f"{' --allow-event workflow_dispatch' if self.policy else ''}\n")
+        completed = ("#!/bin/bash\n"
+                     "# glaeda-promotion-admit lease runner job-completed hook (generated). Never fails the job.\n"
+                     f"{python} {hook} job-completed{common} || true\n"
+                     "exit 0\n")
+        for name, text in (("job-started.sh", started), ("job-completed.sh", completed)):
+            (hooks / name).write_text(text)
+            (hooks / name).chmod(0o755)
+        (dest / ".env").write_text(f"LANG=en_US.UTF-8\nACTIONS_RUNNER_HOOK_JOB_STARTED={hooks / 'job-started.sh'}\n"
+                                   f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={hooks / 'job-completed.sh'}\n")
+        (dest / ".path").write_text(WORKLOAD_PATH + "\n")
+
+    def start_listener(self) -> None:
+        if self.policy:
+            copied = self.lease.runner_dir / "glaeda-hooks/glaeda-cmux-runner-hook"
+            if hashlib.sha256(copied.read_bytes()).hexdigest() != self.hook_digest:
+                raise Refusal("runner hook changed while preparing the capture lease")
+        hooks = self.lease.runner_dir / "glaeda-hooks"
+        env = {"HOME": os.fspath(Path.home()), "PATH": WORKLOAD_PATH, "LANG": "en_US.UTF-8",
+               "USER": os.environ.get("USER", ""), "LOGNAME": os.environ.get("LOGNAME", ""),
+               "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(hooks / "job-started.sh"),
+               "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(hooks / "job-completed.sh"),
+               JIT_ENV: self.request.pop("encoded_jit_config")}  # held nowhere after this
+        for name in ("TMPDIR", "GLAEDA_FLEET_DIR"):
+            if os.environ.get(name):
+                env[name] = os.environ[name]
+        if self.settings.get("developer_dir"):
+            env["DEVELOPER_DIR"] = self.settings["developer_dir"]
+        out = os.open(self.lease.listener_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            self.listener = subprocess.Popen([os.fspath(self.lease.runner_dir / "run.sh")],
+                                             cwd=self.lease.runner_dir, env=env, stdin=subprocess.DEVNULL,
+                                             stdout=out, stderr=out, close_fds=True, start_new_session=True)
+        finally:
+            os.close(out)
+            env.clear()
+        self.update(listener_pid=self.listener.pid, listener_identity=self.hook.process_identity(self.listener.pid))
+        self.say(f"the JIT listener started (pid {self.listener.pid}), serving only {self.request['runner_label']}")
+
+    # -- the listener's life
+
+    def listener_pids(self) -> list[int]:
+        """Our listener's process group, by its recorded group id and the lease runner's path; [] when gone."""
+        if self.listener is None:
+            return []
+        leader = self.listener.poll() is None
+        rows = ps_table()
+        if rows is None:
+            return [self.listener.pid] if leader else []
+        tree = os.fspath(self.lease.runner_dir)
+        return sorted({pid for pid, pgid, command in rows if pgid == self.listener.pid
+                       and (tree in command or pid == self.listener.pid)} | ({self.listener.pid} if leader else set()))
+
+    def online(self) -> bool:
+        try:
+            return LISTENING.encode() in self.lease.listener_log.read_bytes()
+        except OSError:
+            return False
+
+    def signal_listener(self, signum: int) -> None:
+        if self.listener is None:
+            return
+        with contextlib.suppress(OSError):
+            os.killpg(self.listener.pid, signum)
+
+    def stop_listener(self) -> None:
+        if not self.listener_pids():
+            return
+        self.signal_listener(signal.SIGTERM)
+        self.signal_listener(signal.SIGCONT)
+        deadline = time.monotonic() + STOP_WAIT_S
+        while self.listener_pids() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if self.listener_pids():
+            self.signal_listener(signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.listener.wait(timeout=5)
+
+    def assignment(self) -> tuple[str, str]:
+        """("assigned" | "unassigned" | "no-session" | "unknown", evidence) for our listener, read while it is frozen.
+        Only "unassigned" and "no-session" (it never logged Listening for Jobs, so nothing can have reached it) let a
+        withdrawal stop it; "unknown" (anything unreadable) keeps it, like "assigned"."""
+        try:
+            commands = subprocess.run(["/bin/ps", "-axww", "-o", "command="], stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, timeout=60, check=True).stdout.splitlines()
+        except Exception as error:  # noqa: BLE001
+            return "unknown", f"the process table is unreadable ({type(error).__name__})"
+        try:
+            log = self.lease.listener_log.read_bytes()
+        except OSError as error:
+            return "unknown", f"the listener log is unreadable ({type(error).__name__})"
+        runner_dir = self.lease.runner_dir
+        if any(self.hook.runner_worker(runner_dir, command) for command in commands):
+            return "assigned", "a Runner.Worker of the lease runner runs"
+        if RUNNING_JOB.encode() in log:
+            return "assigned", "the listener logged Running job"
+        if LISTENING.encode() not in log:
+            return "no-session", "the listener has no session yet"
+        try:
+            traces = [n for n in os.listdir(runner_dir / "_diag") if n.startswith("Runner_") and n.endswith(".log")]
+        except OSError as error:
+            return "unknown", f"the listener's _diag is unreadable ({type(error).__name__})"
+        if not traces:
+            return "unknown", "the listener has a session but no _diag/Runner_*.log"
+        try:
+            request = self.hook.listener_request(runner_dir)
+        except Exception as error:  # noqa: BLE001
+            return "unknown", f"the listener's _diag trace is unreadable ({type(error).__name__})"
+        if request is not None:
+            return "assigned", f"the listener acknowledged runner request {request[:80]}"
+        return "unassigned", "no Runner.Worker, no Running job and no acknowledged request in the listener's trace"
+
+    def mark_assigned(self, state: dict[str, Any], evidence: str) -> dict[str, Any]:
+        """Persist that a job reached our listener (call under the lease lock). Sticky: it is never cleared."""
+        if isinstance(state.get("assigned"), dict):
+            return state
+        state = {**state, "assigned": {"at": time.time(), "evidence": evidence[:300]}}
+        self.hook.promotion_write_state(self.lease.dir, state)
+        self.say(f"a job reached the listener ({evidence[:200]}); keeping the listener and the claim")
+        return state
+
+    def withdraw(self, why: str, phase: str = "withdrawn", session_ok: bool = False) -> bool:
+        """Stop our own listener only while it is proven unassigned, then let the claim go. Under the lease lock, so
+        a job is never adopted after this, and this never runs after one was. False when the listener has, or may
+        have, a job. A listener that has a session (logged Listening for Jobs) is stopped only when session_ok: the
+        controller released the lease (overflow, or parent_completed), or the claim is already lost or never was
+        whole (a dead holder, a failed start). Capture explicitly permits withdrawal on its admission deadline
+        only with this frozen unassigned proof; promotion still waits for controller authority."""
+        with self.hook.promotion_locked(self.lease.dir, wait_s=60.0):
+            self.owned()
+            state = self.lease.state()
+            if isinstance(state.get("adopted"), dict):
+                return False
+            if self.listener_pids():
+                if isinstance(state.get("assigned"), dict):
+                    return False  # a job reached it: keep it, even with no job-start log yet
+                self.signal_listener(signal.SIGSTOP)  # it can take no job while it is looked at
+                verdict, evidence = self.assignment()
+                if verdict == "assigned":
+                    self.mark_assigned(state, evidence)
+                if not (verdict == "no-session" or verdict == "unassigned" and session_ok):
+                    self.signal_listener(signal.SIGCONT)
+                    if verdict == "unknown":
+                        self.say(f"cannot prove the listener unassigned ({evidence[:200]}); keeping it")
+                    return False
+                self.stop_listener()
+            released = self.release_claim()
+            self.hook.promotion_write_state(self.lease.dir, {**state, "phase": phase, "reason": why[:400],
+                                                             "ended_at": time.time()})
+        self.say(f"withdrew its unassigned listener ({why[:200]}); {released}")
+        self.cleanup()
+        return True
+
+    def finish(self) -> None:
+        """The adopted Runner.Worker has exited: let the claim go."""
+        with self.hook.promotion_locked(self.lease.dir):
+            self.owned()
+        self.stop_listener()  # an ephemeral listener exits after its one job; never leave one behind
+        released = self.release_claim()
+        self.update(phase="released", reason="the adopted job's Runner.Worker ended", ended_at=time.time())
+        self.say(f"the adopted job ended; {released}")
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        if self.policy:
+            self.policy.unreserve(self.lease, self.hook)
+        shutil.rmtree(self.lease.runner_dir, ignore_errors=True)
+
+    def write_receipt(self) -> None:
+        request = self.request
+        receipt = {"lease_id": self.lease_id, "repository": request["repository"], "run_id": request["run_id"],
+                   "run_attempt": request["run_attempt"], "source_sha": request["source_sha"],
+                   "ready_at": rfc3339(time.time()), "runners": {self.job: request["runner_label"]},
+                   "exclusive_claim": self.lease_id, "runner_name": request["runner_name"]}
+        if self.policy:
+            receipt.update(workflow=request["workflow"], job=self.job, ref=request["ref"], hook_sha256=self.hook_digest)
+        write_json(self.lease.receipt_path, receipt)
+        self.update(phase="ready", ready_at=receipt["ready_at"])
+        self.say("ready: the listener is online and the whole mini is held; receipt written")
+
+    def holder_alive(self, state: dict[str, Any]) -> bool:
+        pid = state.get("holder_pid")
+        try:
+            return isinstance(pid, int) and int(self.holder_pid_file().read_text().strip()) == pid \
+                and self.hook.pid_alive(pid)
+        except (OSError, ValueError):
+            return False
+
+    def step(self, last_status: list[float]) -> bool:
+        """One look. False once the lease has ended."""
+        hook = self.hook
+        state = self.lease.state()
+        adopted = state.get("adopted")
+        if self.policy and not self.holder_alive(state):
+            if not adopted and not state.get("assigned"):
+                return not self.withdraw("holder lost before adoption", phase="failed", session_ok=True)
+            if state.get("phase") != "quarantined":
+                self.update(phase="quarantined", reason="holder lost; durable reservation retains host")
+                self.say("holder lost; durable reservation retains host until cleanup")
+            group = listener_group(self.lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            worker_gone = (hook.JobOwner(int(adopted["pid"]), str(adopted["identity"])).gone()
+                           if isinstance(adopted, dict) else group == [])
+            if worker_gone and group is not None and self.policy.cleaned(self.lease):
+                self.finish()
+                return False
+            return True
+        if isinstance(adopted, dict):
+            if self.lease.receipt() is None and self.online():
+                self.write_receipt()
+            if hook.JobOwner(int(adopted["pid"]), str(adopted["identity"])).gone():
+                if self.policy and not self.policy.cleaned(self.lease):
+                    if state.get("phase") != "quarantined":
+                        self.update(phase="quarantined", reason="capture cleanup is not proven; retaining the whole host")
+                        self.say("quarantined: missing or invalid cleanup receipt; whole-host claim retained")
+                    return True
+                self.finish()
+                return False
+            return True
+        phase = state.get("phase")
+        if self.policy and phase == "quarantined":
+            if self.policy.cleaned(self.lease) and listener_group(
+                    self.lease.runner_dir, state.get("listener_pid"), state.get("listener_identity")) == []:
+                self.finish()
+                return False
+            return True
+        if phase not in hook.PROMOTION_LIVE:
+            return False
+        if not self.holder_alive(state):
+            # the claim is gone (a holder killed by hand): nothing may run here as if it held the mini
+            return not self.withdraw("the claim's holder exited", phase="failed", session_ok=True)
+        if phase == "starting":
+            if self.online():
+                self.write_receipt()
+                return True
+            if not self.listener_pids():
+                return not self.withdraw("the listener exited before it was online", phase="failed")
+            if time.time() >= self.expires:
+                return not self.withdraw("expires_at passed before the listener was online", phase="expired")
+            return True
+        # Promotion readiness waits for controller authority; capture expiry still
+        # requires a frozen proof of no assignment and never releases cleanup quarantine.
+        if hook.runner_busy_now(self.lease.runner_dir):
+            if not isinstance(state.get("assigned"), dict):
+                with hook.promotion_locked(self.lease.dir):
+                    self.owned()
+                    self.mark_assigned(self.lease.state(), "a Runner.Worker, or a request its listener took")
+            return True  # a Runner.Worker (or a job its listener took) keeps the claim until it ends
+        if self.policy and isinstance(state.get("assigned"), dict) and not self.listener_pids():
+            if not self.policy.cleaned(self.lease):
+                if phase != "quarantined":
+                    self.update(phase="quarantined", reason="assigned capture has no cleanup receipt")
+                return True
+        if not self.listener_pids():  # nothing can take the job here any more: never hold the mini for nothing
+            return not self.withdraw("the listener exited with no adopted job", phase="failed")
+        if self.policy:
+            if time.time() >= self.expires:
+                return not self.withdraw("capture admission expired without a job", phase="expired", session_ok=True)
+            return True
+        if time.monotonic() - last_status[0] < self.poll:
+            return True
+        last_status[0] = time.monotonic()
+        status = controller_status(self.request["controller_url"], self.request["status_path"], self.lease_id)
+        if status["status"] == "overflow":
+            return not self.withdraw("the controller sent the job to overflow", session_ok=True)
+        if status["status"] == "fleet" and status["parent_completed"]:
+            return not self.withdraw("the controller saw the parent run complete", session_ok=True)
+        if status["status"] == "unreachable":
+            self.say(f"controller unreachable ({status['why'][:160]}); keeping the claim")
+        return True
+
+    def run(self) -> int:
+        try:
+            return self.supervise()
+        except Superseded as why:
+            self.say(f"not this lease's supervisor ({why}); ending without touching it")
+            return 1
+
+    def supervise(self) -> int:
+        with self.hook.promotion_locked(self.lease.dir):
+            self.owned()
+            if self.lease.state().get("phase") != "claiming":
+                return 1
+        try:
+            if not self.claim():
+                return 1
+            self.prepare_runner()
+            self.start_listener()
+        except Superseded:
+            raise
+        except Exception as error:  # noqa: BLE001 - never leave a claim held for a listener that did not start
+            self.say(f"could not start the listener: {type(error).__name__}")
+            try:
+                if self.listener is not None:
+                    self.withdraw(f"start failed ({type(error).__name__})", phase="failed", session_ok=True)
+                else:
+                    self.release_claim()
+                    self.update(phase="failed", reason=f"start failed ({type(error).__name__})")
+                    self.cleanup()
+            except Superseded:
+                raise
+            except Exception as again:  # noqa: BLE001 - e.g. the lease lock timed out (TimeoutError)
+                # the holder follows this process and lets the claim go when it exits, unless a job adopted it;
+                # the next request's prune stops the listener and removes the runner tree (recover)
+                self.say(f"could not withdraw ({type(again).__name__}); exiting so the claim follows this process")
+            return 1
+        last_status = [float("-inf")]
+        while True:
+            try:
+                if not self.step(last_status):
+                    return 0
+            except Superseded:
+                raise
+            except Exception as error:  # noqa: BLE001 - a bad look keeps the claim and looks again
+                self.say(f"look failed ({type(error).__name__}: {str(error)[:120]}); keeping the claim")
+            time.sleep(self.tick)
+
+
+def supervise(lease_dir: Path, policy: Any = None) -> int:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    text = sys.stdin.read(MAX_REQUEST + 1)
+    sys.stdin.close()
+    request = policy.validate(json.loads(text), time.time()) if policy else validate(json.loads(text), time.time())
+    lease = Lease(lease_dir.parent, lease_dir.name)
+    if lease.lease().get("fingerprint") != fingerprint(request, policy) or lease_dir.name != request["lease_id"]:
+        raise Refusal("the supervisor's request is not its lease's")
+    try:
+        supervisor = Supervisor(lease_dir, request, policy)
+    except Exception as error:  # noqa: BLE001 - nothing is held yet: say why, so the request ends at once
+        why = str(error) if isinstance(error, Refusal) else type(error).__name__
+        if recorded_supervisor(lease.dir) == os.getpid():  # never a second supervisor's write
+            write_json(lease.dir / "state.json", {**lease.state(), "phase": "failed", "reason": why[:400]})
+        raise
+    return supervisor.run()
+
+
+def main(argv: list[str] | None = None, policy: Any = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        if argv == ["--request-stdin"]:
+            text = sys.stdin.read(MAX_REQUEST + 1)
+            if len(text) > MAX_REQUEST:
+                raise Refusal("invalid request: too large", 2)
+            return admit(text, policy)
+        if len(argv) == 2 and argv[0] == "--supervise":
+            return supervise(Path(argv[1]), policy)
+        print(f"usage: {PREFIX} --request-stdin", file=sys.stderr)
+        return 2
+    except Refusal as refusal:
+        log(f"refused: {refusal}")
+        return refusal.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

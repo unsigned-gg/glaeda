@@ -131,14 +131,19 @@ mod tests {
 
     use super::*;
 
+    // PID and clock alone collided between two tests of one binary (glaeda#2244's CI): a counter keeps each
+    // fixture path distinct (router review of glaeda#2249, F1).
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temporary_document(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "glaeda-blender-plan-{}-{nonce}-{name}.json",
-            std::process::id()
+            "glaeda-blender-plan-{}-{nonce}-{}-{name}.json",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes).unwrap();
         path

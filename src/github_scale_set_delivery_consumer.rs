@@ -14,7 +14,8 @@ use crate::disposable_prepared_template::{
     DisposablePreparedTemplateIdentity, DisposablePreparedTemplateManifest,
 };
 use crate::disposable_worker_reconciler::{
-    CapacityClaimId, DisposableAttemptId, DisposableVmId, DisposableWorkerResources,
+    CapacityClaimId, DisposableAttemptId, DisposableHostBudget, DisposableVmId,
+    DisposableWorkerResources,
 };
 use crate::execution_admission::EpochMillis;
 use crate::github_scale_set_delivery::{
@@ -40,9 +41,37 @@ pub(crate) struct ScaleSetDeliveryConsumerPolicy {
     request_labels: Vec<String>,
     resources: DisposableWorkerResources,
     prepared_template_identity: DisposablePreparedTemplateIdentity,
+    host_budget: DisposableHostBudget,
 }
 
 impl ScaleSetDeliveryConsumerPolicy {
+    /// Let this host run up to `budget.max_workers()` workers of the policy's size at once, with
+    /// their summed reservations inside `budget.total()`.
+    ///
+    /// Every policy starts at one worker per host; this is the only way to raise it. The budget
+    /// must admit at least one worker of the policy's size.
+    pub(crate) fn with_host_budget(
+        mut self,
+        budget: DisposableHostBudget,
+    ) -> Result<Self, ScaleSetDeliveryConsumerError> {
+        if !budget.admits_another(
+            crate::disposable_worker_reconciler::DisposableHostUsage::zero(),
+            self.resources,
+        ) {
+            return Err(invalid_policy());
+        }
+        self.host_budget = budget;
+        Ok(self)
+    }
+
+    pub(crate) const fn host_budget(&self) -> DisposableHostBudget {
+        self.host_budget
+    }
+
+    pub(crate) const fn resources(&self) -> DisposableWorkerResources {
+        self.resources
+    }
+
     pub(crate) fn new(
         scale_set_id: u32,
         repository: &str,
@@ -123,6 +152,7 @@ impl ScaleSetDeliveryConsumerPolicy {
             request_labels: labels,
             resources,
             prepared_template_identity,
+            host_budget: DisposableHostBudget::single(resources),
         })
     }
 }
@@ -135,6 +165,7 @@ impl fmt::Debug for ScaleSetDeliveryConsumerPolicy {
             .field("repository", &"<enrolled>")
             .field("label_count", &self.request_labels.len())
             .field("resources", &self.resources)
+            .field("max_workers", &self.host_budget.max_workers())
             .field("prepared_template_identity", &"<private>")
             .finish()
     }
@@ -289,12 +320,13 @@ fn reconcile_event(
             validate_tombstone_event(existing, event)?;
             return Ok(catalog.clone());
         }
-        if catalog
+        // Each new reservation is counted against the host budget: under the worker ceiling and
+        // with the summed reservations inside the host total. A one-worker budget is the old rule
+        // (no reservation beside any reserved worker).
+        let usage = catalog
             .host_usage()
-            .map_err(|_| consumer_error("delivery_consumer_catalog_invalid"))?
-            .workers()
-            != 0
-        {
+            .map_err(|_| consumer_error("delivery_consumer_catalog_invalid"))?;
+        if !policy.host_budget.admits_another(usage, policy.resources) {
             return Err(consumer_error("delivery_consumer_capacity_unavailable"));
         }
         let reservation = DisposableAttemptReservation::new(
@@ -738,6 +770,111 @@ mod tests {
                 .unwrap();
         }
         catalog
+    }
+
+    fn budget_policy(max_workers: u16, memory_fits: u64) -> ScaleSetDeliveryConsumerPolicy {
+        policy()
+            .with_host_budget(
+                DisposableHostBudget::new(
+                    max_workers,
+                    DisposableWorkerResources::new(
+                        64_000,
+                        memory_fits * (2 << 30),
+                        u64::from(max_workers) * (20 << 30),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn available(jobs: &[(u64, &str)]) -> ScaleSetDelivery {
+        delivery(
+            jobs.iter()
+                .map(|(request, job_id)| ScaleSetBridgeEvent::Available(job(*request, job_id)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn one_worker_host_refuses_a_second_reservation() {
+        let error = reconcile_scale_set_delivery(
+            &policy(),
+            &available(&[(41, "job-1"), (42, "job-2")]),
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "delivery_consumer_capacity_unavailable");
+        assert_eq!(policy().host_budget().max_workers(), 1);
+    }
+
+    #[test]
+    fn three_worker_host_reserves_two_jobs_then_a_third_and_refuses_a_fourth() {
+        let policy = budget_policy(3, 3);
+        let two = reconcile_scale_set_delivery(
+            &policy,
+            &available(&[(41, "job-1"), (42, "job-2")]),
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        assert_eq!(two.active().len(), 2);
+        assert_eq!(two.host_usage().unwrap().workers(), 2);
+        assert_ne!(
+            two.active()[0].attempt().vm_id(),
+            two.active()[1].attempt().vm_id(),
+            "each clone has its own VM identity"
+        );
+
+        let three = reconcile_scale_set_delivery(
+            &policy,
+            &available(&[(43, "job-3")]),
+            &two,
+            observed_at(),
+        )
+        .unwrap();
+        assert_eq!(three.active().len(), 3);
+        let error = reconcile_scale_set_delivery(
+            &policy,
+            &available(&[(44, "job-4")]),
+            &three,
+            observed_at(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "delivery_consumer_capacity_unavailable");
+    }
+
+    #[test]
+    fn host_memory_budget_refuses_the_third_reservation_under_a_higher_ceiling() {
+        let policy = budget_policy(3, 2);
+        let two = reconcile_scale_set_delivery(
+            &policy,
+            &available(&[(41, "job-1"), (42, "job-2")]),
+            &DisposableAttemptCatalogDocument::empty(),
+            observed_at(),
+        )
+        .unwrap();
+        assert_eq!(two.active().len(), 2);
+        let error = reconcile_scale_set_delivery(
+            &policy,
+            &available(&[(43, "job-3")]),
+            &two,
+            observed_at(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "delivery_consumer_capacity_unavailable");
+    }
+
+    #[test]
+    fn host_budget_must_fit_one_worker() {
+        let too_small = DisposableHostBudget::new(
+            3,
+            DisposableWorkerResources::new(64_000, 1 << 30, 60 << 30).unwrap(),
+        )
+        .unwrap();
+        assert!(policy().with_host_budget(too_small).is_err());
     }
 
     #[test]

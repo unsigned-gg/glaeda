@@ -6,6 +6,12 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Two tests in one process can read the clock in the same nanosecond (a coarse clock, parallel test
+// threads): the counter keeps each temp path its own. glaeda#2244's CI, 2026-11-20: two
+// rolling_tip_ledger_store tests shared one journal and each read the other's partial line.
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(PathBuf);
 
@@ -15,6 +21,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let nonce = format!("{nonce}-{}", NEXT_TEMP.fetch_add(1, Ordering::Relaxed));
         let root =
             std::env::temp_dir().join(format!("glaeda-macos-{}-{nonce}", std::process::id()));
         fs::create_dir(&root).unwrap();

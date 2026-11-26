@@ -4,6 +4,8 @@
 
 Accepted for the local preview prototype.
 
+Retired: the preview code was removed from the tree; see [`docs/history/RETIRED_FEATURE_ISLANDS.md`](../history/RETIRED_FEATURE_ISLANDS.md).
+
 ## Context
 
 ADR 0011 blocks operations that do not fit the observed Podman state. Some mismatches represent an already satisfied goal, not an error. Starting an already running preview and stopping an already inactive preview should avoid subprocess calls while remaining visible to callers and journals.

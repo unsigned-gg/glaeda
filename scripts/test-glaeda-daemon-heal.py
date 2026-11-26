@@ -1,0 +1,1806 @@
+#!/usr/bin/env python3
+"""Tests for scripts/glaeda-daemon-heal and its desired state, config/macos-daemons.json."""
+
+from __future__ import annotations
+
+import copy
+import gzip
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import plistlib
+import re
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+import urllib.error
+from unittest import mock
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+POLICY_PATH = ROOT / "config" / "macos-daemons.json"
+
+
+def load(name: str, path: Path):
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+heal = load("glaeda_daemon_heal", ROOT / "scripts" / "glaeda-daemon-heal")
+POLICY = heal.load_policy(POLICY_PATH)
+FSEV = next(d for d in POLICY["daemons"] if d["name"] == "fseventsd")
+WRM = next(d for d in POLICY["daemons"] if d["name"] == "WirelessRadioManagerd")
+T0 = 1_790_500_000.0
+
+
+class FakeHost(heal.Host):
+    """Processes from a table; CPU time grows by `rate` cores per second of fake clock."""
+
+    def __init__(self) -> None:
+        self.t = T0
+        self.procs: dict[int, list] = {}  # pid -> [uid, cpu, exe, rate]
+        self.signals: list[tuple[int, int]] = []
+        self.respawn: dict[str, int] = {}
+        self.survives_term = False
+        self.sizes: dict[int, int] = {}  # pid -> footprint bytes
+        self.asked: list[list[int]] = []
+        self.probes: list[float | None] = []  # sandbox probe answers, in order; empty: a healthy 0.1 s
+        self.probed = 0
+        self.hold = ""
+        self.lock_held = False
+        self.reboots: list[float] = []
+        self.reboot_result = (0, "")
+        self.journal_rows: list[dict] = []
+        self.journal_broken = False
+        self.ps_broken = False
+
+    def processes_strict(self):
+        if self.ps_broken:
+            raise heal.HealError("ps gave no process list (exit 1: x)")
+        return self.processes()
+
+    def sandbox_hold(self, now: float) -> str:
+        return self.hold
+
+    def sandbox_probe(self, slow_s: float):
+        self.probed += 1
+        return self.probes.pop(0) if self.probes else 0.1
+
+    def with_host_lock(self, fn):
+        return None if self.lock_held else fn()
+
+    def reboot(self):
+        self.reboots.append(self.t)
+        return self.reboot_result
+
+    def journal_read(self):
+        if self.journal_broken:
+            raise heal.HealError("sandboxd journal unreadable: broken")
+        return [dict(r) for r in self.journal_rows]
+
+    def journal_append(self, entry):
+        self.journal_rows.append(dict(entry))
+
+    def add(self, pid: int, exe: str, rate: float, uid: int = 0) -> None:
+        self.procs[pid] = [uid, 0.0, exe, rate]
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+        for row in self.procs.values():
+            row[1] += row[3] * seconds
+
+    def now(self) -> float:
+        return self.t
+
+    def processes(self):
+        return [(pid, r[0], r[1], r[2]) for pid, r in self.procs.items()]
+
+    def footprints(self, pids):
+        self.asked.append(list(pids))
+        return {pid: self.sizes[pid] for pid in pids if pid in self.sizes and pid in self.procs}
+
+    def signal(self, pid: int, sig: int) -> bool:
+        self.signals.append((pid, sig))
+        if pid in self.procs and (sig == signal.SIGKILL or not self.survives_term):
+            exe = self.procs.pop(pid)[2]
+            if exe in self.respawn:
+                self.add(self.respawn.pop(exe), exe, 0.01)
+        return True
+
+    def sleep(self, seconds: float) -> None:
+        pass
+
+
+class Base(unittest.TestCase):
+    def setUp(self) -> None:
+        self.host = FakeHost()
+        self.state: dict = {}
+        self.policy = copy.deepcopy(POLICY)
+
+    def tick(self, seconds: float | None = None, apply: bool = True) -> dict:
+        self.host.advance(self.policy["every_s"] if seconds is None else seconds)
+        self.state, report = heal.reconcile(self.host, self.policy, self.state, apply)
+        return report
+
+    def run_for(self, hours: float, apply: bool = True) -> list[dict]:
+        actions: list[dict] = []
+        steps = int(hours * 3600 / self.policy["every_s"])
+        for _ in range(steps):
+            actions += self.tick(apply=apply)["actions"]
+        return actions
+
+
+class Policy(unittest.TestCase):
+    def test_shipped_policy_is_valid_and_names_the_seen_daemons(self) -> None:
+        self.assertEqual({d["name"] for d in POLICY["daemons"]}, {"fseventsd", "audiomxd", "WirelessRadioManagerd"})
+        self.assertTrue(FSEV["wait_idle"], "a fseventsd restart drops live FSEvents streams: only on an idle host")
+
+    def test_only_system_executables_can_be_named(self) -> None:
+        for path in ("/opt/homebrew/bin/fseventsd", "/Users/cmux/fseventsd", "/usr/libexec/../../tmp/fseventsd",
+                     "/usr/libexec/other"):
+            bad = copy.deepcopy(POLICY)
+            bad["daemons"] = [{"name": "fseventsd", "path": path, "wait_idle": True}]
+            with self.assertRaises(heal.HealError, msg=path):
+                heal.validate_policy(bad)
+
+    def test_numbers_are_validated(self) -> None:
+        for key, value in (("hot_hours", 0), ("hot_cores", "1"), ("every_s", True), ("busy_hot_hours", 1),
+                           ("footprint_gib", 0), ("footprint_gib", None)):
+            bad = copy.deepcopy(POLICY)
+            bad[key] = value
+            with self.assertRaises(heal.HealError, msg=key):
+                heal.validate_policy(bad)
+
+    def test_no_limit_is_a_literal_in_the_script(self) -> None:
+        """Every limit comes from the policy: the script names each key, never a number for it."""
+        text = (ROOT / "scripts" / "glaeda-daemon-heal").read_text()
+        for key in heal.POLICY_KEYS:
+            self.assertNotRegex(text, rf"\b{key.upper()}\s*=\s*\d", key)
+        self.assertNotRegex(text, r"hot_hours\"\]\s*[*]\s*3600\s*[<>]")
+        self.assertNotIn("fseventsd\"", text.split("def validate_policy")[1])  # no daemon is special-cased
+
+    def test_cpu_time_parsing(self) -> None:
+        self.assertEqual(heal.cpu_seconds("1891:53.94"), 1891 * 60 + 53.94)
+        self.assertEqual(heal.cpu_seconds("0:12.59"), 12.59)
+        self.assertEqual(heal.cpu_seconds("1-02:03:04"), ((24 + 2) * 60 + 3) * 60 + 4)
+        self.assertIsNone(heal.cpu_seconds("-"))
+
+    def test_footprint_parsing(self) -> None:
+        self.assertEqual(heal.footprint_bytes("102G"), 102 << 30)
+        self.assertEqual(heal.footprint_bytes("1264M"), 1264 << 20)
+        self.assertEqual(heal.footprint_bytes("31M+"), 31 << 20)
+        self.assertEqual(heal.footprint_bytes("4096K-"), 4096 << 10)
+        self.assertEqual(heal.footprint_bytes("12B"), 12)
+        self.assertEqual(heal.footprint_bytes("1.5T"), int(1.5 * (1 << 40)))
+        for bad in ("", "-", "MEM", "12X", "G"):
+            self.assertIsNone(heal.footprint_bytes(bad), bad)
+
+    def test_host_reads_footprints_from_top_for_the_asked_pids_only(self) -> None:
+        top = ("Processes: 900 total\nPhysMem: 37G used (3421M wired, 11G compressor), 11G unused.\n\n"
+               "PID  MEM  \n427  102G \n1    31M+ \n9    5M\n")
+        calls = []
+
+        def fake_sh(argv, timeout=15):
+            calls.append(argv)
+            return 0, top, ""
+
+        real = heal.sh
+        heal.sh = fake_sh
+        try:
+            self.assertEqual(heal.Host().footprints([1, 427]), {427: 102 << 30, 1: 31 << 20})
+            self.assertEqual(heal.Host().footprints([]), {})
+        finally:
+            heal.sh = real
+        self.assertEqual(len(calls), 1, "no pids: top is not run")
+        heal.sh = lambda argv, timeout=15: (1, top, "top: failure")
+        try:
+            self.assertEqual(heal.Host().footprints([427]), {}, "a failed top measures nothing, whatever it printed")
+        finally:
+            heal.sh = real
+        self.assertEqual(calls[0][:2], ["/usr/bin/top", "-l"])
+        self.assertEqual([calls[0][i + 1] for i, a in enumerate(calls[0]) if a == "-pid"], ["1", "427"])
+
+
+class Reconcile(Base):
+    def test_hot_daemon_on_an_idle_host_restarts_at_hot_hours_and_not_before(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.host.respawn[FSEV["path"]] = 9000
+        early = self.run_for(self.policy["hot_hours"] - 0.1)
+        self.assertEqual(early, [])
+        self.assertEqual(self.tick()["hot"][0]["name"], "fseventsd")
+        actions = self.run_for(0.2)
+        self.assertEqual([a["name"] for a in actions], ["fseventsd"])
+        self.assertTrue(actions[0]["ok"])
+        self.assertIn("launchd started pid 9000", actions[0]["action"])
+        self.assertEqual(self.host.signals, [(421, signal.SIGTERM)])
+        self.assertEqual(self.tick()["hot"], [], "the fresh daemon is cool")
+
+    def test_the_limit_follows_the_policy(self) -> None:
+        self.policy["hot_hours"] = 0.5
+        self.host.add(421, FSEV["path"], 1.0)
+        self.assertEqual(len(self.run_for(0.6)), 1)
+
+    def test_a_cool_interval_ends_the_streak(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.run_for(self.policy["hot_hours"] - 0.2)
+        self.host.procs[421][3] = 0.1
+        self.tick()
+        self.host.procs[421][3] = 1.0
+        self.assertEqual(self.run_for(0.5), [], "the streak restarted after the cool interval")
+
+    def test_wait_idle_daemon_waits_while_a_job_runs_until_busy_hot_hours(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.host.add(77, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.0, uid=501)
+        self.assertEqual(self.run_for(self.policy["hot_hours"] + 0.5), [])
+        waiting = self.tick()["hot"][0]["waiting"]
+        self.assertIn("host busy (Runner.Worker)", waiting)
+        actions = self.run_for(self.policy["busy_hot_hours"] - self.policy["hot_hours"])
+        self.assertEqual([a["name"] for a in actions], ["fseventsd"])
+
+    def test_job_ending_lets_a_due_restart_happen(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.host.add(77, "/x/bin/Runner.Worker", 0.0, uid=501)
+        self.run_for(self.policy["hot_hours"] + 0.1)
+        del self.host.procs[77]
+        self.assertEqual([a["name"] for a in self.tick()["actions"]], ["fseventsd"])
+
+    def test_daemon_without_wait_idle_restarts_on_a_busy_host(self) -> None:
+        self.host.add(283, WRM["path"], 1.1)
+        self.host.add(77, "/x/bin/xcodebuild", 0.0, uid=501)
+        self.assertEqual([a["name"] for a in self.run_for(self.policy["hot_hours"] + 0.1)], ["WirelessRadioManagerd"])
+
+    def test_restarts_are_capped_per_day(self) -> None:
+        self.policy["hot_hours"] = 0.1
+        self.policy["max_restarts_per_day"] = 2
+        self.host.add(1, FSEV["path"], 1.0)
+        pid = 2
+        actions = []
+        for _ in range(6):
+            self.host.respawn[FSEV["path"]] = pid
+            pid += 1
+            actions += self.run_for(0.2)
+            for p in list(self.host.procs):
+                self.host.procs[p][3] = 1.0
+        self.assertEqual(len(actions), 2)
+        self.assertIn("2 restarts in the last day", self.tick()["hot"][0]["waiting"])
+
+    def test_only_the_system_daemon_at_its_exact_path_is_touched(self) -> None:
+        self.host.add(500, FSEV["path"], 1.0, uid=501)  # a user process at that path is not the daemon
+        self.host.add(501, "/tmp/fseventsd", 1.0)
+        self.assertEqual(self.run_for(self.policy["busy_hot_hours"] + 1), [])
+        self.assertEqual(self.host.signals, [])
+
+    def test_plan_never_signals(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.run_for(self.policy["hot_hours"] + 1, apply=False)
+        self.assertEqual(self.host.signals, [])
+
+    def test_a_daemon_that_ignores_sigterm_is_killed(self) -> None:
+        self.host.survives_term = True
+        self.host.add(421, FSEV["path"], 1.0)
+        actions = self.run_for(self.policy["hot_hours"] + 0.1)
+        self.assertEqual(self.host.signals, [(421, signal.SIGTERM), (421, signal.SIGKILL)])
+        self.assertIn("SIGKILL after SIGTERM", actions[0]["action"])
+
+    def test_bloated_daemon_restarts_at_once_even_on_a_busy_host_and_while_cool(self) -> None:
+        """cmuxs-mac-mini-6 10-25: fseventsd at 102 GiB (65 GiB of it swap) and 3 GiB of disk free."""
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 102 << 30
+        self.host.add(77, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.0, uid=501)
+        self.host.respawn[FSEV["path"]] = 9000
+        report = self.tick()
+        self.assertEqual([a["name"] for a in report["actions"]], ["fseventsd"])
+        self.assertEqual(self.host.signals, [(427, signal.SIGTERM)])
+        self.assertEqual(report["healed"][0]["footprint_gib"], 102.0)
+        self.assertEqual(self.tick()["actions"], [], "the fresh daemon is small and cool")
+
+    def test_a_footprint_under_the_cap_waits_for_the_cpu_rule(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = int(self.policy["footprint_gib"] * heal.GIB) - 1
+        self.assertEqual(self.run_for(self.policy["busy_hot_hours"] + 1), [])
+        self.assertEqual(self.tick()["hot"], [])
+
+    def test_the_footprint_cap_follows_the_policy(self) -> None:
+        self.policy["footprint_gib"] = 1
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 1 << 30
+        self.assertEqual(len(self.tick()["actions"]), 1)
+
+    def test_a_bloated_daemon_is_held_to_the_daily_restart_cap(self) -> None:
+        self.policy["max_restarts_per_day"] = 2
+        pid = 100
+        self.host.add(pid, FSEV["path"], 0.0)
+        actions = []
+        for _ in range(5):
+            for p in list(self.host.procs):
+                self.host.sizes[p] = 50 << 30
+            self.host.respawn[FSEV["path"]] = pid = pid + 1
+            actions += self.tick()["actions"]
+        self.assertEqual(len(actions), 2)
+        hot = self.tick()["hot"][0]
+        self.assertIn("2 restarts in the last day", hot["waiting"])
+        self.assertEqual(hot["footprint_gib"], 50.0)
+
+    def test_plan_reports_a_bloated_daemon_without_signalling(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 102 << 30
+        hot = self.tick(apply=False)["hot"]
+        self.assertEqual(self.host.signals, [])
+        self.assertEqual(hot[0]["waiting"], "would restart now (plan)")
+        self.assertIn("footprint 102.0 GiB", hot[0]["why"])
+
+    def test_footprints_are_asked_once_per_pass_for_the_policy_daemons_only(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.add(500, FSEV["path"], 0.0, uid=501)  # a user process at that path is not the daemon
+        self.host.add(283, WRM["path"], 0.0)
+        self.host.sizes[500] = 900 << 30
+        self.tick()
+        self.assertEqual(self.host.asked, [[283, 427]], "the user process at fseventsd's path is not asked")
+        self.assertEqual(self.host.signals, [])
+
+    def test_a_new_pid_starts_over(self) -> None:
+        self.host.add(421, FSEV["path"], 1.0)
+        self.run_for(self.policy["hot_hours"] - 0.2)
+        del self.host.procs[421]
+        self.host.add(422, FSEV["path"], 1.0)
+        self.assertEqual(self.run_for(0.5), [])
+
+
+class Guards(Base):
+    def test_never_signals_launchd_or_the_kernel(self) -> None:
+        ok, what = heal.restart(self.host, self.policy, FSEV, 1)
+        self.assertFalse(ok)
+        self.assertIn("refusing", what)
+        self.assertEqual(self.host.signals, [])
+
+    def test_install_refuses_bytes_that_are_not_the_release(self) -> None:
+        with self.assertRaisesRegex(heal.HealError, "script sha256 .* is not the expected"):
+            heal.install(POLICY_PATH, True, expect_sha256="0" * 64)
+        with self.assertRaisesRegex(heal.HealError, "policy sha256 .* is not the expected"):
+            heal.install(POLICY_PATH, True, expect_policy_sha256="0" * 64)
+        good = heal.sha256((ROOT / "scripts" / "glaeda-daemon-heal").read_bytes())
+        with self.assertRaisesRegex(heal.HealError, "not 64 hex digits"):
+            heal.install(POLICY_PATH, True, expect_sha256="nothex")
+        with self.assertRaisesRegex(heal.HealError, "policy sha256"):  # shasum's "<hash>  -" is accepted for the script
+            heal.install(POLICY_PATH, True, expect_sha256=good + "  -", expect_policy_sha256="0" * 64)
+
+
+class SandboxHeal(Base):
+    """sandboxd's self-heal: two slow probes a few minutes apart on an idle, opted-in mini reboot it, at most once a
+    day and never twice within a week (fleet decision by claude-sr2 (coordinator), 2026-10-28)."""
+
+    def slow_twice(self, after: float | None = None) -> dict:
+        """A slow probe now and another confirm_after_s later; the second pass's report."""
+        self.host.probes = [9.0]
+        first = self.tick()
+        self.assertIn("confirms after", first["sandbox"]["waiting"])
+        self.host.probes = [9.0]
+        return self.tick(self.policy["sandbox_probe"]["confirm_after_s"] if after is None else after)
+
+    def test_the_policy_reboots_after_two_slow_probes_once_a_day_and_once_a_week(self) -> None:
+        p = POLICY["sandbox_probe"]
+        self.assertEqual((p["enabled"], p["slow_s"], p["reboot_every_s"], p["repeat_window_s"]),
+                         (True, 5, 86400, 7 * 86400))
+        self.assertGreaterEqual(p["confirm_after_s"], 120)  # "a few minutes apart"
+        self.assertNotIn("kickstart", (ROOT / "scripts" / "glaeda-daemon-heal").read_text().split('"""', 2)[2]
+                         .split("SANDBOX_PROBE_SOURCE")[0])
+        self.assertEqual(heal.SANDBOX_REBOOT[:3], ["/sbin/shutdown", "-r", "now"])
+
+    def test_a_fast_probe_does_nothing(self) -> None:
+        report = self.tick()
+        self.assertEqual(report["sandbox"], {"probe_s": 0.1})
+        self.assertEqual((self.host.reboots, report["actions"], self.host.journal_rows), ([], [], []))
+
+    def test_one_slow_probe_never_reboots_and_a_fast_one_ends_the_episode(self) -> None:
+        self.host.probes = [9.0]
+        self.tick()
+        self.assertEqual(self.host.journal_rows[-1]["action"], "slow")
+        self.host.probes = [9.0]
+        self.assertIn("confirms", self.tick(60)["sandbox"]["waiting"])  # too soon after the first
+        self.tick(60)  # fast again
+        self.host.probes = [9.0]
+        self.assertIn("confirms after", self.tick(600)["sandbox"]["waiting"])  # a new episode starts over
+        self.assertEqual(self.host.reboots, [])
+
+    def test_two_slow_probes_apart_reboot_once_logged_before_it(self) -> None:
+        report = self.slow_twice()
+        self.assertEqual(len(self.host.reboots), 1)
+        self.assertTrue(report["sandbox"]["rebooting"])
+        self.assertTrue(report["actions"][0]["ok"])
+        self.assertIn("/sbin/shutdown -r now", report["actions"][0]["action"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot"])
+        self.assertEqual(self.host.journal_rows[-1]["t"], self.host.reboots[0])  # logged before the reboot ran
+
+    def test_two_slow_probes_too_far_apart_are_two_episodes(self) -> None:
+        report = self.slow_twice(after=self.policy["sandbox_probe"]["confirm_within_s"] + 1)
+        self.assertIn("confirms after", report["sandbox"]["waiting"])
+        self.assertEqual(self.host.reboots, [])
+
+    def test_the_first_fast_probe_after_a_reboot_is_logged_and_healed(self) -> None:
+        self.slow_twice()
+        report = self.tick(300)
+        self.assertEqual(report["healed"][-1]["name"], "sandboxd")
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot", "after-reboot"])
+        self.assertEqual(self.tick()["healed"][-1]["name"], "sandboxd")  # kept a day, not logged again
+        self.assertEqual(len(self.host.journal_rows), 3)
+
+    def test_a_second_reboot_within_7_days_is_refused_for_a_person_and_logged_once(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        for hours in (1, 2 * 24, 4 * 24):  # passes run all along: 1 h, 2 d and 6 d after the reboot
+            self.run_for(hours)
+            report = self.slow_twice()
+            self.assertIn("needs a person", report["sandbox"]["needs_operator"])
+            self.assertEqual(len(self.host.reboots), 1, hours)
+            self.tick()  # fast: the episode ends
+        self.assertEqual([r["action"] for r in self.host.journal_rows].count("refused-repeat"), 3)
+        self.run_for(25)  # past 7 d by both the clock and the passes
+        self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
+        self.assertEqual(len(self.host.reboots), 2)
+
+    def test_the_repeat_refusal_is_logged_once_per_episode(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.t += 86400
+        self.slow_twice()
+        for _ in range(5):
+            self.host.probes = [9.0]
+            self.assertIn("needs_operator", self.tick()["sandbox"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows].count("refused-repeat"), 1)
+
+    def test_never_while_busy_held_reserved_or_not_opted_in(self) -> None:
+        self.host.add(500, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.1, uid=502)
+        self.host.probes = [9.0]
+        self.assertIn("host busy", self.tick()["sandbox"]["skipped"])
+        self.assertEqual(self.host.probed, 0)
+        self.host.procs.pop(500)
+        for hold in ("reserved until 2026-10-28T23:59:59Z", "cmux-lawrence: never rebooted by a self-heal",
+                     "not opted in by fleet-registry.json (x)"):
+            self.host.hold = hold
+            self.assertEqual(self.tick()["sandbox"], {"skipped": hold})
+        self.assertEqual((self.host.probed, self.host.reboots), (0, []))
+
+    def test_a_job_or_reservation_that_arrives_before_the_reboot_wins(self) -> None:
+        host = self.host
+        real = host.sandbox_probe
+        host.probes = [9.0]
+        self.tick()
+
+        def slow_then_busy(slow_s):
+            host.add(600, "/usr/bin/xcodebuild", 0.1, uid=502)
+            return real(slow_s)
+
+        host.probes = [9.0]
+        host.sandbox_probe = slow_then_busy
+        report = self.tick(self.policy["sandbox_probe"]["confirm_after_s"])
+        self.assertEqual(report["sandbox"]["skipped"], "host busy (xcodebuild)")
+        self.assertEqual((host.reboots, report["actions"]), ([], []))
+        host.procs.pop(600)
+        host.sandbox_probe = real
+        holds = iter(["", "reserved until later"])
+        host.sandbox_hold = lambda now: next(holds)
+        host.probes = [9.0]
+        self.assertEqual(self.tick()["sandbox"]["skipped"], "reserved until later")
+        self.assertEqual(host.reboots, [])
+        self.assertNotIn("reboot", [r["action"] for r in host.journal_rows])
+
+    def test_a_held_host_lock_waits(self) -> None:
+        self.host.lock_held = True
+        self.assertIn("host.lock is held", self.slow_twice()["sandbox"]["waiting"])
+        self.assertEqual(self.host.reboots, [])
+        self.host.lock_held = False
+        self.host.probes = [9.0]
+        self.assertTrue(self.tick()["sandbox"]["rebooting"])
+
+    def test_a_failed_reboot_is_logged_and_still_counts(self) -> None:
+        self.host.reboot_result = (124, "timed out")  # shutdown may have taken it before the timeout
+        report = self.slow_twice()
+        self.assertFalse(report["actions"][0]["ok"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot", "reboot-failed"])
+        self.host.reboot_result = (0, "")
+        self.host.probes = [9.0]
+        self.assertIn("needs_operator", self.tick()["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_ps_that_fails_under_the_lock_never_reboots(self) -> None:
+        self.host.ps_broken = True
+        report = self.slow_twice()
+        self.assertIn("cannot tell the host is idle", report["sandbox"]["skipped"])
+        self.assertEqual(self.host.reboots, [])
+        self.assertNotIn("reboot", [r["action"] for r in self.host.journal_rows])
+
+    def test_a_forward_clock_jump_does_not_open_the_week(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.t += 30 * 86400  # the clock jumps a month; few passes have run
+        report = self.slow_twice()
+        self.assertIn("needs_operator", report["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_week_of_passes_and_of_clock_opens_it_even_while_busy(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.add(700, "/usr/bin/xcodebuild", 0.1, uid=502)  # busy all week: passes still count the time
+        self.run_for(7 * 24 + 1)
+        self.host.procs.pop(700)
+        self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
+        self.assertEqual(len(self.host.reboots), 2)
+
+    def test_a_journal_that_lost_a_reboot_the_state_saw_refuses(self) -> None:
+        self.slow_twice()
+        self.host.journal_rows = []
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_journal_cut_back_to_an_older_reboot_refuses(self) -> None:
+        self.slow_twice()
+        self.assertEqual(len(self.host.reboots), 1)
+        self.host.journal_rows = [{"t": T0 - 30 * 86400, "action": "reboot"}]  # cut back to a month-old reboot
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.run_for(8 * 24)
+        self.host.probes = [9.0, 9.0]
+        self.tick()
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_an_unreadable_journal_never_reboots(self) -> None:
+        self.host.journal_broken = True
+        self.host.probes = [9.0, 9.0]
+        self.tick()
+        report = self.tick(self.policy["sandbox_probe"]["confirm_after_s"])
+        self.assertIn("unreadable", report["sandbox"]["error"])
+        self.assertEqual(self.host.reboots, [])
+
+    def test_a_plan_pass_or_an_off_policy_never_probes(self) -> None:
+        self.host.probes = [9.0]
+        self.assertEqual(self.tick(apply=False)["sandbox"], {"skipped": "probed under --apply only"})
+        self.policy["sandbox_probe"]["enabled"] = False
+        self.assertEqual(self.tick()["sandbox"], {"skipped": "off in the policy"})
+        self.assertEqual(self.host.probed, 0)
+
+    def test_a_probe_that_cannot_run_is_an_error_not_a_reboot(self) -> None:
+        self.host.probes = [None]
+        self.assertEqual(self.tick()["sandbox"], {"probe_s": None, "error": "the probe could not run"})
+        self.assertEqual(self.host.reboots, [])
+
+    def test_the_policy_block_is_validated_and_optional(self) -> None:
+        doc = copy.deepcopy(POLICY)
+        del doc["sandbox_probe"]
+        heal.validate_policy(doc)
+        good = dict(POLICY["sandbox_probe"])
+        for change in ({"enabled": "yes"}, {"slow_s": 0}, {"slow_s": 120}, {"slow_s": float("nan")},
+                       {"confirm_after_s": float("inf")}, {"confirm_after_s": 1800, "confirm_within_s": 1800},
+                       {"reboot_every_s": 3600}, {"repeat_window_s": 3600}, {"repeat_window_s": None}):
+            doc["sandbox_probe"] = {**good, **change}
+            with self.assertRaises(heal.HealError, msg=change):
+                heal.validate_policy(doc)
+        doc["sandbox_probe"] = []
+        with self.assertRaises(heal.HealError):
+            heal.validate_policy(doc)
+
+    def test_the_journal_appends_synced_lines_and_compacts(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            h = heal.Host()
+            h.journal = Path(d) / "state" / heal.SANDBOX_JOURNAL
+            self.assertEqual(h.journal_read(), [])
+            h.journal_append({"t": 0.5, "action": "reboot"})
+            for i in range(2 * heal.SANDBOX_JOURNAL_KEEP + 3):
+                h.journal_append({"t": float(i + 1), "action": "slow"})
+            rows = h.journal_read()
+            self.assertLessEqual(len(rows), 2 * heal.SANDBOX_JOURNAL_KEEP + 1)
+            self.assertEqual(rows[0], {"t": 0.5, "action": "reboot"})  # compaction never drops a reboot
+            self.assertEqual(rows[-1]["t"], float(2 * heal.SANDBOX_JOURNAL_KEEP + 3))
+            with open(h.journal, "a") as f:
+                f.write('{"t": NaN, "action": "reboot"}\n')
+            with self.assertRaisesRegex(heal.HealError, "no finite time"):
+                h.journal_read()
+            with open(h.journal, "w") as f:
+                f.write("garbage\n")
+            with self.assertRaisesRegex(heal.HealError, "not JSON"):
+                h.journal_read()
+            os.symlink(h.journal, Path(d) / "link")
+            h.journal = Path(d) / "link"
+            with self.assertRaises(heal.HealError):
+                h.journal_read()
+
+    def test_run_pass_journals_beside_its_state(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            host = FakeHost()
+            report = heal.run_pass(POLICY_PATH, Path(d) / "state", False, host)
+            self.assertEqual(host.journal, Path(d) / "state" / heal.SANDBOX_JOURNAL)
+            self.assertIn("sandbox", report)
+
+    def test_the_hold_reads_the_registry_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".config/glaeda").mkdir(parents=True)
+            (home / ".config/glaeda/update.json").write_text(json.dumps({"host": "cmux-austin-mini-0"}))
+            opt = home / heal.SANDBOX_OPT_IN
+            pw = mock.Mock(pw_dir=os.fspath(home))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value=""), \
+                    mock.patch.object(heal, "fleet_ops_hold", return_value=""), \
+                    mock.patch.object(heal.pwd, "getpwuid", return_value=pw), \
+                    mock.patch.object(heal.os, "stat", return_value=mock.Mock(st_uid=502)), \
+                    mock.patch.object(heal, "platform_node", return_value="cmux-mac-014.local"), \
+                    mock.patch.object(heal.Host, "boots_unattended", return_value=""):
+                self.assertIn("not opted in", heal.Host().sandbox_hold(T0))
+                opt.write_text(json.dumps({"schema": heal.SANDBOX_OPT_IN_SCHEMA, "host": "cmux14",
+                                           "source": "fleet-registry.json"}))
+                self.assertIn("does not name", heal.Host().sandbox_hold(T0))
+                opt.write_text(json.dumps({"schema": heal.SANDBOX_OPT_IN_SCHEMA, "host": "cmux-austin-mini-0",
+                                           "source": "fleet-registry.json"}))
+                self.assertEqual(heal.Host().sandbox_hold(T0), "")
+                (home / ".config/glaeda/update.json").write_text(json.dumps({"host": "cmux-lawrence"}))
+                self.assertIn("lawrence", heal.Host().sandbox_hold(T0))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value="an EC2 Mac (ec2-user)"):
+                self.assertIn("EC2", heal.Host().sandbox_hold(T0))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value=""), \
+                    mock.patch.object(heal, "fleet_ops_hold", return_value="reserved until x"):
+                self.assertEqual(heal.Host().sandbox_hold(T0), "reserved until x")
+
+    def test_a_mini_that_would_not_come_back_by_itself_is_never_rebooted(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            lw, kc = Path(d) / "loginwindow.plist", Path(d) / "kcpassword"
+            answers = {"fdesetup": (1, "false\n", "")}
+            with mock.patch.object(heal, "sh", side_effect=lambda argv, timeout=15: answers["fdesetup"]), \
+                    mock.patch.object(heal, "SANDBOX_LOGINWINDOW", os.fspath(lw)), \
+                    mock.patch.object(heal, "SANDBOX_KCPASSWORD", os.fspath(kc)):
+                self.assertIn("no auto-login", heal.Host().boots_unattended())
+                lw.write_bytes(plistlib.dumps({"autoLoginUser": "cmux"}))
+                self.assertIn("saved password", heal.Host().boots_unattended())
+                kc.write_bytes(b"x")
+                self.assertEqual(heal.Host().boots_unattended(), "")
+                for answer in ((0, "true\n", ""), (127, "", "no fdesetup"), (1, "", "")):
+                    answers["fdesetup"] = answer
+                    self.assertIn("FileVault", heal.Host().boots_unattended(), answer)
+                answers["fdesetup"] = (1, "false\n", "")
+                lw.write_bytes(b"not a plist")
+                self.assertIn("no auto-login", heal.Host().boots_unattended())
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"), "macOS only")
+    def test_the_real_probe_runs_here(self) -> None:
+        took = heal.Host().sandbox_probe(5)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 5)
+
+
+class Install(unittest.TestCase):
+    def test_launchdaemon_runs_the_root_snapshot_with_system_python_at_the_policy_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            want = heal.desired_install(POLICY_PATH, Path(tmp))
+            doc = plistlib.loads(want["plist"])
+            self.assertEqual(doc["ProgramArguments"][:3], ["/usr/bin/python3", "-I", os.fspath(Path(tmp) / "glaeda-daemon-heal")])
+            self.assertEqual(doc["StartInterval"], POLICY["every_s"])
+            self.assertNotIn("UserName", doc)
+            self.assertIn(os.fspath(Path(tmp) / "macos-daemons.json"), doc["ProgramArguments"])
+
+    def test_status_is_current_only_when_script_policy_and_plist_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
+            d.mkdir()
+            self.assertFalse(heal.install_status(POLICY_PATH, d, plist)["installed"])
+            want = heal.desired_install(POLICY_PATH, d)
+            for path, (data, _mode) in want["files"].items():
+                path.write_bytes(data)
+            plist.write_bytes(want["plist"])
+            status = heal.install_status(POLICY_PATH, d, plist)
+            self.assertTrue(status["installed"] and status["current"], status)
+            self.assertFalse(status["reportFresh"], "no report yet: the daemon has not run a pass")
+            (want["state_dir"]).mkdir()
+            (want["state_dir"] / "report.json").write_text("{}")
+            self.assertTrue(heal.install_status(POLICY_PATH, d, plist)["reportFresh"])
+            (d / "macos-daemons.json").write_text("{}")
+            self.assertEqual(heal.install_status(POLICY_PATH, d, plist)["stale"], [os.fspath(d / "macos-daemons.json")])
+
+    def test_runs_on_macos_system_python(self) -> None:
+        """The root daemon runs /usr/bin/python3 (3.9 on macOS): no syntax newer than that."""
+        import ast
+        tree = ast.parse((ROOT / "scripts" / "glaeda-daemon-heal").read_text(), feature_version=(3, 9))
+        self.assertFalse([n for n in ast.walk(tree) if type(n).__name__ == "Match"])
+
+
+SCRIPT_BYTES = (ROOT / "scripts" / "glaeda-daemon-heal").read_bytes()
+POLICY_BYTES = POLICY_PATH.read_bytes()
+OPS_BYTES = (ROOT / "config" / "fleet-ops.json").read_bytes()
+ORIGIN, MIRROR = heal.RELEASE_SOURCES
+
+
+def tar_gz(files: dict) -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o755
+            tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue(), mtime=0)
+
+
+class Channel:
+    """The ota-channels files and releases on one or both sources, as GitHub serves them; records each download."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.down: set[str] = set()
+        self.got: list[str] = []
+
+    def publish(self, n: int, script: bytes = SCRIPT_BYTES, policy: bytes = POLICY_BYTES, sources=(ORIGIN, MIRROR),
+                members: dict | None = None, release_sha: str | None = None, paused: bool = False,
+                ancestors: range | None = None) -> str:
+        tag, commit = f"r-20261026-{n:012x}", f"{n:040x}"
+        ancestry = "".join(f"{k:040x}\n" for k in (ancestors if ancestors is not None else range(n, 0, -1)))
+        archive = tar_gz(members if members is not None else {
+            "glaeda/README.md": b"glaeda\n", heal.MEMBERS[heal.SCRIPT_NAME]: script,
+            heal.MEMBERS[heal.POLICY_NAME]: policy, heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES,
+            heal.ANCESTRY: ancestry.encode()})
+        release = json.dumps({"schema": heal.RELEASE_SCHEMA, "repository": heal.REPOSITORY, "tag": tag,
+                              "source": commit, "assets": {heal.ARCHIVE: {
+                                  "size": len(archive), "sha256": hashlib.sha256(archive).hexdigest()}}}).encode()
+        entry = {"schema": heal.CHANNEL_SCHEMA, "ring": "stable", "tag": tag, "source": commit,
+                 "releaseSha256": release_sha or hashlib.sha256(release).hexdigest()}
+        for source in sources:
+            self.files[heal.release_url(source, "ota-channels", "control.json")] = json.dumps(
+                {"schema": heal.CONTROL_SCHEMA, "paused": paused}).encode()
+            self.files[heal.release_url(source, "ota-channels", "stable.json")] = json.dumps(entry).encode()
+            self.files[heal.release_url(source, tag, "release.json")] = release
+            self.files[heal.release_url(source, tag, heal.ARCHIVE)] = archive
+        return tag
+
+    def get(self, url: str, limit: int) -> bytes:
+        self.got.append(url)
+        if any(url.startswith(f"https://github.com/{s}/") for s in self.down) or url not in self.files:
+            raise urllib.error.URLError("connection refused")
+        if len(self.files[url]) > limit:
+            raise heal.HealError("too big")
+        return self.files[url]
+
+
+def edited_policy(**changes) -> bytes:
+    doc = json.loads(POLICY_BYTES)
+    doc.update(changes)
+    return (json.dumps(doc, indent=2) + "\n").encode()
+
+
+class SelfUpdate(unittest.TestCase):
+    """The installed root copy follows the stable release: a release that changes the script or the policy reaches
+    the snapshot on its own, through the same hash chain glaeda-update checks."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name) / "daemon-heal"
+        self.state_dir = self.dir / "state"
+        self.state_dir.mkdir(parents=True)
+        for name, data in ((heal.SCRIPT_NAME, SCRIPT_BYTES), (heal.POLICY_NAME, POLICY_BYTES),
+                           (heal.FLEET_OPS_NAME, OPS_BYTES)):
+            (self.dir / name).write_bytes(data)  # what a root --install of today's release left
+        self.channel = Channel()
+        self.host = FakeHost()
+
+    def installed(self, name: str) -> bytes:
+        return (self.dir / name).read_bytes()
+
+    def run_pass(self, seconds: float = 0, python: str = sys.executable) -> dict:
+        self.host.advance(seconds)
+        return heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                             get=self.channel.get, python=python)
+
+    def verdict(self, report: dict, after: float = 0) -> dict:
+        """The judgment `after` seconds on, of a pass then that holds this release state (passes kept running)."""
+        now = heal.parse_iso(report["at"]) + after
+        return heal.judge({**report, "at": heal.iso(now)}, now, True)
+
+    def test_a_release_that_changes_the_script_and_the_policy_reaches_the_snapshot_with_no_hand_step(self) -> None:
+        script = SCRIPT_BYTES + b"\n# released later\n"
+        policy = edited_policy(hot_hours=3)
+        tag = self.channel.publish(2, script=script, policy=policy)
+        report = self.run_pass()  # the staged pair really runs: a plan pass of the new code with its policy
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertEqual((report["release"]["tag"], report["release"]["wants"], report["release"]["error"]),
+                         (tag, tag, None))
+        self.assertEqual(self.verdict(report)["state"], "current")
+        later = edited_policy(hot_hours=4)  # a release that changes only the policy, picked up within every_s
+        tag3 = self.channel.publish(3, script=script, policy=later)
+        self.run_pass(60)
+        self.assertEqual(self.installed(heal.POLICY_NAME), policy, "not due yet")
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual((self.installed(heal.POLICY_NAME), report["release"]["tag"]), (later, tag3))
+        mode = (self.dir / heal.SCRIPT_NAME).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o555)
+
+    def test_a_release_that_changes_only_the_script_reaches_the_snapshot(self) -> None:
+        script = SCRIPT_BYTES + b"\n# only the script\n"
+        tag = self.channel.publish(2, script=script)
+        report = self.run_pass()
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, POLICY_BYTES))
+        self.assertEqual(report["release"]["tag"], tag)
+        self.assertFalse((self.dir / "staged" / heal.PAIR_MARK).exists(), "the swap finished")
+
+    def test_a_release_that_does_not_descend_from_the_installed_one_is_refused(self) -> None:
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass()
+        self.channel.publish(3, script=SCRIPT_BYTES + b"# 3, from a branch\n", ancestors=range(3, 2, -1))
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_a_crash_before_state_is_saved_still_refuses_a_downgrade(self) -> None:
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")
+        self.run_pass()
+        saved = (self.state_dir / "state.json").read_bytes()
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass(POLICY["release"]["every_s"])
+        (self.state_dir / "state.json").write_bytes(saved)  # the pass died after the swap, before its state
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")  # a lagging source names the older release
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_a_truncated_download_is_an_error_not_a_crash(self) -> None:
+        import http.client
+        self.channel.publish(2, script=b"# new\n")
+        real = self.channel.get
+
+        def truncated(url: str, limit: int) -> bytes:
+            if url.endswith(heal.ARCHIVE):
+                raise http.client.IncompleteRead(b"partial")
+            return real(url, limit)
+        self.channel.get = truncated
+        report = self.run_pass()
+        self.assertTrue(report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertTrue((self.state_dir / "report.json").exists(), "the pass still saved its report")
+
+    def test_malformed_release_metadata_is_an_error_not_a_crash(self) -> None:
+        self.channel.publish(2, script=b"# new\n")
+        url = next(u for u in self.channel.files if u.endswith("/release.json") and f"/{ORIGIN}/" in u)
+        doc = json.loads(self.channel.files[url])
+        doc["assets"] = ["not", "a", "map"]
+        self.channel.files[url] = json.dumps(doc).encode()
+        stable = heal.release_url(ORIGIN, "ota-channels", "stable.json")
+        entry = json.loads(self.channel.files[stable])
+        entry["releaseSha256"] = hashlib.sha256(self.channel.files[url]).hexdigest()
+        self.channel.files[stable] = json.dumps(entry).encode()
+        report = self.run_pass()
+        self.assertIn("has no", report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+
+    def test_a_swap_cut_short_is_finished_before_the_next_policy_load(self) -> None:
+        script, policy = SCRIPT_BYTES + b"# next\n", edited_policy(hot_hours=5)
+        stage = self.dir / "staged"
+        stage.mkdir()
+        (stage / heal.SCRIPT_NAME).write_bytes(script)
+        (stage / heal.POLICY_NAME).write_bytes(policy)
+        hashes = {heal.SCRIPT_NAME: heal.sha256(script), heal.POLICY_NAME: heal.sha256(policy)}
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": hashes, "release": {"tag": "r-9", "commit": "c9"}}))
+        (self.dir / heal.POLICY_NAME).write_bytes(policy)  # died after the policy, before the script
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertEqual(json.loads(self.installed(heal.INSTALLED))["commit"], "c9", "the release is swapped with it")
+        self.assertFalse((stage / heal.PAIR_MARK).exists())
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": {heal.SCRIPT_NAME: "0" * 64,
+                                                                  heal.POLICY_NAME: "0" * 64}, "release": None}))
+        (stage / heal.SCRIPT_NAME).write_bytes(b"# torn\n")
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), script, "a mark the staged files do not match is dropped")
+        self.assertFalse(heal.finish_pair(self.dir, root=False))
+
+    def test_the_staged_run_keeps_bounded_output_and_a_timeout(self) -> None:
+        code, out, _err = heal.bounded_run([sys.executable, "-c", "print('x' * 5_000_000)"], 30, limit=1000)
+        self.assertEqual((code, len(out)), (0, 1000))
+        code, _out, _err = heal.bounded_run([sys.executable, "-c", "import time; time.sleep(30)"], 0.5)
+        self.assertEqual(code, 124)
+        started = heal.time.time()  # a descendant that keeps the pipes open is killed with it
+        code, _out, _err = heal.bounded_run(["/bin/sh", "-c", "sleep 30 & sleep 30"], 0.5)
+        self.assertEqual(code, 124)
+        self.assertLess(heal.time.time() - started, 4)
+
+    def test_the_same_release_costs_two_small_reads_and_rewrites_nothing(self) -> None:
+        tag = self.channel.publish(2)
+        self.run_pass()
+        before = (self.dir / heal.SCRIPT_NAME).stat().st_mtime_ns
+        self.channel.got.clear()
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual([u.rsplit("/", 1)[1] for u in self.channel.got], ["control.json", "stable.json"])
+        self.assertEqual(((self.dir / heal.SCRIPT_NAME).stat().st_mtime_ns, report["release"]["tag"]), (before, tag))
+        self.assertIsNone(report["release"]["installedAt"], "the hand install already held these bytes")
+
+    def test_files_that_drift_from_their_release_are_restored_at_the_next_pass(self) -> None:
+        self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(b"print('hand edit')\n")
+        self.run_pass(POLICY["every_s"])  # drift is checked every pass, not every release.every_s
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+
+    def test_files_that_drift_and_cannot_be_repaired_show_as_stale(self) -> None:
+        tag = self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(b"print('hand edit')\n")
+        url = next(u for u in self.channel.files if u.endswith(heal.ARCHIVE) and f"/{ORIGIN}/" in u)
+        del self.channel.files[url]  # the repair cannot download its release
+        report = self.run_pass(POLICY["every_s"])
+        self.assertEqual((report["release"]["tag"], report["release"]["wants"]), (tag, tag))
+        self.assertTrue(report["release"]["drifted"] and report["release"]["error"])
+        verdict = self.verdict(report, POLICY["release"]["stale_s"] + 1)
+        self.assertEqual(verdict["state"], "stale")
+        self.assertIn("not the " + tag, verdict["why"])
+
+    def test_the_mirror_answers_when_the_repository_does_not(self) -> None:
+        tag = self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.channel.down.add(ORIGIN)
+        report = self.run_pass()
+        self.assertEqual((report["release"]["source"], report["release"]["tag"]), (MIRROR, tag))
+
+    def test_a_paused_channel_installs_nothing(self) -> None:
+        self.channel.publish(2, script=b"# new\n", paused=True)
+        report = self.run_pass()
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertEqual(self.channel.got[-1].rsplit("/", 1)[1], "control.json")
+        self.assertEqual(self.verdict(report)["state"], "current")
+
+    def refused(self, why: str, **publish) -> dict:
+        self.channel.publish(2, **publish)
+        report = self.run_pass()
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)),
+                         (SCRIPT_BYTES, POLICY_BYTES), why)
+        self.assertRegex(report["release"]["error"], why)
+        self.assertIn("hot", report, "the heal pass itself still ran")
+        return report
+
+    def test_a_release_json_that_is_not_the_channels_is_refused(self) -> None:
+        self.refused("does not match the channel", script=b"# evil\n", release_sha="0" * 64)
+
+    def test_an_archive_that_is_not_release_jsons_is_refused(self) -> None:
+        self.channel.publish(2, script=b"# evil\n")
+        url = next(u for u in self.channel.files if u.endswith(heal.ARCHIVE) and f"/{ORIGIN}/" in u)
+        self.channel.files[url] = tar_gz({heal.MEMBERS[heal.SCRIPT_NAME]: b"# swapped\n"})
+        report = self.run_pass()
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertIn("does not match release.json", report["release"]["error"])
+
+    def test_a_release_without_the_two_files_is_refused(self) -> None:
+        self.refused("ships no", members={heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES})
+
+    def test_a_pair_that_cannot_plan_a_pass_is_never_installed_and_shows_as_stale(self) -> None:
+        report = self.refused("its own plan pass failed", script=b"raise SystemExit(3)\n")
+        self.assertEqual(self.verdict(report)["state"], "current", "within stale_s it is a lag, not a fault")
+        verdict = self.verdict(report, POLICY["release"]["stale_s"] + 1)
+        self.assertEqual(verdict["state"], "stale")
+        self.assertIn("plan pass failed", verdict["why"])
+
+    def test_code_that_would_not_update_itself_again_is_never_installed(self) -> None:
+        # A plan pass of code from before self-update: its report says nothing of following a release.
+        old = b"import json\nprint(json.dumps({'schema': 'glaeda-daemon-heal/v1', 'hot': []}))\n"
+        self.refused("does not keep itself on the stable release", script=old)
+
+    def test_a_policy_its_own_code_refuses_is_never_installed(self) -> None:
+        self.refused("its own plan pass failed", policy=b'{"schema": "nope"}')
+
+    def test_an_unreachable_channel_is_stale_after_stale_s(self) -> None:
+        report = self.run_pass()  # nothing published: every source refuses
+        self.assertIn("no release source answered", report["release"]["error"])
+        self.assertEqual(self.verdict(report)["state"], "stale")
+        self.assertIn("has not read its release channel", self.verdict(report)["why"])
+
+    def test_root_acts_only_on_the_fleet_ops_json_its_release_recorded(self) -> None:
+        """A fleet-ops.json that installed.json does not name (a hand install's leftovers, a file someone wrote)
+        never runs: the live pass holds and says so, and the next release pass restores the release's bytes."""
+        self.channel.publish(2)
+        self.run_pass()
+        calls = []
+        with mock.patch.object(heal, "fleet_ops_pass", side_effect=lambda *a, **k: calls.append((a, k)) or {}), \
+                mock.patch.object(heal, "INSTALL_DIR", self.dir), mock.patch.object(heal.os, "geteuid", return_value=0), \
+                mock.patch.object(heal, "schedule_reload", return_value=False), \
+                mock.patch.object(heal.os, "chown"):
+            heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                          get=self.channel.get, python=sys.executable)
+            self.assertTrue(calls[-1][0][2], "the release's own file: live")
+            (self.dir / heal.FLEET_OPS_NAME).write_bytes(OPS_BYTES.replace(b"glaeda-fleet-ops/v1", b"glaeda-fleet-ops/v1 "))
+            heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                          get=lambda u, n: (_ for _ in ()).throw(urllib.error.URLError("down")), python=sys.executable)
+            self.assertFalse(calls[-1][0][2], "a file the release did not record: never live")
+            self.assertIn("not the one its release installed", calls[-1][1]["hold"](0))
+
+    def test_a_failed_optional_stage_does_not_poison_a_later_release_without_it(self) -> None:
+        self.channel.publish(2)
+        self.run_pass()
+        bad = tar_gz({heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES + b"# 3\n", heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+                      heal.MEMBERS[heal.FLEET_OPS_NAME]: b"{}",
+                      heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(3, 0, -1)).encode()})
+        self.channel.publish(3, members={})  # its archive and release.json are replaced below
+        for source in (ORIGIN, MIRROR):
+            self.channel.files[heal.release_url(source, "r-20261026-000000000003", heal.ARCHIVE)] = bad
+            rel = heal.release_url(source, "r-20261026-000000000003", "release.json")
+            doc = json.loads(self.channel.files[rel])
+            doc["assets"][heal.ARCHIVE] = {"size": len(bad), "sha256": hashlib.sha256(bad).hexdigest()}
+            self.channel.files[rel] = json.dumps(doc).encode()
+            stable = heal.release_url(source, "ota-channels", "stable.json")
+            entry = json.loads(self.channel.files[stable])
+            entry["releaseSha256"] = hashlib.sha256(self.channel.files[rel]).hexdigest()
+            self.channel.files[stable] = json.dumps(entry).encode()
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertTrue(report["release"]["error"], "a malformed fleet-ops.json fails the staged plan")
+        members = {heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES + b"# 4\n", heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+                   heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(4, 0, -1)).encode()}
+        self.channel.publish(4, members=members)
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(report["release"]["error"], None)
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 4\n")
+
+    def test_a_copy_from_before_fleet_ops_takes_the_file_from_its_own_release(self) -> None:
+        """A mini whose snapshot is the script and policy only (installed.json names two files) gets
+        fleet-ops.json from the same release, with no new tag, and a release without it takes it away again."""
+        tag = self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.FLEET_OPS_NAME).unlink()
+        ident = json.loads(self.installed(heal.INSTALLED))
+        ident["files"].pop(heal.FLEET_OPS_NAME)
+        ident.pop("members")  # what a copy from before fleet-ops.json writes
+        (self.dir / heal.INSTALLED).write_text(json.dumps(ident))
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.FLEET_OPS_NAME), OPS_BYTES)
+        self.assertEqual((report["release"]["tag"], report["release"]["drifted"]), (tag, False))
+        members = {heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+                   heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(3, 0, -1)).encode()}
+        self.channel.publish(3, members=members)
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertFalse((self.dir / heal.FLEET_OPS_NAME).exists(), "a release without it")
+        self.assertEqual((report["release"]["error"], report["release"]["drifted"]), (None, False))
+
+    def test_root_reads_nothing_the_runner_user_writes(self) -> None:
+        text = SCRIPT_BYTES.decode()
+        for path in ("~/", ".config/glaeda", ".local/state/glaeda", "Path.home", "expanduser", "HOME"):
+            self.assertNotIn(path, text.split("# ---------------------------------------------------------------- the "
+                                              "release this copy follows")[1].split("def judge")[0], path)
+        with self.assertRaises(heal.HealError):
+            heal.fetch("http://github.com/x", 10)
+        with self.assertRaises(heal.HealError):
+            heal.fetch("https://example.com/x", 10)
+        for bad in ("http://release-assets.githubusercontent.com/x", "https://evil.example/x",
+                    "https://github.com.evil.example/x", "https://release-assets.githubusercontent.com:8443/x"):
+            with self.assertRaisesRegex(heal.HealError, "refusing a redirect", msg=bad):
+                heal.HttpsOnly().redirect_request(None, None, 302, "Found", {}, bad)
+        self.assertTrue(heal.url_ok("https://release-assets.githubusercontent.com/github-production-release-asset/1"))
+        for sources in (["someone/glaeda"], [], [ORIGIN, ORIGIN], [{"x": 1}]):
+            bad = copy.deepcopy(POLICY)
+            bad["release"]["sources"] = sources
+            with self.assertRaises(heal.HealError, msg=sources):
+                heal.validate_policy(bad)
+
+
+class FleetOps(unittest.TestCase):
+    """The fleet's root ops scripts (config/fleet-ops.json): pinned bodies, installed only on an eligible host that
+    is not reserved, and a reservation list that cannot be read holds; an expired one holds only by a live entry."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.ops_dir, self.plists = self.root / "ops", self.root / "LaunchDaemons"
+        self.ops_dir.mkdir()
+        self.plists.mkdir()
+        self.calls: list[tuple] = []
+        self.loaded: set[str] = set()
+        self.bootstrap_fails = False
+        self.bootout_sticks = False
+        self.print_broken = False
+        self.ledger = self.root / "managed.json"
+        self.doc = json.loads(OPS_BYTES)
+        self.path = self.root / heal.FLEET_OPS_NAME
+        self.path.write_bytes(OPS_BYTES)
+
+    def ctl(self, *args: str):
+        self.calls.append(args)
+        if args[0] == "print":
+            if self.print_broken:
+                return 5, "Could not connect to launchd"
+            return (0, "") if args[1] in self.loaded else (113, "could not find service")
+        if args[0] == "bootstrap":
+            if self.bootstrap_fails:
+                return 5, "Bootstrap failed: 5: Input/output error"
+            self.loaded.add("system/" + plistlib.loads(Path(args[2]).read_bytes())["Label"])
+        if args[0] == "bootout" and not self.bootout_sticks:
+            self.loaded.discard(args[1])
+        return 0, ""
+
+    def run_ops(self, apply: bool = True, hold: str = "", eligible: str = "") -> dict:
+        return heal.fleet_ops_pass(self.path, T0, apply, ops_dir=self.ops_dir, plist_dir=self.plists, root=False,
+                                   hold=lambda now: hold, eligible=lambda d: eligible, ctl=self.ctl,
+                                   ledger=self.ledger, wait=lambda s: None)
+
+    def test_shipped_ops_are_pinned_to_their_source(self) -> None:
+        doc = heal.load_fleet_ops(OPS_BYTES)
+        self.assertEqual(sorted(doc["ops"]), ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
+        for name, op in doc["ops"].items():
+            self.assertEqual(heal.sha256(op["body"].encode()), op["sha256"])
+            self.assertRegex(op["source"]["commit"], r"^[0-9a-f]{40}$")
+            self.assertTrue(op["source"]["path"].endswith(f"/{name}.sh"))
+        self.assertIn("FileVault is Off", doc["ops"]["console-unlock-guard"]["body"],
+                      "the guard never restarts a mini that would stop at the FileVault unlock screen")
+
+    def test_a_stale_or_missing_body_is_installed_with_its_launchdaemon(self) -> None:
+        (self.ops_dir / "console-unlock-guard").write_bytes(b"#!/bin/bash\n# older\n")
+        out = self.run_ops()
+        self.assertEqual(out["installed"], ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
+        for name, op in self.doc["ops"].items():
+            self.assertEqual((self.ops_dir / name).read_bytes(), op["body"].encode())
+            self.assertEqual((self.ops_dir / name).stat().st_mode & 0o777, 0o755)
+            plist = plistlib.loads((self.plists / f"ai.manaflow.{name}.plist").read_bytes())
+            self.assertEqual(plist, {"Label": f"ai.manaflow.{name}", "ProgramArguments": [os.fspath(self.ops_dir / name)],
+                                     "StartInterval": op["every_s"], "StandardOutPath": f"/var/log/{name}.log",
+                                     "StandardErrorPath": f"/var/log/{name}.log"})
+            self.assertEqual(out["ops"][name]["state"], "current")
+        self.assertEqual(self.loaded, {"system/ai.manaflow.console-unlock-guard", "system/ai.manaflow.seed-root",
+                                       "system/ai.manaflow.symbol-cache-cap"})
+
+    def test_an_op_dropped_from_the_file_is_unloaded_and_removed_but_nothing_else(self) -> None:
+        self.run_ops()
+        (self.ops_dir / "by-hand").write_bytes(b"#!/bin/bash\n")  # installed by a person, not by this pass
+        (self.plists / "ai.manaflow.by-hand.plist").write_bytes(b"x")
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertEqual(out["removed"], ["symbol-cache-cap"])
+        self.assertFalse((self.ops_dir / "symbol-cache-cap").exists())
+        self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
+        self.assertNotIn("system/ai.manaflow.symbol-cache-cap", self.loaded)
+        self.assertTrue((self.ops_dir / "by-hand").exists() and (self.plists / "ai.manaflow.by-hand.plist").exists())
+        self.assertEqual(json.loads(self.ledger.read_text())["ops"], ["console-unlock-guard", "seed-root"])
+        self.assertNotIn("removed", self.run_ops())
+
+    def test_a_load_that_fails_is_retried_at_the_next_pass(self) -> None:
+        self.bootstrap_fails = True
+        out = self.run_ops()
+        self.assertIn("bootstrap", out["ops"]["console-unlock-guard"]["error"])
+        self.assertFalse((self.plists / "ai.manaflow.console-unlock-guard.plist").exists(), "removed so it differs")
+        self.bootstrap_fails = False
+        out = self.run_ops()
+        self.assertNotIn("error", out["ops"]["console-unlock-guard"])
+        self.assertIn("system/ai.manaflow.console-unlock-guard", self.loaded)
+
+    def test_a_dropped_op_that_will_not_unload_stays_in_the_ledger(self) -> None:
+        self.run_ops()
+        self.bootout_sticks = True
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertNotIn("removed", out)
+        self.assertIn("did not unload", out["errors"][0])
+        self.assertTrue((self.ops_dir / "symbol-cache-cap").exists())
+        self.assertIn("symbol-cache-cap", json.loads(self.ledger.read_text())["ops"])
+        self.bootout_sticks = False
+        self.assertEqual(self.run_ops()["removed"], ["symbol-cache-cap"])
+
+    def test_launchd_that_does_not_answer_is_not_read_as_unloaded(self) -> None:
+        self.run_ops()
+        doc = copy.deepcopy(self.doc)
+        doc["ops"].pop("symbol-cache-cap")
+        self.path.write_text(json.dumps(doc))
+        self.print_broken = True
+        out = self.run_ops()
+        self.assertNotIn("removed", out)
+        self.assertIn("symbol-cache-cap", json.loads(self.ledger.read_text())["ops"])
+        self.assertTrue((self.ops_dir / "symbol-cache-cap").exists())
+
+    def test_a_job_that_will_not_unload_is_not_bootstrapped_over(self) -> None:
+        self.run_ops()
+        self.bootout_sticks = True
+        doc = copy.deepcopy(self.doc)
+        doc["ops"]["symbol-cache-cap"]["every_s"] = 7200
+        self.path.write_text(json.dumps(doc))
+        out = self.run_ops()
+        self.assertIn("did not unload", out["ops"]["symbol-cache-cap"]["error"])
+        self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
+
+    def test_a_hand_install_never_installs_fleet_ops_json(self) -> None:
+        """--install takes the script and the policy (each pinnable by --expect-*), never a fleet-ops.json found
+        beside them in a directory the runner user can write; only the release chain installs that."""
+        with tempfile.TemporaryDirectory() as tmp:
+            want = heal.desired_install(POLICY_PATH, Path(tmp))
+            self.assertEqual(sorted(p.name for p in want["files"]), [heal.SCRIPT_NAME, heal.POLICY_NAME])
+            d = Path(tmp) / "heal"
+            (d / "staged").mkdir(parents=True)
+            (d / heal.FLEET_OPS_NAME).write_bytes(OPS_BYTES)
+            heal.commit_pair({heal.SCRIPT_NAME: SCRIPT_BYTES, heal.POLICY_NAME: POLICY_BYTES}, d, False, None)
+            self.assertFalse((d / heal.FLEET_OPS_NAME).exists(), "a hand install drops it until the release restores it")
+
+    def test_a_current_host_is_left_alone(self) -> None:
+        self.run_ops()
+        self.calls.clear()
+        out = self.run_ops()
+        self.assertEqual(out["installed"], [])
+        self.assertEqual([c[0] for c in self.calls], ["print"] * len(self.doc["ops"]),
+                         "no bootout, no rewrite: only is it loaded")
+
+    def test_a_held_or_ineligible_host_installs_nothing_but_reports(self) -> None:
+        (self.ops_dir / "console-unlock-guard").write_bytes(b"#!/bin/bash\n# older\n")
+        for kw in ({"hold": "reserved until later"}, {"eligible": "an EC2 Mac"}):
+            out = self.run_ops(**kw)
+            self.assertEqual(out["installed"], [])
+            self.assertEqual(out["held"], next(iter(kw.values())))
+            self.assertEqual(out["ops"]["console-unlock-guard"]["state"], "stale")
+            self.assertEqual(out["ops"]["symbol-cache-cap"]["state"], "missing")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.run_ops(apply=False)["installed"], [], "a plan pass writes nothing")
+
+    def test_a_symlink_at_an_op_path_is_never_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        (self.ops_dir / "console-unlock-guard").symlink_to(victim)
+        out = self.run_ops()
+        self.assertIn("not a regular file", out["ops"]["console-unlock-guard"]["error"])
+        self.assertEqual(victim.read_text(), "keep")
+
+    def test_a_body_that_is_not_its_pin_or_a_bad_name_is_refused(self) -> None:
+        for change in ({"body": "#!/bin/bash\necho other\n"}, {"every_s": 5}, {"source": {"commit": "x"}}):
+            doc = copy.deepcopy(self.doc)
+            doc["ops"]["symbol-cache-cap"].update(change)
+            with self.assertRaises(heal.HealError, msg=change):
+                heal.load_fleet_ops(json.dumps(doc).encode())
+        doc = copy.deepcopy(self.doc)
+        doc["ops"]["../evil"] = doc["ops"].pop("symbol-cache-cap")
+        with self.assertRaisesRegex(heal.HealError, "plain name"):
+            heal.load_fleet_ops(json.dumps(doc).encode())
+
+    def reservations(self, doc, local=None, update_host=None) -> str:
+        fleet = self.root / "fleet"
+        home = self.root / "home"
+        (home / ".local/share/glaeda").mkdir(parents=True, exist_ok=True)
+        (home / ".config/glaeda").mkdir(parents=True, exist_ok=True)
+        fleet.mkdir(exist_ok=True)
+        path = home / ".local/share/glaeda/fleet-reservations.json"
+        if doc is None:
+            path.unlink(missing_ok=True) if sys.version_info >= (3, 8) else None
+        else:
+            path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        update = home / ".config/glaeda/update.json"
+        if update_host is None:
+            update.write_text(json.dumps({"host": "build-mini-7"}))
+        elif update_host == "":
+            update.unlink(missing_ok=True)
+        else:
+            update.write_text(update_host if update_host.startswith("{") else json.dumps({"host": update_host}))
+        if local is not None:
+            (fleet / "reservation.json").write_text(json.dumps(local))
+        user = mock.Mock(pw_dir=os.fspath(home))
+        with mock.patch.object(heal.pwd, "getpwuid", return_value=user):
+            return heal.fleet_ops_hold(T0, fleet, node="build-mini-7.local")
+
+    def lst(self, **kw) -> dict:
+        doc = {"schema": heal.RESERVATIONS_SCHEMA, "expires": heal.iso(T0 + 3600), "reservations": [], "aliases": {}}
+        doc.update(kw)
+        return doc
+
+    def test_reservations_hold_fail_closed(self) -> None:
+        self.assertEqual(self.reservations(self.lst()), "")
+        self.assertIn("unreadable", self.reservations(None), "no list: held")
+        self.assertIn("unreadable", self.reservations("{not json"))
+        self.assertIn("unreadable", self.reservations(self.lst(schema="other/v1")))
+        self.assertIn("unreadable", self.reservations(self.lst(expires=None)), "no expires: held")
+        self.assertIn("unreadable", self.reservations(self.lst(expires="soon")))
+        self.assertEqual(self.reservations(self.lst(expires=heal.iso(T0 - 1))), "", "an old, empty list: released")
+        entry = {"id": "r1", "owner": "someone", "hosts": ["build-mini-7"], "from": heal.iso(T0 - 60),
+                 "until": heal.iso(T0 + 60)}
+        old = heal.iso(T0 - 1)
+        self.assertIn("list expired at", self.reservations(self.lst(expires=old, reservations=[entry])),
+                      "an old list's entry still live by its own until: held")
+        self.assertEqual(self.reservations(self.lst(expires=old, reservations=[{**entry, "until": old}])), "",
+                         "an old list whose entry lapsed: released")
+        self.assertIn("reserved until", self.reservations(self.lst(reservations=[entry])))
+        self.assertEqual(self.reservations(self.lst(reservations=[{**entry, "until": heal.iso(T0 - 1)}])), "", "lapsed")
+        other = {**entry, "hosts": ["build-mini-8"]}
+        self.assertEqual(self.reservations(self.lst(reservations=[other])), "")
+        self.assertIn("reserved", self.reservations(self.lst(reservations=[other], aliases={"build-mini-8": ["build-mini-7"]})))
+        self.assertIn("reserved", self.reservations(self.lst(reservations=[other]), update_host="build-mini-8"),
+                      "the update config's host name counts too")
+        self.assertIn("update config", self.reservations(self.lst(), update_host=""), "no update config: held")
+        self.assertIn("update config", self.reservations(self.lst(), update_host="{broken"))
+        self.assertIn("host reservation", self.reservations(self.lst(), local={
+            "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}))
+        self.assertEqual(self.reservations(self.lst(), local={
+            "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) - 1}), "", "lapsed")
+        self.assertIn("host reservation", self.reservations(self.lst(expires=old), local={
+            "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}),
+            "an old list still reads the host-local marker")
+
+    def test_a_malformed_reservation_anywhere_holds(self) -> None:
+        entry = {"id": "r1", "owner": "someone", "hosts": ["build-mini-8"], "from": heal.iso(T0 - 60),
+                 "until": heal.iso(T0 + 60)}
+        for bad in ('{"schema": "glaeda-fleet-reservations/v1", "expires": NaN, "reservations": []}',
+                    self.lst(reservations=[{**entry, "hosts": "build-mini-7"}]),
+                    self.lst(reservations=[{**entry, "hosts": [7]}]),
+                    self.lst(reservations=[{**entry, "until": "NaN"}]),
+                    self.lst(reservations=[entry, "not an entry"]),
+                    self.lst(reservations=[entry], aliases={"build-mini-8": "build-mini-7"}),
+                    self.lst(reservations=[entry], aliases=[]),
+                    self.lst(expires=1e300),
+                    self.lst(reservations=[{**entry, "from": heal.iso(T0 + 60), "until": heal.iso(T0 - 60)}]),
+                    '{"schema": "glaeda-fleet-reservations/v1", "expires": "%s", "reservations": [{"hosts": '
+                    '["build-mini-7"], "from": "%s", "until": "%s"}], "reservations": []}'
+                    % (heal.iso(T0 + 3600), heal.iso(T0 - 60), heal.iso(T0 + 60))):
+            with self.subTest(bad=str(bad)[:80]):
+                self.assertIn("held", self.reservations(bad))
+        for local in ("not json", {"schema": "glaeda-reservation/v1", "since": "x", "until": 1},
+                      {"schema": "glaeda-reservation/v1", "since": int(T0) + 60, "until": int(T0) - 60},
+                      {"schema": "other/v1"}, ["list"]):
+            with self.subTest(local=local):
+                fleet = self.root / "fleet"
+                fleet.mkdir(exist_ok=True)
+                (fleet / "reservation.json").write_text(local if isinstance(local, str) else json.dumps(local))
+                self.assertIn("unreadable", self.reservations(self.lst()))
+                (fleet / "reservation.json").unlink()
+
+    def test_the_fleet_ops_file_names_no_host_or_login(self) -> None:
+        """This file is public: no host, address, account or person in it. The real fleet's names are checked
+        where they live, against this file as published; here, the shapes they take. /Users/runner is the
+        CI runner account every Actions mini has (seed-root's /Users/runner/_work/cmux, glaeda-disk CMUX_SEED_ROOT),
+        not a person's login."""
+        text = OPS_BYTES.decode()
+        for pattern in (r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", r"\.ts\.net\b", r"\b[\w.-]+@[\w-]+\.[\w.]+\b",
+                        r"\b\w+-mac-mini(?:-\d+)?\b", r"\b(?!python\d|sha\d)[a-z]{3,}\d{1,3}s?\b", r"/Users/(?!Shared/|runner/)\w+",
+                        r"\b(?:aws|ec2)-[a-z0-9]+-\d+\b", r"\bmsg \d+\b", r"\b[A-Z][a-z]+, 20\d\d-\d\d-\d\d\b"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(re.findall(pattern, text), [], pattern)
+
+
+class Updater(unittest.TestCase):
+    """The fleet user's glaeda-update: re-enabled and bootstrapped once no reservation holds the host, never while
+    one does, and only from that user's own plist."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.uid = os.getuid()
+        self.account = mock.Mock(pw_uid=self.uid, pw_dir=os.fspath(self.home), pw_name="runner")
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        self.plist = agents / f"{heal.UPDATER_LABEL}.plist"
+        self.plist.write_bytes(plistlib.dumps({"Label": heal.UPDATER_LABEL, "ProgramArguments": ["/bin/true"]}))
+        self.disabled, self.loaded = True, False
+        self.fail: set[str] = set()
+        self.calls: list[tuple] = []
+        self.state: dict = {}
+
+    def ctl(self, *args: str):
+        self.calls.append(args)
+        if args[0] in self.fail:
+            return 5, f"{args[0]} failed"
+        if args[0] == "print-disabled":
+            return 0, ('disabled services = {\n\t\t"com.teamleaderleo.glaeda.wallpaper" => disabled\n'
+                       f'\t\t"{heal.UPDATER_LABEL}" => {"disabled" if self.disabled else "enabled"}\n}}\n')
+        if args[0] == "enable":
+            self.disabled = False
+        if args[0] == "print":
+            return (0, "") if self.loaded else (113, "Could not find service")
+        if args[0] == "bootstrap":
+            self.loaded = True
+        return 0, ""
+
+    def run_updater(self, hold: str = "", now: float = T0, apply: bool = True) -> dict:
+        return heal.updater_pass(now, apply, self.state, hold=lambda t: hold, user=lambda: self.account, ctl=self.ctl)
+
+    def mutations(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] in ("enable", "bootstrap")]
+
+    def test_a_disabled_updater_with_no_reservation_is_enabled_and_bootstrapped(self) -> None:
+        out = self.run_updater()
+        target = f"gui/{self.uid}/{heal.UPDATER_LABEL}"
+        self.assertEqual(self.mutations(),
+                         [("enable", target), ("bootstrap", f"gui/{self.uid}", os.fspath(self.plist))])
+        self.assertTrue(out["enabled"] and out["bootstrapped"])
+        self.assertIn("re-enabled", out["line"])
+        self.assertEqual(self.state, {})
+        self.calls.clear()
+        self.assertEqual(self.run_updater(), {"state": "enabled"}, "the next pass changes nothing")
+        self.assertEqual(self.mutations(), [])
+
+    def test_never_while_a_reservation_holds(self) -> None:
+        for why in ("reserved until 2026-10-30T00:00:00Z",
+                    "fleet reservations unreadable (ValueError); held as reserved"):
+            with self.subTest(why=why):
+                out = self.run_updater(hold=why)
+                self.assertEqual(out["held"], why)
+                self.assertNotIn("line", out)
+                self.assertEqual(self.mutations(), [])
+                self.assertTrue(self.disabled)
+
+    def test_an_enabled_updater_is_left_alone_and_the_hold_not_read(self) -> None:
+        self.disabled = False
+        holds: list[float] = []
+        out = heal.updater_pass(T0, True, self.state, hold=lambda t: holds.append(t) or "", user=lambda: self.account,
+                                ctl=self.ctl)
+        self.assertEqual((out, holds, self.mutations()), ({"state": "enabled"}, [], []))
+
+    def test_an_already_loaded_agent_is_only_enabled(self) -> None:
+        self.loaded = True
+        out = self.run_updater()
+        self.assertEqual([c[0] for c in self.mutations()], ["enable"])
+        self.assertIn("already loaded", out["line"])
+
+    def test_a_failed_bootstrap_is_retried_after_the_backoff_until_it_loads(self) -> None:
+        self.fail = {"bootstrap"}
+        out = self.run_updater()
+        self.assertFalse(out["bootstrapped"])
+        self.assertTrue(self.state["updater"]["bootstrapPending"])
+        self.assertFalse(self.disabled, "the enable stands: launchd loads it at the next login anyway")
+        self.calls.clear()
+        self.assertIn("retryAt", self.run_updater(now=T0 + 60))
+        self.assertEqual(self.mutations(), [])
+        self.fail = set()
+        out = self.run_updater(now=T0 + heal.UPDATER_RETRY_S)
+        self.assertEqual([c[0] for c in self.mutations()], ["bootstrap"])
+        self.assertTrue(out["bootstrapped"])
+        self.assertEqual(self.state, {})
+
+    def test_a_failed_enable_is_reported_and_backed_off(self) -> None:
+        self.fail = {"enable"}
+        out = self.run_updater()
+        self.assertIn("launchctl enable", out["error"])
+        self.assertIn("line", out)
+        self.assertNotIn("bootstrap", [c[0] for c in self.calls])
+        self.calls.clear()
+        self.assertIn("retryAt", self.run_updater(now=T0 + 1))
+        self.assertEqual(self.mutations(), [])
+
+    def test_a_plan_pass_changes_nothing(self) -> None:
+        out = self.run_updater(apply=False)
+        self.assertEqual(out["would"], "enable and bootstrap")
+        self.assertEqual(self.mutations(), [])
+
+    def test_only_the_users_own_updater_plist(self) -> None:
+        other = self.home / "elsewhere.plist"
+        other.write_bytes(self.plist.read_bytes())
+        self.plist.unlink()
+        self.assertEqual(self.run_updater(), {"state": "not installed"})
+        self.plist.symlink_to(other)
+        self.assertEqual(self.run_updater()["state"], "left alone", "a symlink is not the user's plist")
+        self.plist.unlink()
+        self.plist.write_bytes(plistlib.dumps({"Label": "com.example.other"}))
+        self.assertEqual(self.run_updater()["state"], "left alone", "another Label")
+        self.plist.write_bytes(b"not a plist")
+        self.assertEqual(self.run_updater()["state"], "left alone")
+        self.assertEqual(self.mutations(), [])
+
+    def test_print_disabled_is_read_like_the_runner(self) -> None:
+        listing = f'\t"{heal.UPDATER_LABEL}.extra" => disabled\n\t"{heal.UPDATER_LABEL}" => enabled\n'
+        self.assertFalse(heal.label_disabled(listing, heal.UPDATER_LABEL))
+        self.assertTrue(heal.label_disabled(f'"{heal.UPDATER_LABEL}" => true', heal.UPDATER_LABEL))
+        self.assertFalse(heal.label_disabled("", heal.UPDATER_LABEL))
+
+    def test_run_pass_reports_it_and_keeps_its_state(self) -> None:
+        self.fail = {"bootstrap"}
+        with tempfile.TemporaryDirectory() as d:
+            updater = {"hold": lambda t: "", "user": lambda: self.account, "ctl": self.ctl}
+            report = heal.run_pass(POLICY_PATH, Path(d) / "state", True, FakeHost(), updater=updater)
+            self.assertFalse(report["updater"]["bootstrapped"])
+            saved = json.loads((Path(d) / "state" / "state.json").read_text())
+            self.assertTrue(saved["updater"]["bootstrapPending"], "state.json carries the backoff")
+
+
+class Judge(unittest.TestCase):
+    def report(self, **release) -> dict:
+        rel = {"tag": "r-1", "wants": "r-1", "okAt": heal.iso(T0), "behindSince": None, "error": None,
+               "staleAfterS": 3600, **release}
+        return {"at": heal.iso(T0), "staleAfterS": 360, "release": rel}
+
+    def test_states(self) -> None:
+        self.assertEqual(heal.judge({}, T0, False)["state"], "missing")
+        self.assertEqual(heal.judge(None, T0, True)["state"], "stale")
+        old = heal.judge({"at": heal.iso(T0), "hot": []}, T0, True)
+        self.assertEqual(old["state"], "stale")
+        self.assertIn("one root --install", old["why"])
+        self.assertEqual(heal.judge(self.report(), T0 + 300, True)["state"], "current")
+        self.assertIn("not running", heal.judge(self.report(), T0 + 400, True)["why"])
+        behind = self.report(wants="r-2", behindSince=heal.iso(T0 - 4000), error="boom")
+        self.assertIn("named r-2", heal.judge(behind, T0, True)["why"])
+        self.assertIn("boom", heal.judge(behind, T0, True)["why"])
+        self.assertEqual(heal.judge(self.report(okAt=heal.iso(T0 - 4000)), T0, True)["state"], "stale")
+
+
+class Reload(unittest.TestCase):
+    def test_a_plist_that_no_longer_matches_the_policy_is_reloaded_once_from_a_detached_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
+            (d / "state").mkdir(parents=True)
+            (d / heal.POLICY_NAME).write_bytes(edited_policy(every_s=300))
+            plist.write_bytes(heal.desired_install(POLICY_PATH, d)["plist"])  # loaded at the old interval
+            spawn = mock.Mock()
+            state: dict = {}
+            self.assertTrue(heal.schedule_reload(d, plist, state, T0, 600, spawn))
+            argv, kw = spawn.call_args
+            self.assertEqual(argv[0][:2], ["/usr/bin/python3", "-I"])
+            self.assertIn("--after-pid", argv[0])
+            self.assertTrue(kw["start_new_session"])
+            self.assertFalse(heal.schedule_reload(d, plist, state, T0 + 60, 600, spawn), "once per every_s")
+            plist.write_bytes(heal.desired_install(d / heal.POLICY_NAME, d)["plist"])
+            self.assertFalse(heal.schedule_reload(d, plist, {}, T0, 600, spawn))
+            self.assertEqual(spawn.call_count, 1)
+
+
+DISK_BYTES = (ROOT / "scripts" / "glaeda-disk").read_bytes()
+HYGIENE_BYTES = (ROOT / "scripts" / "glaeda-runner-hygiene").read_bytes()
+
+
+class FakeHygiene:
+    """glaeda-runner-hygiene --check/--apply over a test tree: stale while the snapshot is not --source's bytes."""
+
+    def __init__(self, root: Path) -> None:
+        self.root, self.argv, self.fail_apply = root, [], False
+
+    def __call__(self, argv: list[str], timeout: float) -> tuple[int, str, str]:
+        self.argv.append(argv)
+        source = Path(argv[argv.index("--source") + 1]).read_bytes()
+        if "--root-census" in argv:  # the host's census alone: its snapshot and plist under the same test tree
+            census = self.root / "root-census" / "glaeda-disk"
+            if "--apply" in argv:
+                if self.fail_apply:
+                    return 2, "", "glaeda-runner-hygiene: launchctl bootstrap of the root census failed"
+                census.parent.mkdir(parents=True, exist_ok=True)
+                census.write_bytes(source)
+                return 0, json.dumps({"state": "applied", "operation": "root-census"}), ""
+            current = census.is_file() and census.read_bytes() == source
+            return 0, json.dumps({"state": "current" if current else "stale",
+                                  "stale": [] if current else ["root census snapshot missing"]}), ""
+        uid = "501"  # the one account the tests enroll
+        snapshot, manifest = self.root / uid / "glaeda-disk", self.root / uid / "manifest.json"
+        if "--apply" in argv:
+            if self.fail_apply:
+                return 2, "", "glaeda-runner-hygiene: launchctl bootstrap failed"
+            snapshot.write_bytes(source)
+            doc = json.loads(manifest.read_text())
+            manifest.write_text(json.dumps({**doc, "sha256": hashlib.sha256(source).hexdigest()}))
+            return 0, json.dumps({"state": "applied"}), ""
+        stale = [] if snapshot.read_bytes() == source else ["snapshot is not this source"]
+        return 0, json.dumps({"state": "stale" if stale else "current", "stale": stale}), ""
+
+    def applies(self) -> int:
+        return sum("--apply" in a for a in self.argv)
+
+
+class RunnerHygiene(unittest.TestCase):
+    """The root pass keeps each runner account's root-pinned glaeda-disk on the release it runs, idempotently."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        self.dir, self.root, self.daemons = base / "daemon-heal", base / "runner-hygiene", base / "LaunchDaemons"
+        for d in (self.dir, self.root / "501", self.daemons):
+            d.mkdir(parents=True)
+        (self.dir / heal.DISK_NAME).write_bytes(DISK_BYTES)
+        (self.dir / heal.HYGIENE_NAME).write_bytes(HYGIENE_BYTES)
+        (self.dir / heal.INSTALLED).write_text(json.dumps({"tag": "r-20261027-000000000002", "files": {
+            heal.DISK_NAME: hashlib.sha256(DISK_BYTES).hexdigest(),
+            heal.HYGIENE_NAME: hashlib.sha256(HYGIENE_BYTES).hexdigest()}}))
+        self.snapshot = self.root / "501" / "glaeda-disk"
+        self.snapshot.write_bytes(b"# the glaeda-disk an earlier release pinned\n")
+        (self.root / "501" / "manifest.json").write_text(json.dumps({
+            "user": "cmux", "python": "/usr/bin/python3", "sha256": hashlib.sha256(self.snapshot.read_bytes()).hexdigest()}))
+        (self.daemons / f"{heal.HYGIENE_LABEL}.501.plist").write_bytes(b"<plist/>")
+        self.run = FakeHygiene(self.root)
+        self.state: dict = {}
+
+    def hygiene_pass(self, live: bool = True, now: float = T0) -> dict:
+        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                 sys.executable, lambda uid: {501: "cmux"}[uid])
+
+    def mtimes(self) -> list:
+        return sorted((p, p.stat().st_mtime_ns) for p in self.root.rglob("*"))
+
+    def assert_planned(self, report: dict) -> None:
+        """The invariant: a root copy whose hash is not its release's always has a reconcile action."""
+        for uid, a in report["accounts"].items():
+            have = hashlib.sha256((self.root / uid / "glaeda-disk").read_bytes()).hexdigest()
+            if have != a["wants"]:
+                self.assertTrue(a.get("action") == "reinstall" and a["state"] in ("stale", "error"),
+                                f"{uid}: root copy {have[:12]} is not its release's {a['wants'][:12]} and nothing is planned")
+
+    def test_a_root_copy_that_is_not_its_release_is_reinstalled_and_a_second_pass_changes_nothing(self) -> None:
+        report = self.hygiene_pass()
+        a = report["accounts"]["501"]
+        self.assertEqual((a["state"], a["reinstalled"], self.run.applies()), ("current", True, 1))
+        self.assertEqual(self.snapshot.read_bytes(), DISK_BYTES)
+        self.assertEqual(self.run.argv[0][:3], [sys.executable, "-I", os.fspath(self.dir / heal.HYGIENE_NAME)])
+        self.assertIn(os.fspath(self.dir / heal.DISK_NAME), self.run.argv[0])
+        self.assert_planned(report)
+        before, calls = self.mtimes(), len(self.run.argv)
+        second = self.hygiene_pass(now=T0 + 120)
+        self.assertEqual((second["accounts"]["501"]["state"], len(self.run.argv), self.mtimes()),
+                         ("current", calls, before), "the second pass runs nothing and writes nothing")
+        later = self.hygiene_pass(now=T0 + heal.HYGIENE_RECHECK_S + 1)
+        self.assertEqual((later["accounts"]["501"]["state"], self.run.applies(), self.mtimes()),
+                         ("current", 1, before), "a recheck only reads")
+
+    def test_a_stale_root_copy_always_has_a_planned_reinstall(self) -> None:
+        report = self.hygiene_pass(live=False)
+        self.assertEqual((report["accounts"]["501"]["state"], report["accounts"]["501"]["action"]), ("stale", "reinstall"))
+        self.assertEqual(self.run.applies(), 0, "only a root pass reinstalls")
+        self.assert_planned(report)
+        with self.assertRaises(AssertionError):  # the invariant catches a stale copy with no action
+            self.assert_planned({"accounts": {"501": {**report["accounts"]["501"], "action": None, "state": "current"}}})
+
+    def test_a_release_change_reaches_a_current_copy_at_once(self) -> None:
+        self.hygiene_pass()
+        newer = DISK_BYTES + b"\n# released later\n"
+        (self.dir / heal.DISK_NAME).write_bytes(newer)
+        ident = json.loads((self.dir / heal.INSTALLED).read_text())
+        ident["files"][heal.DISK_NAME] = hashlib.sha256(newer).hexdigest()
+        (self.dir / heal.INSTALLED).write_text(json.dumps(ident))
+        self.hygiene_pass(now=T0 + 120)
+        self.assertEqual((self.snapshot.read_bytes(), self.run.applies()), (newer, 2))
+
+    def test_root_runs_only_the_files_its_release_recorded(self) -> None:
+        (self.dir / heal.HYGIENE_NAME).write_bytes(b"print('not the release')\n")
+        report = self.hygiene_pass()
+        self.assertEqual((self.run.argv, report["accounts"]["501"]["state"]), ([], "unchecked"))
+        self.assertIn("release pass brings them", report["hold"])
+
+    def test_a_failed_reinstall_is_retried_after_hygiene_retry_s_not_every_pass(self) -> None:
+        self.run.fail_apply = True
+        a = self.hygiene_pass()["accounts"]["501"]
+        self.assertEqual((a["state"], a["reinstalled"], a["action"]), ("error", False, "reinstall"))
+        self.assertIn("bootstrap failed", a["why"])
+        calls = len(self.run.argv)
+        self.assertEqual(self.hygiene_pass(now=T0 + 120)["accounts"]["501"]["state"], "error")
+        self.assertEqual(len(self.run.argv), calls)
+        self.run.fail_apply = False
+        self.hygiene_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)
+        self.assertEqual(self.snapshot.read_bytes(), DISK_BYTES)
+
+    def test_a_release_from_before_these_members_still_installs_and_holds_the_hygiene_pass(self) -> None:
+        for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
+            (self.dir / name).unlink()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(SCRIPT_BYTES)
+        (self.dir / heal.POLICY_NAME).write_bytes(POLICY_BYTES)
+        (self.dir / "state").mkdir()
+        channel = Channel()
+        tag = channel.publish(2, members={  # an archive with only the three members older releases shipped
+            heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+            heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES,
+            heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(2, 0, -1)).encode()})
+        hygiene = {"hygiene_root": self.root, "daemons": self.daemons, "run": self.run, "python": sys.executable,
+                   "account": lambda uid: "cmux", "live": True}
+        report = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                               get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual((report["release"]["tag"], report["release"]["error"], report["release"]["drifted"]),
+                         (tag, None, False))
+        self.assertEqual((report["runnerHygiene"]["accounts"]["501"]["state"], self.run.argv), ("unchecked", []))
+
+    def test_an_account_its_manifest_does_not_match_is_left_alone(self) -> None:
+        report = heal.hygiene_pass(self.dir, self.state, T0, True, self.root, self.daemons, self.run,
+                                   sys.executable, lambda uid: "someone-else")
+        self.assertEqual((report["accounts"]["501"]["state"], self.run.argv), ("error", []))
+
+    def test_an_unreadable_enrollment_directory_is_an_error_not_no_work(self) -> None:
+        self.hygiene_pass()
+        cache = dict(self.state["runner_hygiene"])
+        with mock.patch.object(heal.Path, "iterdir", side_effect=OSError(5, "Input/output error")):
+            report = self.hygiene_pass(now=T0 + 120)
+        self.assertIn("Input/output error", report["error"])
+        self.assertEqual(self.state["runner_hygiene"], cache, "the cache is kept")
+
+    def unenroll(self) -> None:
+        for p in (self.root / "501").iterdir():
+            p.unlink()
+        (self.root / "501").rmdir()
+
+    def census_pass(self, why: str = "", live: bool = True, now: float = T0) -> dict:
+        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                 sys.executable, lambda uid: {501: "cmux"}[uid], lambda: why)
+
+    def test_no_enrolled_account_off_a_ci_mini_is_no_work(self) -> None:
+        self.unenroll()
+        self.assertEqual(self.census_pass(why="no runner glaeda-cmux-runner enrolled under /Users/x: not a CI mini"),
+                         {"accounts": {}, "rootCensus": {"state": "skipped", "why":
+                                                          "no runner glaeda-cmux-runner enrolled under /Users/x: not a CI mini"}})
+        self.assertEqual(self.run.argv, [])
+
+    def test_an_unenrolled_ci_mini_gets_the_root_census_from_daemon_heal(self) -> None:
+        # Lent CI minis, 2026-11-18: no account was ever enrolled, so no root census anywhere ("nothing is adopted").
+        # Root daemon-heal now keeps the host's read-only census there with the release's own --root-census.
+        self.unenroll()
+        census = self.root / "root-census" / "glaeda-disk"
+        report = self.census_pass()
+        c = report["rootCensus"]
+        self.assertEqual((report["accounts"], c["state"], c["reinstalled"]), ({}, "current", True))
+        self.assertEqual(census.read_bytes(), DISK_BYTES)
+        self.assertEqual(self.run.argv[0], [sys.executable, "-I", os.fspath(self.dir / heal.HYGIENE_NAME),
+                                            "--root-census", "--source", os.fspath(self.dir / heal.DISK_NAME),
+                                            "--python", "/usr/bin/python3", "--check"])
+        self.assertEqual([a[-1] for a in self.run.argv], ["--check", "--apply", "--check"])
+        calls = len(self.run.argv)
+        again = self.census_pass(now=T0 + 120)
+        self.assertEqual((again["rootCensus"]["state"], len(self.run.argv)), ("current", calls), "a second pass runs nothing")
+
+    def test_the_root_census_is_planned_not_installed_off_a_root_pass_and_waits_on_its_release(self) -> None:
+        self.unenroll()
+        c = self.census_pass(live=False)["rootCensus"]
+        self.assertEqual((c["state"], c["action"], self.run.applies()), ("stale", "reinstall", 0))
+        (self.dir / heal.HYGIENE_NAME).write_bytes(b"print('not the release')\n")
+        self.run.argv.clear()
+        c = self.census_pass(now=T0 + 120)["rootCensus"]
+        self.assertEqual((c["state"], self.run.argv), ("unchecked", []))
+        self.assertIn("release pass brings them", c["why"])
+
+    def test_a_failed_root_census_install_is_an_error_retried_after_hygiene_retry_s(self) -> None:
+        self.unenroll()
+        self.run.fail_apply = True
+        c = self.census_pass()["rootCensus"]
+        self.assertEqual((c["state"], c["reinstalled"]), ("error", False))
+        calls = len(self.run.argv)
+        self.assertEqual(self.census_pass(now=T0 + 120)["rootCensus"]["state"], "error")
+        self.assertEqual(len(self.run.argv), calls)
+        self.run.fail_apply = False
+        self.assertEqual(self.census_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)["rootCensus"]["state"], "current")
+
+    def test_an_enrolled_account_keeps_the_census_itself(self) -> None:
+        report = self.census_pass()
+        self.assertNotIn("rootCensus", report)
+        self.assertFalse(any("--root-census" in a for a in self.run.argv), "one writer: the account's own --apply")
+
+    def test_a_ci_mini_is_a_mac_whose_fleet_user_runs_enrolled_runners_never_lawrence_or_ec2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            pw = mock.Mock(pw_dir=os.fspath(home), pw_name="cmux")
+            with mock.patch.object(heal.sys, "platform", "darwin"), \
+                    mock.patch.object(heal, "fleet_user", return_value=pw), \
+                    mock.patch.object(heal, "platform_node", return_value="cmux-mac-018.local"), \
+                    mock.patch.object(heal.pwd, "getpwnam", side_effect=KeyError("ec2-user")):
+                self.assertIn("not a CI mini", heal.ci_mini_why_not())
+                runner = home / "actions-runner-glaeda-1"
+                (runner / "glaeda-hooks").mkdir(parents=True)
+                self.assertIn("not a CI mini", heal.ci_mini_why_not(), "a .runner config too")
+                (runner / ".runner").write_text("{}")
+                self.assertEqual(heal.ci_mini_why_not(), "")
+                with mock.patch.object(heal, "platform_node", return_value="cmux-lawrence.local"):
+                    self.assertIn("lawrence", heal.ci_mini_why_not())
+            with mock.patch.object(heal.sys, "platform", "darwin"), \
+                    mock.patch.object(heal.pwd, "getpwnam", return_value=mock.Mock()):
+                self.assertIn("EC2", heal.ci_mini_why_not())
+
+    def test_a_deeply_nested_json_file_is_malformed_not_a_crashed_root_pass(self) -> None:
+        # The fleet user writes update.json and the reservation files root reads; nesting under read_small's cap
+        # raised RecursionError, which no caller catches. strict_json says ValueError, which every caller handles.
+        with self.assertRaisesRegex(ValueError, "nested too deeply"):
+            heal.strict_json(b"[" * 100000 + b"]" * 100000)
+
+    def test_the_release_chain_brings_both_files_and_the_root_pass_uses_them(self) -> None:
+        for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
+            (self.dir / name).unlink()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(SCRIPT_BYTES)
+        (self.dir / heal.POLICY_NAME).write_bytes(POLICY_BYTES)
+        (self.dir / "state").mkdir()
+        channel = Channel()
+        channel.publish(2, members={
+            heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+            heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES, heal.MEMBERS[heal.DISK_NAME]: DISK_BYTES,
+            heal.MEMBERS[heal.HYGIENE_NAME]: HYGIENE_BYTES,
+            heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(2, 0, -1)).encode()})
+        hygiene = {"hygiene_root": self.root, "daemons": self.daemons, "run": self.run, "python": sys.executable,
+                   "account": lambda uid: "cmux", "live": True}
+        report = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                               get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual(((self.dir / heal.DISK_NAME).read_bytes(), self.snapshot.read_bytes()), (DISK_BYTES, DISK_BYTES))
+        self.assertEqual(report["runnerHygiene"]["accounts"]["501"]["state"], "current")
+        calls = len(self.run.argv)
+        again = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                              get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual((again["runnerHygiene"]["accounts"]["501"]["state"], len(self.run.argv)), ("current", calls),
+                         "state.json carries the check: the next pass runs nothing")
+
+
+if __name__ == "__main__":
+    unittest.main()

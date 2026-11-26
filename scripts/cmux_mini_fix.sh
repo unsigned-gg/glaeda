@@ -76,6 +76,22 @@ host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it i
   say "free"
 }
 
+host_drain() {  # hold new jobs off the fleet host lock until stdin closes (glaeda-mini-fleet onboard --wait)
+  # A host.lock.waiters entry <pid>-onboard, live while perl's pid is: the build worker then leases no new job or
+  # step here, and what runs finishes, so the lock frees between jobs. It takes no lock itself. The caller closes
+  # stdin (or its ssh drops) to remove the entry; no waiters dir means nothing to drain.
+  [ -d "$GLAEDA_FLEET_DIR/host.lock.waiters" ] || { say "no host.lock.waiters here, nothing to drain"; return 0; }
+  perl -e '
+    my $waiter = "$ARGV[0]/host.lock.waiters/$$-onboard";
+    open(my $w, ">", $waiter) or do { print STDERR "glaeda-mini-fleet: cannot write $waiter ($!)\n"; exit 3 };
+    close($w);
+    $SIG{$_} = sub { unlink $waiter; exit 0 } for qw(TERM INT HUP);
+    $| = 1; print "draining\n";
+    my $buf; 1 while sysread(STDIN, $buf, 4096);
+    unlink $waiter;
+  ' "$GLAEDA_FLEET_DIR"
+}
+
 # One changing step at a time per host: an SSH timeout on the operator side does not stop the remote
 # step, so a rerun must not start the same work beside it. A lock whose process is gone is taken over.
 # No step starts while the host is held (see host_held). runner_hold honors only reservations: it exists to
@@ -145,7 +161,7 @@ rust_channel() {  # ROOT CHANNEL (the toolchain rust-toolchain.toml in the check
 }
 
 # Glaeda itself: the checkout glaeda-mini-enroll runs from, then its user-level setup.
-glaeda() {  # PYTHON
+glaeda() {  # PYTHON [--headless]
   local dir="$HOME/glaeda"
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
@@ -155,7 +171,9 @@ glaeda() {  # PYTHON
   # an older checkout's setup predates --ota-source; glaeda-mirror.sh in hq sets it on such hosts later
   local ota=()
   grep -q -- '--ota-source' "$dir/scripts/glaeda-mini-setup" && ota=(--ota-source manaflow-ai/glaeda)
-  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${ota[@]+"${ota[@]}"}
+  local headless=()
+  [ "${2:-}" = "--headless" ] && headless=(--headless)
+  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${headless[@]+"${headless[@]}"} ${ota[@]+"${ota[@]}"}
 }
 
 # ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes --glaeda-ref, else the tip of main), so
@@ -267,8 +285,49 @@ runner_launchctl() {
   esac
 }
 
+runner_idle() {  # DIR: true only when that runner has no job, as the gate and glaeda-cmux-runner decide it (a
+  # Worker under bin or a self-update's bin.<version>, or a request its live listener took). The runner's own hook
+  # answers, else the fleet copy's; with neither, or any other answer (a crash, an older hook), it has a job.
+  local hook="$1/glaeda-hooks/glaeda-cmux-runner-hook" py="$HOME/.local/bin/python3" rc=0
+  [ -x "$py" ] || py=python3
+  [ -f "$hook" ] || hook="$HOME/glaeda-runner/scripts/glaeda-cmux-runner-hook"
+  [ -f "$hook" ] || return 1
+  "$py" "$hook" busy --runner-dir "$1" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ]
+}
+
+runner_re() {  # DIR as a literal pgrep pattern
+  printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'
+}
+
+runner_supervisors() {  # DIR: the pgrep pattern for its listeners and what starts them (the gate, run.sh, run-helper.sh)
+  local re; re=$(runner_re "$1")
+  printf '%s' "$re/bin[^/ ]*/Runner\.Listener|listen --runner-dir $re( |\$)|$re/run(-helper)?\.sh"
+}
+
+runner_freeze() {  # DIR: SIGSTOP its listeners and their spawners until a look finds none left running; false when
+  # a signal failed or the tree kept changing (pkill 1, nothing matched, is fine)
+  local rc tries=0 pattern table matches running; pattern=$(runner_supervisors "$1")
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    rc=0; pkill -STOP -f "$pattern" 2>/dev/null || rc=$?
+    [ "$rc" -le 1 ] || return 1
+    # every match stopped (state T): nothing of it can start a listener or take a job now. A ps that fails is no proof.
+    table=$(ps -axww -o stat=,command=) || return 1
+    rc=0; matches=$(printf '%s\n' "$table" | grep -E -- "$pattern") || rc=$?
+    [ "$rc" -le 1 ] || return 1  # grep's 1 is no match; anything else is a failed look
+    running=$(printf '%s\n' "$matches" | awk 'NF && $1 !~ /^T/') || return 1
+    [ -n "$running" ] || return 0
+  done
+  return 1
+}
+
+runner_thaw() {  # DIR
+  pkill -CONT -f "$(runner_supervisors "$1")" 2>/dev/null || true
+}
+
 runner_hold() {  # WAIT_SECONDS
-  local r dir plist label domain deadline
+  local r dir plist label domain deadline disabled
   mkdir -p "$(held_dir)"
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
@@ -278,19 +337,24 @@ runner_hold() {  # WAIT_SECONDS
     domain=$(runner_domain "$plist")
     if ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
     deadline=$(( $(date +%s) + $1 ))
-    while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
+    # the last look and the stop happen with its listener frozen, as the gate's own stop: it cannot take a job between
+    while ! { runner_freeze "$dir" && runner_idle "$dir"; }; do
+      runner_thaw "$dir"
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
       say "$label is running a job; waiting for it to end"
       sleep 30
     done
     : > "$(held_dir)/$(basename "$dir")"
-    if ! runner_launchctl "$plist" disable "$domain/$label"; then
+    disabled=1
+    runner_launchctl "$plist" disable "$domain/$label" || disabled=
+    [ -z "$disabled" ] || runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
+    runner_thaw "$dir"  # gone after the bootout, else thawed
+    if [ -z "$disabled" ]; then
       case "$plist" in
         /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;
         *) refuse "could not disable $label" ;;
       esac
     fi
-    runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
     case "$plist" in
       /Library/LaunchDaemons/*) say "held $label; the headless listener gate remains active"; continue ;;
     esac
@@ -354,6 +418,91 @@ metal() {  # DEVELOPER_DIR
   DEVELOPER_DIR="$1" xcrun metal --version | head -1
 }
 
+ios_runtime_ready() {  # DEVELOPER_DIR BUILD: the runtime is listed and available (the probe's own reading)
+  DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null |
+    grep -E "^iOS [0-9.]+ \([0-9.]+ - $2\) - com\.apple\.[A-Za-z0-9.-]+ *\$" >/dev/null  # no -q: pipefail
+}
+data_free_kib() {
+  df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $4; found = 1 } END { exit !found }' ||
+    df -k / | awk 'NR == 2 { print $4 }'
+}
+ios_runtime_install() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB: the download itself, with the host already drained
+  local before after
+  # A booted simulator runs launchd_sim; adding a runtime under it can restart CoreSimulatorService.
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  before=$(data_free_kib)
+  if [ "$before" -lt $((($3 + $4) * 1048576)) ]; then
+    refuse "$((before / 1048576)) GiB free on the Data volume; the download needs $(($3 + $4)) ($3 above the $4 GiB floor)"
+  fi
+  DEVELOPER_DIR="$1" xcodebuild -downloadPlatform iOS
+  after=$(data_free_kib)
+  ios_runtime_ready "$1" "$2" ||
+    refuse "the download finished but runtime $2 is not available; this Xcode yields: $(DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null | grep '^iOS' | tr '\n' ';')"
+  say "iOS simulator runtime $2 available; used $(((before - after) * 1024)) bytes, $((after / 1048576)) GiB free"
+}
+ios_runtime() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB WAIT_SECONDS [GRACE_SECONDS]: add the pinned Xcode's iOS runtime,
+  # never remove one
+  if ios_runtime_ready "$1" "$2"; then say "unchanged: iOS simulator runtime $2 available"; return; fi
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  # No fleet dir: nothing here takes the fleet host lock (the build worker, its run-worker.sh and the runner hook's
+  # ledger all live in that dir), so there is nothing to drain.
+  [ -d "$GLAEDA_FLEET_DIR" ] || { ios_runtime_install "$1" "$2" "$3" "$4"; return; }
+  # The fleet host lock, held exclusively for the whole download, so no build or ci-step runs beside it (each holds it,
+  # steps shared); perl creates it (0660, as the worker does) when it is absent. First a host.lock.waiters entry
+  # <pid>-ios-runtime, live while perl's pid is: the build worker then leases no new job or step here, and what runs
+  # finishes. perl waits up to WAIT_SECONDS for the lock, then runs the download as a child in its own process group
+  # (the lock fd is close-on-exec, so nothing the download starts keeps it). A TERM, INT or HUP to perl (an ssh drop,
+  # the step's timeout) goes on to that group, and perl keeps the lock and the entry until no process of the group is
+  # left (KILL 60 s after the signal), so no build starts beside a download that outlives its caller.
+  perl -MFcntl=:flock,O_RDONLY,O_CREAT,O_NOFOLLOW -MPOSIX=:signal_h,:sys_wait_h,setpgid -e '
+    my ($lock, $wait, $grace) = splice(@ARGV, 0, 3);
+    my $waiter = "";
+    sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\n" if $_[1]; exit $_[0] }
+    my $fh;
+    sysopen($fh, $lock, O_RDONLY | O_CREAT | O_NOFOLLOW, 0660) or leave(20, "held: cannot open $lock ($!), skipped");
+    if (-d "$lock.waiters") {
+      my $w; $waiter = "$lock.waiters/$$-ios-runtime";
+      if (open($w, ">", $waiter)) { close($w) } else { $waiter = "" }
+    }
+    my ($deadline, $said) = (time() + $wait, 0);
+    until (flock($fh, LOCK_EX | LOCK_NB)) {
+      leave(20, "held: $lock still held after ${wait}s, skipped") if time() >= $deadline;
+      print "glaeda-mini-fleet: waiting for the jobs holding $lock to finish (no new ones start)\n" unless $said++;
+      sleep 2;
+    }
+    # TERM, INT and HUP are blocked from before the fork until the child has its own group and the handler is
+    # set, so none can end perl (and drop the lock) in between; one that came meanwhile is delivered after.
+    my $sigs = POSIX::SigSet->new(SIGTERM, SIGINT, SIGHUP);
+    sigprocmask(SIG_BLOCK, $sigs) or leave(3, "refused: sigprocmask: $!");
+    my $pid = fork();
+    defined $pid or leave(3, "refused: fork: $!");
+    if (!$pid) {
+      setpgid(0, 0);
+      $SIG{$_} = "DEFAULT" for qw(TERM INT HUP PIPE);
+      sigprocmask(SIG_UNBLOCK, $sigs);
+      exec { $ARGV[0] } @ARGV;
+      POSIX::_exit(127);
+    }
+    setpgid($pid, $pid);  # also here, so the group exists before any signal is passed on
+    my ($rc, $stop_at, $killed) = (undef, 0, 0);
+    $SIG{$_} = sub { $stop_at ||= time() + $grace; kill "TERM", -$pid } for qw(TERM INT HUP);
+    $SIG{PIPE} = "IGNORE";
+    sigprocmask(SIG_UNBLOCK, $sigs);
+    # Wait for the child, then for every process left in its group. GRACE_SECONDS (60) after a signal, or after the
+    # child ended, the group gets KILL; the lock and the waiter entry stay until no process of it is left.
+    while (1) {
+      if (!defined $rc) {
+        my $r = waitpid($pid, WNOHANG);
+        if ($r == $pid) { $rc = $?; $stop_at ||= time() + $grace }
+      }
+      last if defined $rc && !kill(0, -$pid);
+      if ($stop_at && time() >= $stop_at && !$killed) { kill "KILL", -$pid; $killed = 1 }
+      select(undef, undef, undef, 0.2);
+    }
+    leave($rc & 127 ? 128 + ($rc & 127) : $rc >> 8);
+  ' "$GLAEDA_FLEET_DIR/host.lock" "$5" "${6:-60}" /bin/bash -c "$(declare -f say refuse held_refuse data_free_kib ios_runtime_ready ios_runtime_install)
+set -euo pipefail; ios_runtime_install \"\$@\"" ios_runtime "$1" "$2" "$3" "$4"
+}
 # cmux scripts/setup.sh builds GhosttyKit, the artifacts the bootstrap checks for.
 cmux_setup() {  # ROOT DEVELOPER_DIR
   cd "$(home "$1")" && DEVELOPER_DIR="$2" ./scripts/setup.sh

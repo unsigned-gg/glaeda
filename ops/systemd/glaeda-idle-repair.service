@@ -1,0 +1,17 @@
+[Unit]
+Description=Run queued Glaeda repairs when the host is idle
+Documentation=https://github.com/teamleaderleo/glaeda/blob/main/scripts/glaeda-idle-repair
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/glaeda-idle-repair --apply
+# 75 (QUEUED_EXIT) is "busy host, repair queued for the next idle minute" or "another run holds the lock": the queue
+# working, not a failure. Without this every busy minute left the unit in `systemctl --user --failed`, which
+# a failed-units detector reports (2026-11-22: five hosts; 455 "failed"
+# runs in 24 h on one of them, every one a running CI job).
+SuccessExitStatus=75
+Environment=PYTHONUNBUFFERED=1
+Environment=GLAEDA_ROLE=@GLAEDA_ROLE@
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min

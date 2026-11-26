@@ -106,7 +106,11 @@ Catch-up DerivedData lifecycle, since one directory serves every slot on the hos
   build on the host empties the directory;
 - the local CAS is kept between builds (the 102 s result depends on a filled one), except on
   the writer, whose builds start from an empty one (Writer, below). It is Xcode's own on-disk CAS, which the node daemon does not manage, so its size budget comes
-  from a separate pruner; the daemon's `node-store` gets its own eviction (both not built yet).
+  from a separate pruner, `glaeda-fleet-cas-prune` (hourly). Over its 20 GiB cap it goes whole,
+  also while unrelated runner jobs run, once no process has it open (its `lock` file is free) and
+  nothing in it was used in the last hour or since the oldest running build started (hq#11385:
+  cmux9s always runs jobs, so an idle-host-only rule never pruned it). The daemon's `node-store`
+  gets its own oldest-first eviction in the same tool.
 
 Contract. The host check (`glaeda-mini-fleet check`) can verify:
 
@@ -135,8 +139,8 @@ CI's main build is the only writer (#1134 M3; tested in
 - It runs on one dedicated writer mini whose node daemon holds the signing key and signs
   every index entry (`glaeda-fleet-cas writer`). The store keeps, and every node uses, only
   entries signed by a trusted key (`--trusted-keys`); objects need no signature.
-- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux <sha> -- <build>`. It
-  publishes the signed marker `cmux/<sha>/<Xcode build>` only after a successful build that
+- The main build runs under `xcode/bin/fleet-cas-writer-build.sh cmux@catchup-v1 <sha> -- <build>`. It
+  publishes the signed marker `cmux@catchup-v1/<sha>/<Xcode build>` only after a successful build that
   used the node, with no write error, no failed or skipped fleet-store call and no node
   restart, and with the node still up afterwards; otherwise it exits 4 and later main builds
   fill the rest. It empties the local CAS (`xcode/cas`) first, so every lookup reaches the node (an entry answered from the
@@ -209,6 +213,26 @@ binary started by launchd reaches cmux7s's tailnet address (verified on cmux8s w
 also allowed Unix-socket and remote forwards (`permitopen` limits TCP forwards only), for
 example to the writer's signing socket, and the tailnet makes it unnecessary.
 
+A store that only listens on the office LAN (cmux-lawrence, whose tailnet port no ACL grant
+opens) is reached through the fleet-cas relay instead: `glaeda-fleet-cas-rollout --store-lan IP`
+installs `com.teamleaderleo.glaeda.fleet-cas-relay` on the writer and every node, a
+socket-activated LaunchAgent on `127.0.0.1:7451` whose program is `/usr/bin/nc -G 2 IP 7450`
+(`inetdCompatibility`, one nc per connection). launchd starts Apple's nc directly, with no
+non-Apple ancestor, so Local Network privacy lets it through, and it can reach nothing but the
+one store port: unlike the ssh relay there is no key and no other forward. The node, its
+`fleet-cas.env` (`FLEET_CAS_STORE=127.0.0.1:7451`, `FLEET_CAS_RELAY=IP:7450`) and the scripts
+then use the relay as the store. The store sees each client's LAN address, so `--writers` is
+the writer's LAN source address toward the store (the rollout reads it from the writer's route
+table; it is a DHCP lease, so a changed lease needs the rollout again, and until then the writer's
+puts are refused and builds still read). A dead relay or store is a refused or closed
+connection within nc's 2 s connect limit: the node answers its socket as before, so
+`fleet-cas-settings.sh` still enables the cache, and the node's 30 s upstream backoff turns
+lookups into local misses. The install checks the path with a signed-marker lookup through the
+relay. A manifest compiler-cas service with `"reader_transport": "lan-relay"` makes
+glaeda-mini-fleet report a reader that dials the store directly or lacks the relay agent.
+A custom-root store also gets `com.teamleaderleo.glaeda.fleet-cas-store-gc`, the hourly
+`glaeda-fleet-cas-prune --apply --store-gc-only` (the daily gc below, on that root only).
+
 `--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above), and
 its tailnet address the store's only allowed writer. The writer runs on an hq-only builder
 with no PR runners: any process on the writer host can reach the signing node's socket.
@@ -245,9 +269,9 @@ cmux8s (node), 2026-09-24.
 Catch-up is only fast when the store already holds the target commit; on a store miss it
 is a cold build (756 s on Xcode 26.3 minis; a full caching-on rebuild took 606 s on 26.6), slower than an incremental caching-off rebuild. So the
 worker asks first: the writer records a marker per commit it has filled, and catch-up is
-chosen only when `xcode/bin/fleet-cas-marker.sh cmux <sha>` exits 0 (the signed marker for
+chosen only when `xcode/bin/fleet-cas-marker.sh cmux@catchup-v1 <sha>` exits 0 (the signed marker for
 that commit and this host's Xcode build exists). Before building, the worker then runs
-`xcode/bin/fleet-cas-warm.sh cmux <sha>` under a timeout: it copies the whole fill into the
+`xcode/bin/fleet-cas-warm.sh cmux@catchup-v1 <sha>` under a timeout: it copies the whole fill into the
 node, so the build's lookups are local hits. On any other exit (1: no manifest, 2: something
 did not verify, 3: incomplete) or a timeout, fall back to a slot build. Unwarmed, each lookup is two
 serial fleet-store round trips, and a full catch-up read took 1631 s on 09-25. Between builds,

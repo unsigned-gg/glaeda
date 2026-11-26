@@ -6,27 +6,134 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
+import collections
 import fcntl
+import hashlib
 import io
+import itertools
 import json
+import errno
 import os
 import plistlib
+import pwd
+import re
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
+import functools
 import unittest
+from dataclasses import replace
 from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, os.fspath(ROOT / "scripts"))
+import glaeda_hook_pin  # noqa: E402
+
+# pin a changed runner hook before glaeda-disk loads, so its drain tests see the pin on the first run (CI only checks)
+if not glaeda_hook_pin.under_ci():
+    glaeda_hook_pin.ensure(check=False)
 loader = importlib.machinery.SourceFileLoader("glaeda_disk", os.fspath(ROOT / "scripts" / "glaeda-disk"))
 spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+# Never the host's own sudo, nor a stale-scratch family that depends on it: a runner with passwordless sudo turned
+# every census test's unreadable fixture into a measured row. StaleTmpScratchTest and CensusSudoTest set both.
+gd._SUDO_READS = False
+gd._RUNNER_ACCOUNTS_ENABLED = False  # RUNNER_ACCOUNTS: no test reaches sudo
+gd._STALE_TMP_ENABLED = False
+
+
+# The ages before Leo's 1 h default (2026-11-18). Tests of rules other than the window's length (a git veto, a lease,
+# a seed keep, LRU order, a reservation) were written with fixtures aged around the 12 h window; they run under it, and
+# the 1 h window itself is pinned by test_every_disposable_age_is_one_hour and its neighbours.
+TWELVE_HOUR_AGES = {name: 12.0 for name in (
+    "DEFAULT_AGE_HOURS", "KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
+    "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "IDLE_SEED_HOURS", "SIM_DEVICE_IDLE_HOURS",
+    "CHECKOUT_BUILD_IDLE_HOURS", "RUNNER_CACHE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS",
+    "TMP_TEST_RESIDUE_IDLE_HOURS", "CMUX_JOB_MIRROR_HOURS")}
+TWELVE_HOUR_AGES["RUNTIME_IDLE_DAYS"] = 0.5
+
+
+def twelve_hour_ages(test):
+    """Run TEST (a method or a TestCase class) with the 12 h ages and the matching policy defaults."""
+    if isinstance(test, type):
+        for name in [n for n in vars(test) if n.startswith("test") or n == "setUp"]:
+            setattr(test, name, twelve_hour_ages(getattr(test, name)))
+        return test
+
+    @functools.wraps(test)
+    def run(*args, **kwargs):
+        policy = {**gd.POLICY, "soft_idle_hours": 12.0, "stale_marker_max_hours": 12.0,
+                  "build_caches_unwindowed": False}
+        with mock.patch.multiple(gd, **TWELVE_HOUR_AGES), mock.patch.object(gd, "POLICY", policy):
+            return test(*args, **kwargs)
+    return run
+
+
+# Every test runs on an unreserved host unless it says otherwise (HostReservationTest): an empty reservation list, so a
+# test's host never reads the real ~/.local/share/glaeda/fleet-reservations.json, or fails closed without one.
+_NO_RESERVATIONS = tempfile.NamedTemporaryFile("w", suffix="-fleet-reservations.json", delete=False)
+_NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z", '
+                       '"reservations": [], "aliases": {}}')
+_NO_RESERVATIONS.close()
+gd.FLEET_RESERVATIONS = Path(_NO_RESERVATIONS.name)
+# No test reads a real root census (RootCensusTest writes its own).
+gd.ROOT_CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".no-root-census.json")
+gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
+# An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
+# the test's own, the TMPDIR reaper does nothing.
+_reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
+gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None, runner_host=None:
+                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt, runner_host))
+# Nor start a background volume census, or read the real host's census, from a test.
+gd.CENSUS_AUTOLAUNCH = False
+gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
+# Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
+_gc_home_clones = gd.gc_home_clones
+gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
+# Nor trim the Cargo targets of the host running the suite: only a test's own roots are swept.
+_sweep_cargo_targets = gd.sweep_cargo_targets
+gd.sweep_cargo_targets = (lambda receipt, roots=None, *args, **kw:
+                          {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
+                          if roots is None else _sweep_cargo_targets(receipt, roots, *args, **kw))
+# Nor repack the shared mirrors of the host running the suite: only a test's own home's.
+_compact_shared_mirrors = gd.compact_shared_mirrors
+gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
+                             0 if home is None else _compact_shared_mirrors(receipt, home, halt))
+# And room for every repack, gc and archive whatever the host running the suite has free (a 2 GiB /tmp failed the
+# success tests under the 4 GiB floor, glaeda#1972 F3); the tests of the gate itself use RELIEF_ROOM.
+RELIEF_ROOM = gd.relief_room
+gd.relief_room = lambda path, peak, slow: ""
+# Nor erase the simulator devices of the host running the suite: only a test that passes its own simctl reading.
+_erase_idle_sim_devices = gd.erase_idle_sim_devices
+gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None, below_target=None:
+                             0 if simctl is None else _erase_idle_sim_devices(receipt, halt, budget_s, simctl,
+                                                                              below_target))
+
+
+# A fleet-mini main() sets BUILD_CACHES_UNWINDOWED for its run; a test that calls survey() itself after another
+# test's main() must not inherit it, so every main() in this suite leaves it off again.
+_gd_main = gd.main
+
+
+def _main_then_reset(*args, **kwargs):
+    try:
+        return _gd_main(*args, **kwargs)
+    finally:
+        gd.BUILD_CACHES_UNWINDOWED = False
+        # and the pressure rules a fleet-mini pressure pass sets (PRESSURE_WORKER_BUILD_OUTPUT and the rest)
+        gd.PRESSURE_WORKER_BUILD_OUTPUT = gd.PRESSURE_NEWEST_SEED = gd.PRESSURE_SIM_RUNTIMES = False
+
+
+gd.main = _main_then_reset
 
 
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
@@ -36,6 +143,19 @@ def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
     for p in (path / "blob", path):
         os.utime(p, (t, t))
     return path
+
+
+_LOAD = mock.patch.object(os, "getloadavg", return_value=(0.0, 0.0, 0.0))
+
+
+def setUpModule() -> None:
+    # An apply asks saturation_halt before its walks: the test host's own load never decides a test (a test that
+    # wants a load patches getloadavg itself)
+    _LOAD.start()
+
+
+def tearDownModule() -> None:
+    _LOAD.stop()
 
 
 class GlaedaDiskTest(unittest.TestCase):
@@ -48,9 +168,19 @@ class GlaedaDiskTest(unittest.TestCase):
         gd._DISCOVERED.clear()
         self.gd_keep = gd.NESTED_KEEP
         gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
+        # an --apply main() refills the full-disk reserve: never 512 MiB in the real home
+        reserve, real_path, real_bytes = (self.root.parent / f"{self.root.name}-reserve",
+                                          gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES)
+        gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES = (lambda: reserve), 8 * 1024**2
+        self.addCleanup(setattr, gd, "full_disk_reserve_path", real_path)
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", real_bytes)
+        self.addCleanup(lambda: reserve.unlink(missing_ok=True))
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.FLOOR_HOLD = {}  # a main() pressure run in a test sets it
+        gd.BUILD_CACHES_UNWINDOWED = False  # and this, on a fleet-mini run
+        gd.PRESSURE_WORKER_BUILD_OUTPUT = gd.PRESSURE_NEWEST_SEED = gd.PRESSURE_SIM_RUNTIMES = False  # a pressure run
         gd.NESTED_KEEP.unlink(missing_ok=True)
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
@@ -70,7 +200,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 raise subprocess.TimeoutExpired(self.argv, timeout)
 
         with mock.patch.object(gd.subprocess, "Popen", HungDu), \
-                mock.patch.object(gd.os, "killpg") as killpg:
+                mock.patch.object(gd.os, "killpg") as killpg, \
+                mock.patch.object(gd, "eviction_activity", return_value=None):
             self.assertIsNone(gd.du_bytes(self.root))
             self.assertIsNone(gd.du_children(self.root))
         self.assertEqual(killpg.call_count, 2)
@@ -78,16 +209,91 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.EVICTION_STUCK[-1]["id"], "eviction_stuck")
         self.assertIn(str(self.root), gd.EVICTION_STUCK[-1]["path"])
 
+    def test_report_only_du_timeout_stays_out_of_eviction_findings(self) -> None:
+        class HungDu:
+            pid = 7320
+            returncode = None
+
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        saved = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
+        with mock.patch.object(gd.subprocess, "Popen", HungDu), \
+                mock.patch.object(gd.os, "killpg"):
+            self.assertIsNone(gd.du_bytes(self.root, record_timeout=False))
+            self.assertIsNone(gd.du_children_with_status(self.root, record_timeout=False))
+        self.assertEqual(gd.EVICTION_STUCK, [])
+
     def test_eviction_timeout_findings_aggregate_by_path(self) -> None:
         saved = list(gd.EVICTION_STUCK)
         gd.EVICTION_STUCK.clear()
         self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
         argv = ["du", "-xsk", str(self.root)]
-        gd._record_eviction_stuck(argv)
-        gd._record_eviction_stuck(argv)
+        with mock.patch.object(gd, "eviction_activity", return_value=None):
+            gd._record_eviction_stuck(argv)
+            gd._record_eviction_stuck(argv)
         self.assertEqual(len(gd.EVICTION_STUCK), 1)
         self.assertEqual(gd.EVICTION_STUCK[0]["count"], 2)
         self.assertEqual(gd.EVICTION_STUCK[0]["path"], str(self.root))
+
+    def test_timed_out_path_is_not_rewalked_during_cooldown(self) -> None:
+        saved_state = gd.TIMEOUT_STATE
+        saved_paths = dict(gd._TIMED_OUT_PATHS)
+        gd.TIMEOUT_STATE = self.root / "timeout-paths.json"
+        gd._TIMED_OUT_PATHS.clear()
+        self.addCleanup(lambda: (setattr(gd, "TIMEOUT_STATE", saved_state),
+                                  gd._TIMED_OUT_PATHS.clear(), gd._TIMED_OUT_PATHS.update(saved_paths)))
+        gd._record_eviction_stuck(["du", "-xsk", str(self.root)])
+        with mock.patch.object(gd, "_du_output") as du:
+            self.assertIsNone(gd.du_bytes(self.root))
+        du.assert_not_called()
+
+    def test_eviction_timeout_marks_active_host_contention(self) -> None:
+        saved = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
+        argv = ["du", "-xsk", str(self.root)]
+        with mock.patch.object(gd, "eviction_activity", return_value={
+                "state": "active", "evidence": "host.lock pid 7319 (worker-current)"}), \
+                mock.patch.object(gd.time, "time", return_value=1_790_500_000):
+            gd._record_eviction_stuck(argv)
+        finding = gd.EVICTION_STUCK[0]
+        self.assertEqual((finding["state"], finding["severity"], finding["auto_fix"]),
+                         ("active", "warn", "deferred"))
+        self.assertEqual(finding["observed_at"], 1_790_500_000)
+        self.assertIn("worker-current", finding["evidence"])
+        self.assertEqual(finding["activity"]["state"], "active")
+
+    def test_eviction_activity_accepts_only_live_marker_pid(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "evict-lock-v1").write_text("7319\n")
+        with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                mock.patch.object(gd, "_pid_alive", return_value=True), \
+                mock.patch.object(gd, "_owner_command", return_value="worker-current"):
+            self.assertEqual(gd.eviction_activity(), {
+                "state": "active", "evidence": "evict-lock-v1 pid 7319 (worker-current)"})
+        with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                mock.patch.object(gd, "_pid_alive", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="")):
+            self.assertIsNone(gd.eviction_activity())
+
+    def test_eviction_activity_reads_a_live_host_lock(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        lock = fleet / "host.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                    mock.patch.object(gd.subprocess, "run") as run:
+                activity = gd.eviction_activity()
+            run.assert_not_called()
+        self.assertEqual(activity, {"state": "active", "evidence": "fleet host.lock is held"})
 
     def test_du_root_walk_refuses_filesystem_root(self) -> None:
         with mock.patch.object(gd, "_du_output") as run:
@@ -129,7 +335,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 {"xcode-derived-data", "cmux-job-cache", "cmux-ghosttykit-cache",
                  "cua-recordings", "cua-cache"},
             )
-            self.assertTrue(all(family.min_idle_hours == 168.0 for family in families))
+            self.assertTrue(all(family.min_idle_hours == gd.DEFAULT_AGE_HOURS for family in families))
             self.assertTrue(gd.runner_profile_roots_safe(families))
             measured = gd.fixed_measurement_roots()
             self.assertEqual(set(measured), {family.root for family in families})
@@ -225,6 +431,58 @@ class GlaedaDiskTest(unittest.TestCase):
         du.assert_not_called()
         self.assertTrue(gd._MEASURE_BUDGET_REACHED)
 
+    def test_a_spent_measure_budget_still_judges_what_was_measured(self) -> None:
+        """A pressure apply's walks stop at its measure deadline and its verdicts at a later one: the candidates
+        measured by then are judged (and can be deleted), the rest stay unsized and are never judged."""
+        old, unsized = make(self.root / "old"), make(self.root / "unsized")
+        with mock.patch.object(gd, "du_bytes") as du:
+            items = gd.survey([self.fam], 24, 0, {os.fspath(old): 1 << 20},
+                              deadline=time.monotonic() - 1, judge_deadline=time.monotonic() + 60)
+        du.assert_not_called()
+        self.assertEqual([(Path(i.path).name, i.verdict) for i in items], [("old", "reclaimable")])
+        self.assertNotIn(os.fspath(unsized), [i.path for i in items])
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+        # the verdict deadline passed too: nothing is judged, so nothing can be deleted
+        items = gd.survey([self.fam], 24, 0, {os.fspath(old): 1 << 20},
+                          deadline=time.monotonic() - 1, judge_deadline=time.monotonic() - 1)
+        self.assertEqual(items, [])
+
+    def test_survey_walks_families_round_robin(self) -> None:
+        """A family of tens of thousands of small entries (a CI mini's $TMPDIR) must not hold every other family's
+        candidates behind it until the measure deadline."""
+        many_root, few_root = self.root / "many", self.root / "few"
+        for k in range(20):
+            make(many_root / f"m{k:02d}")
+        make(few_root / "spm-a")
+        make(few_root / "spm-b")
+        many = gd.Family("user-tmp", many_root, True, "scratch")
+        few = gd.Family("cmux-spm-scratch", few_root, True, "scratch")
+        order = [(fam.id, path.name) for fam, path in gd.round_robin_work([many, few])]
+        self.assertEqual(sorted(name for _, name in order),
+                         sorted([f"m{k:02d}" for k in range(20)] + ["spm-a", "spm-b"]))
+        # directory order is unspecified, so only the family sequence is: alternating, then the long family's rest
+        self.assertEqual([fid for fid, _ in order],
+                         ["user-tmp", "cmux-spm-scratch"] * 2 + ["user-tmp"] * 18)
+
+    def test_the_judge_deadline_stops_the_verdicts_too(self) -> None:
+        """The verdicts' own checks (ages, sockets, locks, git) run under the judge deadline: one that passes mid-way
+        keeps what was judged and leaves the rest out. A controlled clock, so no scheduler pause decides it."""
+        known = {os.fspath(make(self.root / n)): 1 << 20 for n in ("a", "b", "c")}
+        clock, calls = [0.0], []
+
+        def slow_keep(fam, path):
+            calls.append(path.name)
+            clock[0] += 10.0
+            return ""
+        with mock.patch.object(gd, "keep_verdict", side_effect=slow_keep), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd.time, "monotonic", side_effect=lambda: clock[0]):
+            items = gd.survey([self.fam], 24, 0, known, deadline=5.0, judge_deadline=15.0)
+        self.assertEqual(len(calls), 2)  # judged at 0 and 10; at 20 the deadline (15) has passed
+        self.assertEqual(sorted(Path(i.path).name for i in items), sorted(calls))
+        self.assertTrue(all(i.verdict == "reclaimable" for i in items))
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
 
@@ -256,6 +514,36 @@ class GlaedaDiskTest(unittest.TestCase):
         os.utime(repo / ".git", (time.time() - 48 * 3600,) * 2)
         self.assertEqual(gd.survey([self.fam], 24, 0)[0].verdict, "git-checkout")
 
+    def test_referenced_main_checkout_is_kept(self) -> None:
+        home = self.root / "home"
+        home.mkdir()
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / "README").write_text("ok\n")
+        subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(remote)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "-u", "origin", "HEAD"], check=True)
+        (home / ".zshrc").write_text(f"source {repo}/shell.zsh\n")
+        old = time.time() - 48 * 3600
+        os.utime(repo, (old, old))
+        os.utime(repo / ".git", (old, old))
+        fam = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        with mock.patch.object(gd, "HOME", home):
+            item = next(i for i in gd.survey([fam], 24, 0) if i.path == str(repo))
+            self.assertEqual(item.verdict, "in-use")
+            self.assertTrue(any("referenced" in reason for reason in item.reasons))
+            receipt = self.root / "referenced.jsonl"
+            item.verdict = "reclaimable"  # exercise the apply-time reference recheck
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue(repo.exists())
+        self.assertIn("changed:referenced", receipt.read_text())
+
     def test_tmp_checkout_git_metadata_does_not_reset_idle_clock(self) -> None:
         self.fam = gd.Family("tmp", self.root, True, "scratch", git_disposable=True,
                              max_idle_hours=1.0)
@@ -279,10 +567,10 @@ class GlaedaDiskTest(unittest.TestCase):
         calls: list[list[str]] = []
         real_du_output = gd._du_output
 
-        def counting_du_output(args):
+        def counting_du_output(args, **kwargs):
             if args and args[0] == "du":
                 calls.append(list(args))
-            return real_du_output(args)
+            return real_du_output(args, **kwargs)
 
         gd._du_output = counting_du_output
         try:
@@ -310,6 +598,112 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(fam.root, self.root)
         self.assertTrue(fam.reclaimable and fam.git_disposable and not fam.bulk_sizes)
         self.assertIn("com.apple.", fam.skip_prefixes)
+
+    def test_node_products_go_by_age_only_on_a_mini_no_cmux_runner_reaches(self) -> None:
+        """NODE_PRODUCTS_UNREAD (cmux24, 2026-11-20): node-products is bounded only by a cmux job, so on a mini whose
+        runners all serve other repositories it goes by age; any runner that may take a cmux job, an org runner of
+        manaflow-ai, or an unreadable config keeps it report only."""
+        users = self.root / "Users"
+
+        def runner(home: str, name: str, url: str | None) -> None:
+            r = users / home / name
+            r.mkdir(parents=True)
+            (r / ".runner").write_text("{not json" if url is None else json.dumps({"gitHubUrl": url}))
+
+        (users / "Shared" / "cmux-build-fleet").mkdir(parents=True)
+        runner("cmux", "actions-runner-glaeda-hq-census", "https://github.com/manaflow-ai/cmuxterm-hq")
+        runner("cmux", "actions-runner-glaeda-hq-report", "https://github.com/manaflow-ai/cmuxterm-hq")
+        runner("other", "actions-runner-x", "https://github.com/teamleaderleo/glaeda")
+        (users / "cmux" / "actions-runner-unconfigured").mkdir()
+        self.assertFalse(gd.cmux_runner_on_host(users), "only HQ and glaeda runners: no cmux reader")
+        for url in ("https://github.com/manaflow-ai/cmux", "https://github.com/Manaflow-AI/cmux.git",
+                    "https://github.com/manaflow-ai", None):
+            shutil.rmtree(users / "pool", ignore_errors=True)
+            runner("pool", "actions-runner-glaeda-1", url)
+            self.assertTrue(gd.cmux_runner_on_host(users), url)
+        self.assertTrue(gd.cmux_runner_on_host(self.root / "missing"), "an unreadable /Users fails closed")
+        shutil.rmtree(users / "pool")
+        fleet = users / "Shared" / "cmux-build-fleet"
+        (fleet / "node-products").mkdir()
+        saved = (gd.DARWIN, gd.cmux_runner_on_host, gd.FLEET_ROOT)
+        try:
+            gd.DARWIN, gd.FLEET_ROOT = True, fleet
+            for on_host in (False, True):
+                gd.cmux_runner_on_host = lambda on_host=on_host: on_host
+                fam = next(f for f in gd.default_families() if f.id == "cmux-node-products")
+                self.assertEqual(fam.reclaimable, not on_host)
+                if not on_host:
+                    self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+        finally:
+            gd.DARWIN, gd.cmux_runner_on_host, gd.FLEET_ROOT = saved
+
+    def _clone_tree(self) -> tuple[Path, Path]:
+        user_tmp, clones = self.root / "T", self.root / "X"
+        user_tmp.mkdir()
+        bundle = clones / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone"
+        for name, age_h in (("code_sign_clone.Old1", 30), ("code_sign_clone.Old2", 20), ("code_sign_clone.New", 10)):
+            deep = bundle / name / "cmux DEV.app.bundle/Contents/Frameworks/X.framework/Versions/A/Resources/r"
+            deep.mkdir(parents=True)
+            (deep / "blob").write_bytes(b"x" * (2 << 20))
+            stamp = time.time() - age_h * 3600
+            for d, dirs, files in os.walk(bundle / name):
+                for f in files:
+                    os.utime(Path(d) / f, (stamp, stamp))
+            for d, dirs, files in list(os.walk(bundle / name))[::-1]:
+                os.utime(d, (stamp, stamp))
+        (bundle / "stray").mkdir()
+        (clones / "com.apple.Safari.code_sign_clone" / "code_sign_clone.Q1").mkdir(parents=True)
+        return user_tmp, clones
+
+    def _clone_family(self, user_tmp: Path) -> "gd.Family":
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            return next(f for f in gd.default_families() if f.id == "code-sign-clones")
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+
+    def test_code_sign_clones_family(self) -> None:
+        user_tmp, clones = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        self.assertEqual(fam.root, clones)
+        self.assertTrue(fam.reclaimable and fam.app_clones and fam.build_output)
+        self.assertGreaterEqual(fam.min_idle_hours, 2.0)
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "/bin/zsh\n", "")):
+            names = sorted(p.name for p in gd.candidates(fam))
+        # the newest copy of the bundle stays; Apple bundles and stray names are never candidates
+        self.assertEqual(names, ["code_sign_clone.Old1", "code_sign_clone.Old2"])
+
+    def test_code_sign_clones_of_a_running_app_are_kept(self) -> None:
+        user_tmp, _ = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        level = [p for p in (fam.root / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone").iterdir()
+                 if p.name.startswith("code_sign_clone.")]
+        running = "/Users/cmux/Apps/cmux DEV.app/Contents/MacOS/cmux --flag\n"
+        self.assertEqual(gd.keep_live_app_clones(level, running), [])
+        self.assertEqual(len(gd.keep_live_app_clones(level, "/bin/zsh\n")), 2)
+        with mock.patch.object(gd.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(gd.keep_live_app_clones(level), [])  # no process list: keep everything
+
+    def test_code_sign_clones_deep_bundle_is_reclaimable(self) -> None:
+        user_tmp, _ = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        with mock.patch.object(gd, "keep_live_app_clones", side_effect=lambda level, commands=None: level):
+            items = gd.survey([fam], 6, 0)
+        verdicts = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(verdicts["code_sign_clone.Old1"], "reclaimable", verdicts)
+        self.assertEqual(verdicts["code_sign_clone.Old2"], "reclaimable", verdicts)
+
+    def test_no_code_sign_clones_family_without_the_directory(self) -> None:
+        user_tmp = self.root / "T"
+        user_tmp.mkdir()
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            ids = {f.id for f in gd.default_families()}
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        self.assertNotIn("code-sign-clones", ids)
 
     def test_default_user_tmp_sizes_children_without_bulk_root_walk(self) -> None:
         saved = (gd.DARWIN, gd.darwin_user_tmp)
@@ -354,6 +748,7 @@ class GlaedaDiskTest(unittest.TestCase):
         try:
             gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             self.assertTrue(d.exists())
+            self.assertEqual(items[0].verdict, "blocked")
             self.assertIn("changed:modified", receipt.read_text())
         finally:
             receipt.unlink(missing_ok=True)
@@ -378,6 +773,59 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.git_state(self.root / "clone"), "git")
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
+
+    def test_disposable_family_searches_deep_trees_to_the_bottom(self) -> None:
+        # a lane VM, 2026-11-25: an extracted toolchain under /tmp (11 levels, 2190 entries) read "unchecked"
+        # at the default depth 5 forever; a git_disposable family is bounded by the entry budget, not the depth
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        deep = self.root / "toolchain"
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c").mkdir(parents=True)
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/lib.so").write_text("x")
+        self.assertEqual(gd.git_state(deep), "unchecked")  # the plain default depth still fails closed
+        self.assertEqual(gd.family_git_state(self.fam, deep), "unchecked")  # so does a non-disposable family
+        self.assertEqual(gd.family_git_state(tmp, deep), "none")
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/repo/.git").mkdir(parents=True)
+        self.assertEqual(gd.family_git_state(tmp, deep), "git")  # a clone at the bottom is still found
+
+    def test_disposable_item_past_its_window_gets_the_larger_budget_within_a_day(self) -> None:
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        big = self.root / "copy"
+        for i in range(30):
+            (big / f"d{i}").mkdir(parents=True)
+            for j in range(10):
+                (big / f"d{i}" / f"f{j}").write_text("x")
+        real = gd.git_state
+
+        def small(path, depth=5, budget=20000, sealed=False):
+            return real(path, depth, 50 if budget == 20000 else budget, sealed)
+
+        with mock.patch.object(gd, "git_state", small):
+            self.age(big, *big.iterdir(), hours=13)
+            self.assertEqual(gd.family_git_state(tmp, big), "none")  # disposable, past 12 h: larger budget now
+            self.assertEqual(gd.family_git_state(self.fam, big), "unchecked")  # a cache family still waits 7 days
+            self.age(big, *big.iterdir(), hours=2)
+            self.assertEqual(gd.family_git_state(tmp, big), "unchecked")  # recent: fails closed
+
+    def test_old_tree_past_default_budget_is_searched_on_a_larger_budget(self) -> None:
+        big = self.root / "big"
+        for i in range(30):
+            d = big / f"d{i}"
+            d.mkdir(parents=True)
+            for j in range(10):
+                (d / f"f{j}").write_text("x")
+        real = gd.git_state
+
+        def small(path, depth=5, budget=20000, sealed=False):
+            return real(path, depth, 50 if budget == 20000 else budget, sealed)
+
+        with mock.patch.object(gd, "git_state", small):
+            self.age(big, *big.iterdir(), hours=24 * 8)
+            self.assertEqual(gd.family_git_state(self.fam, big), "none")  # old: second pass, larger budget
+            self.age(big, *big.iterdir(), hours=1)
+            self.assertEqual(gd.family_git_state(self.fam, big), "unchecked")  # recent: stays fail-closed
+            (big / "d3" / ".git").mkdir()
+            self.age(big, *big.iterdir(), hours=24 * 8)
+            self.assertEqual(gd.family_git_state(self.fam, big), "git")  # old with a clone inside: protected
 
     @staticmethod
     def age(*tops: Path, hours: float = 48) -> None:
@@ -528,8 +976,9 @@ class GlaedaDiskTest(unittest.TestCase):
         for i in range(50):
             (wide / f"d{i}").mkdir(parents=True)
         (wide / "d0/CACHEDIR.TAG").write_bytes(cargo_tag)
-        with mock.patch.object(gd, "HOME", home):
+        with mock.patch.object(gd, "HOME", home), mock.patch.dict(gd.RUN, clear=True):
             found = {os.path.relpath(p, home) for p in gd.discover_caches(home, budget=20)}
+            self.assertTrue(gd.RUN["survey_incomplete"])
         self.assertNotIn("wide/d0", found)
         self.assertIn(".cargo/registry", found)
 
@@ -602,34 +1051,119 @@ class GlaedaDiskTest(unittest.TestCase):
                                           '[overrides]\n"/p/x" = "1.90.0-aarch64-apple-darwin"\n')
         return rh
 
-    def test_rustup_toolchains_other_than_the_default_go_lru(self) -> None:
+    def test_rustup_toolchains_and_cargo_bin_are_never_evicted(self) -> None:
+        """2026-10-26: all 14 runner minis lost ~/.cargo/bin/rustup and job-started refused every job. ~/.rustup (every
+        toolchain, the default or not) and ~/.cargo/bin stay at any age and any pressure; ~/.cargo's registry still goes."""
         home = self.root / "home"
         rh = self.rustup_home(home)
-        self.age(rh)
-        # read an hour ago, written long ago: where the filesystem records access, LRU order sees it
+        (home / ".cargo/bin").mkdir(parents=True)
+        (home / ".cargo/bin/rustup").write_bytes(b"\0" * 1024 * 1024)
+        for link in ("cargo", "rustc"):
+            (home / ".cargo/bin" / link).symlink_to("rustup")
+        registry = home / ".cargo/registry"
+        registry.mkdir()
+        (registry / "CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n")
+        (registry / "blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(home)
         now = time.time()
         os.utime(rh / "toolchains/nightly-aarch64-apple-darwin/bin/rustc", (now - 3600, now - 90 * 24 * 3600))
         self.fam = gd.Family("home-caches", home, True, "re-download", discover=True)
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd.shutil, "which", return_value=None), \
                 mock.patch.dict(os.environ, {"CARGO_HOME": str(home / ".cargo")}):
-            self.assertTrue(all(v == "kept" for v in self.verdicts().values()))  # no rustup to reinstall
-            (home / ".cargo/bin").mkdir(parents=True)
-            (home / ".cargo/bin/rustup").write_bytes(b"")
-            self.assertEqual(self.verdicts(), {"stable-aarch64-apple-darwin": "kept",
-                                               "1.90.0-aarch64-apple-darwin": "kept",
-                                               "nightly-aarch64-apple-darwin": "recent",
-                                               "1.88.0-aarch64-apple-darwin": "reclaimable"})
+            os.environ.pop("RUSTUP_HOME", None)
+            for path in (rh, rh / "toolchains/1.88.0-aarch64-apple-darwin", rh / "settings.toml", home / ".cargo/bin",
+                         home / ".cargo/bin/rustup", home / ".cargo", home):
+                self.assertTrue(gd.toolchain_held(path), path)
+                self.assertTrue(gd.never_delete(path), path)
+            self.assertFalse(gd.toolchain_held(registry))
             items = gd.survey([self.fam], 24, 0)
+            self.assertFalse([i for i in items if gd.toolchain_held(Path(i.path))], "nothing under the toolchain listed")
             receipt = self.root.parent / f"{self.root.name}-r.jsonl"
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             receipt.unlink(missing_ok=True)
-        self.assertFalse((rh / "toolchains/1.88.0-aarch64-apple-darwin").exists())
-        # rustup would skip the reinstall while the old update hash still matches the channel
-        self.assertFalse((rh / "update-hashes/1.88.0-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "update-hashes/nightly-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "toolchains/stable-aarch64-apple-darwin").exists())
-        self.assertTrue((rh / "settings.toml").exists())
+            # the last line of defence holds even for a caller that names the path itself
+            for path in (home / ".cargo/bin/rustup", home / ".cargo/bin", rh / "toolchains/1.88.0-aarch64-apple-darwin"):
+                with self.assertRaisesRegex(OSError, "job toolchain"):
+                    gd.remove(path)
+            aside = rh / "toolchains" / f"{gd.DELETING_PREFIX}x"
+            aside.mkdir()
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.finish_deletion(aside)
+        for tc in ("stable", "nightly", "1.88.0", "1.90.0"):
+            self.assertTrue((rh / f"toolchains/{tc}-aarch64-apple-darwin/bin/rustc").exists(), tc)
+            self.assertTrue((rh / f"update-hashes/{tc}-aarch64-apple-darwin").exists(), tc)
+        self.assertTrue((home / ".cargo/bin/rustup").exists())
+        self.assertTrue(all((home / ".cargo/bin" / n).is_symlink() for n in ("cargo", "rustc")))
+        self.assertFalse(registry.exists(), "cargo's registry is a cache and still goes")
+
+    def test_the_tools_the_runner_hook_probes_are_never_evicted(self) -> None:
+        """Every TOOLCHAIN_TOOLS binary in any fixed tool dir (each match, whatever the order: the job PATH starts with
+        /opt/homebrew/bin), the dir, every link on the way and where it ends, CARGO_HOME/bin with a symlinked ancestor,
+        RUSTUP_HOME and the Xcode apps; never a directory only the caller's PATH names (a job's checkout bin)."""
+        home = self.root / "home"
+        local_bin, brew_bin = home / ".local/bin", self.root / "brew/bin"
+        local_bin.mkdir(parents=True)
+        brew_bin.mkdir(parents=True)
+        cellar, brew_cellar = self.root / "cellar/python/bin", self.root / "brew/Cellar/python/bin"
+        for d in (cellar, brew_cellar):
+            d.mkdir(parents=True)
+            (d / "python3.13").write_text("#!/bin/sh\n")
+        (local_bin / "python3").symlink_to(cellar / "python3.13")
+        (brew_bin / "python3").symlink_to(brew_cellar / "python3.13")  # a second, distinct installation
+        zig_dir = self.root / "zigdir"
+        zig_dir.mkdir()
+        (zig_dir / "zig").write_text("#!/bin/sh\n")
+        # ~/.cargo itself a link to a switch link inside a cache: every link on the way stays, not only the target
+        switch = home / ".cache/cargo-switch"
+        switch.mkdir(parents=True)
+        job_cargo = self.root / "opt/job-cargo"
+        (job_cargo / "bin").mkdir(parents=True)
+        (switch / "current").symlink_to(job_cargo)
+        (home / ".cargo").symlink_to(switch / "current")
+        checkout_bin = home / "work/repo/node_modules/.bin"
+        checkout_bin.mkdir(parents=True)
+        (checkout_bin / "gh").write_text("#!/bin/sh\n")
+        # CARGO_HOME as spelled is a plain dir whose bin is a symlink elsewhere: both spellings stay
+        cargo_home, cargo_real = self.root / "tmp/cargo-home", self.root / "cargo-real"
+        cargo_home.mkdir(parents=True)
+        (cargo_real / "bin").mkdir(parents=True)
+        (cargo_home / "bin").symlink_to(cargo_real / "bin")
+        rustup_home = self.root / "rustup-home"
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "TOOLCHAIN_SYSTEM_BIN_DIRS", (os.fspath(brew_bin), os.fspath(zig_dir))), \
+                mock.patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTUP_HOME": str(rustup_home),
+                                             "PATH": f"{checkout_bin}{os.pathsep}{os.environ.get('PATH', '')}"}):
+            for path in (local_bin / "python3", local_bin, brew_bin / "python3", brew_bin, zig_dir / "zig",
+                         cellar / "python3.13", cellar, brew_cellar / "python3.13", brew_cellar,
+                         home / ".cargo", switch / "current", switch, job_cargo / "bin",
+                         cargo_home, cargo_home / "bin", cargo_real / "bin", self.root / "tmp",
+                         rustup_home / "toolchains/x", Path("/Applications/Xcode_26.6.app")):
+                self.assertTrue(gd.toolchain_held(path, fresh=True), path)
+            self.assertFalse(gd.toolchain_held(checkout_bin), "a job PATH entry keeps nothing")
+            self.assertFalse(gd.toolchain_held(home / "work/repo"))
+            self.assertFalse(gd.toolchain_held(self.root / "tmp/other"))
+            self.assertFalse(gd.toolchain_held(home / ".cache/other"), "only the switch link's own path stays")
+            self.assertFalse(gd.toolchain_held(self.root / "opt/other"))
+            # a link in a system ancestor (macOS /tmp -> private/tmp) keeps what runs through it, not all below it
+            self.assertFalse(gd.toolchain_held(Path("/tmp") / f"glaeda-disk-not-a-toolchain-{os.getpid()}"))
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove(switch)
+            # a tool switched after the cached look: remove() looks again before it deletes
+            gd.toolchain_keep(fresh=True)
+            newer = self.root / "cellar/python314/bin"
+            newer.mkdir(parents=True)
+            (newer / "python3.14").write_text("#!/bin/sh\n")
+            (local_bin / "python3").unlink()
+            (local_bin / "python3").symlink_to(newer / "python3.14")
+            self.assertFalse(gd.toolchain_held(newer), "the cached look predates the switch")
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove(self.root / "cellar/python314")
+            with self.assertRaisesRegex(OSError, "job toolchain"):
+                gd.remove_spm_scratch(cargo_real / "bin")
+        self.assertTrue((newer / "python3.14").exists())
+        for tool in ("rustup", "rustc", "cargo", "zig", "python3", "gh", "git", "xcodebuild", "xcrun"):
+            self.assertIn(tool, gd.TOOLCHAIN_TOOLS, "the runner hook's job-started probes each of these")
 
     def test_rustup_toolchains_a_checkout_or_the_environment_pins_stay(self) -> None:
         home = self.root / "home"
@@ -725,6 +1259,57 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(gd.in_cwd("/tmp/fo", index))
         self.assertFalse(gd.in_cwd("/tmp/foo/a", index))
 
+    def test_process_evidence_reads_the_tuple_the_query_returns(self) -> None:
+        # _owned_query returns (exit code, text); process_evidence once read .stdout off that text and crashed
+        # with AttributeError on every pass, every 2 s, at near-zero free space (cmux22, 2026-11-11).
+        calls = []
+
+        def query(argv, timeout):
+            calls.append(argv[0])
+            return (0, "p1\nn/tmp/a\nnoise\nn/var/b\n") if argv[0].endswith("lsof") else (0, "/bin/sh -c x\n")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+            opened, commands = self.gd_evidence()
+        self.assertEqual(opened, ["/tmp/a", "/var/b"])
+        self.assertIn("/bin/sh -c x", commands)
+        self.assertEqual(len(calls), 2)
+
+    def test_process_evidence_leaves_out_what_only_notification_center_maps(self) -> None:
+        # cmux19, 2026-11-17: NotificationCenter's mapping of Build/Products/Debug/cmux kept a superseded 9.5 GiB
+        # admission seed "in-use (open by a process)" while the runner gate held listeners for disk.
+        seed = "/Users/Shared/cmux-build-fleet/ci/seeds/admission-derived-data-v1-old"
+        listing = (f"p515\ncNotificationCen\nftxt\nn{seed}/Build/Products/Debug/cmux\n"
+                   f"p516\ncusernoted\nftxt\nn{seed}/Build/Products/Debug/cmux.app/Contents/Info.plist\n"
+                   f"p900\ncxcodebuild\nfcwd\nn/Users/Shared/cmux-build-fleet/ci/seeds/live\n"
+                   f"p901\ncNotify\nf3\nn/tmp/notify-tool\n")
+
+        def query(argv, timeout):
+            if argv[0].endswith("lsof"):
+                self.assertIn("-Fcn", argv)
+                return (0, listing)
+            return (0, "/bin/sh -c x\n")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+            opened, _ = self.gd_evidence()
+        self.assertEqual(opened, ["/Users/Shared/cmux-build-fleet/ci/seeds/live", "/tmp/notify-tool"])
+        self.assertFalse(gd.in_cwd(seed, opened))
+        self.assertTrue(gd.in_cwd("/Users/Shared/cmux-build-fleet/ci/seeds/live", opened))
+        # only a passive holder open: still evidence (lsof worked), and the tree is free
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(
+                gd, "_owned_query", side_effect=lambda argv, t: (0, f"p515\ncNotificat\nn{seed}/x\n")
+                if argv[0].endswith("lsof") else (0, "/bin/sh\n")):
+            self.assertEqual(self.gd_evidence()[0], [])
+
+    def test_process_evidence_failures_raise_no_evidence_never_a_crash(self) -> None:
+        cases = [
+            lambda argv, timeout: (1, ""),  # lsof exits nonzero
+            lambda argv, timeout: (0, ""),  # lsof empty
+            lambda argv, timeout: (0, "") if argv[0].endswith("lsof") else (1, ""),
+            lambda argv, timeout: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+        ]
+        for query in cases:
+            with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+                with self.assertRaises(gd.NoEvidence):
+                    self.gd_evidence()
+
     def test_missing_process_evidence_fails_closed(self) -> None:
         make(self.root / "old")
 
@@ -769,12 +1354,65 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.save_snapshot({"/a": 1}, snap)
         self.assertGreater(gd.load_snapshot(snap)[0], 1000.0)  # a full measurement is now
 
+    def test_a_full_disk_keeps_the_old_snapshot_and_no_temp_file(self) -> None:
+        snap = self.root / "full.json"
+        self.assertTrue(gd.save_snapshot({"/a": 1}, snap, at=1000.0))
+        real = Path.write_text
+
+        def full(path: Path, data: str, *a, **k) -> int:
+            real(path, data[:10], *a, **k)  # a partial write, then the disk is full
+            raise OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(Path, "write_text", full), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertFalse(gd.save_snapshot({"/a": 1, "/b": 2}, snap))  # no raise: the pass goes on
+        self.assertIn("size snapshot not saved", err.getvalue())
+        self.assertEqual(gd.load_snapshot(snap), (1000.0, {"/a": 1}))
+        self.assertEqual([p.name for p in self.root.glob("full.*.tmp")], [])
+
     def test_snapshot_round_trip_and_corrupt_snapshot_is_empty(self) -> None:
         snap = self.root / "sizes.json"
         gd.save_snapshot({"/a": 1}, snap)
         self.assertEqual(gd.load_snapshot(snap)[1], {"/a": 1})
         snap.write_text("{not json")
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
+
+    def test_the_runner_cache_profile_keeps_its_own_snapshot_and_idle_stamp(self) -> None:
+        # glaeda-runner-hygiene's pinned pass runs as the same account as its disk-pressure LaunchAgent: sharing the
+        # idle stamp, its hourly 5-family sweep made every full sweep after it skip as "ran within the hour"
+        with mock.patch.object(gd, "SNAPSHOT", gd.SNAPSHOT), mock.patch.object(gd, "IDLE_STAMP", gd.IDLE_STAMP), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", gd.HEALTH_SUMMARY), mock.patch.object(gd, "_MAIN_STATE", None):
+            main = (gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY)
+            gd.use_profile_state(False)
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), main)
+            gd.use_profile_state(True)
+            profile = (gd.PROFILE_SNAPSHOT, gd.PROFILE_IDLE_STAMP, gd.PROFILE_HEALTH_SUMMARY)
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), profile)
+            self.assertFalse(set(profile) & set(main))
+            gd.use_profile_state(False)  # a reset, for a library caller that runs both
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), main)
+            gd.SNAPSHOT = self.root / "profile.json"
+            gd.save_snapshot({"/a": 1}, at=5.0)  # the default path follows the switch, not the import-time value
+            self.assertEqual(gd.load_snapshot(), (5.0, {"/a": 1}))
+
+    def test_a_profile_background_refresh_stays_in_the_profile(self) -> None:
+        launched = []
+        with mock.patch.object(gd.subprocess, "Popen", lambda argv, **_k: launched.append(argv)), \
+                mock.patch.object(gd, "SNAPSHOT", self.root / "sizes.json"):
+            for profile in (False, True):
+                with mock.patch.object(gd, "RUNNER_CACHE_PROFILE", profile):
+                    self.assertTrue(gd.launch_background_refresh())
+                gd.release_refresh_lock(gd.acquire_refresh_lock())  # the fake child holds none: free the marker
+        self.assertNotIn("--runner-caches", launched[0])
+        self.assertIn("--runner-caches", launched[1])
+
+    def test_snapshot_stamp_moves_once_every_item_is_remeasured(self) -> None:
+        # A fleet mini runs only --apply passes, which re-measure every item but never ran the background
+        # --refresh that alone moved `at`: its sizes.json said 8 days old while every size was minutes old.
+        self.assertEqual(gd.snapshot_stamp(1000.0, {"/a": 1, "/b": 2}, {"/a": 5000.0, "/b": 6000.0}), 5000.0)
+        self.assertEqual(gd.snapshot_stamp(1000.0, {"/a": 1, "/b": 2}, {"/a": 5000.0}), 1000.0)  # /b unmeasured
+        self.assertEqual(gd.snapshot_stamp(9000.0, {"/a": 1}, {"/a": 5000.0}), 9000.0)  # never moves back
+        self.assertEqual(gd.snapshot_stamp(0.0, {"/a": 1}, {"/a": 5000.0}), 5000.0)
+        self.assertIsNone(gd.snapshot_stamp(0.0, {}, {}))
+        self.assertIsNone(gd.snapshot_stamp(1000.0, {}, {}))  # an empty pass is fresh, not 8 days old
 
     def test_snapshot_records_per_item_measurement_times(self) -> None:
         snap = self.root / "times.json"
@@ -845,12 +1483,14 @@ class GlaedaDiskTest(unittest.TestCase):
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB) as du, \
                 mock.patch.object(gd, "accounting_coverage", return_value=[]), \
                 mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             got = gd.filesystem_accounting([fs], [item])
-        self.assertEqual(got[0]["measured"], 3 * gd.GIB)
-        self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
+        du.assert_called_once_with(self.root, record_timeout=False)
+        # the walked root holds the item: measured is the root's bytes, the item is not added again
+        self.assertEqual(got[0]["measured"], 8 * gd.GIB)
+        self.assertEqual(got[0]["unmeasured"], 0)
         self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
     def test_accounting_reconciles_overlapping_shared_runner_coverage(self) -> None:
@@ -894,6 +1534,26 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0]["measured"], 7 * gd.GIB)
         self.assertEqual(got[0]["reclaimable"], 3 * gd.GIB)
 
+    def test_accounting_prefix_selection_preserves_independent_overlap_sets(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        sibling = self.root / "sibling"
+        rows = [(child, 3, "reclaimable"), (parent, 7, "report-only"),
+                (sibling, 5, "reclaimable"), (sibling, 1, "recent")]
+        selected = gd.top_level_catalogued(sorted(rows, key=lambda row: (len(row[0].parts), str(row[0]))))
+        self.assertEqual([(path, size, verdict) for path, size, verdict in selected],
+                         [(parent, 7, "report-only"), (sibling, 5, "reclaimable")])
+
+    def test_accounting_prefix_selection_scales_with_flat_catalog(self) -> None:
+        rows = [(self.root / f"item-{index:05d}", 1, "report-only") for index in range(12_000)]
+        started = time.monotonic()
+        selected = gd.top_level_catalogued(rows)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(selected), len(rows))
+        # A flat catalogue should remain bounded by path depth. This catches a
+        # regression to scanning every previously selected item.
+        self.assertLess(elapsed, 5.0)
+
     def test_apfs_container_capacity_is_separate_from_volume_free(self) -> None:
         saved = gd.DARWIN
         gd.DARWIN = True
@@ -928,6 +1588,67 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got["reclaimable"], 2 * gd.GIB)
         self.assertEqual(got["unclassified"], 5 * gd.GIB)
         self.assertEqual(got["container"]["free"], 6 * gd.GIB)
+
+    def test_accounting_surfaces_blocked_and_unchecked_bytes(self) -> None:
+        blocked = self.root / "blocked"
+        unchecked = self.root / "unchecked"
+        reclaimable = self.root / "reclaimable"
+        for path in (blocked, unchecked, reclaimable):
+            path.mkdir()
+        fs = gd.Fs(self.root.stat().st_dev, str(self.root), 3 * gd.GIB, 10 * gd.GIB,
+                   4 * gd.GIB, 5 * gd.GIB)
+        items = [gd.Item("xcode-derived-data", str(blocked), 4 * gd.GIB, 30.0, "in-use"),
+                 gd.Item("xcode-derived-data", str(unchecked), 3 * gd.GIB, 30.0, "unchecked"),
+                 gd.Item("xcode-derived-data", str(reclaimable), 2 * gd.GIB, 30.0, "reclaimable")]
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = False, self.root / "accounting-blocked.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        got = gd.filesystem_accounting([fs], items)[0]
+        self.assertEqual(got["blocked"], 7 * gd.GIB)
+        self.assertEqual(got["unchecked"], 3 * gd.GIB)
+        self.assertEqual(got["blocked_by_verdict"], {"in-use": 4 * gd.GIB, "unchecked": 3 * gd.GIB})
+
+    def test_eviction_summary_separates_logical_and_physical_bytes(self) -> None:
+        receipt = self.root / "eviction.jsonl"
+        before = [{"dev": 1, "mount": "/data", "free": 10, "total": 20,
+                   "low": 12, "target": 15, "under": True, "observed": True}]
+        after = [{"dev": 1, "mount": "/data", "free": 25, "total": 20,
+                  "low": 12, "target": 15, "under": False, "observed": True}]
+        accounting = [{"mount": "/data", "blocked": 7, "unchecked": 3, "accounting_gap": 4,
+                       "reclaimable": 2}]
+        summary = gd.write_eviction_summary(receipt, "pressure", 12,
+                                            before, after, accounting, accounting)
+        self.assertEqual(summary["logical_released_bytes"], 12)
+        self.assertEqual(summary["physical_df_delta_bytes"], 15)
+        self.assertEqual(summary["physical_df_reclaimed_bytes"], 15)
+        self.assertEqual(summary["blocked_bytes"], 7)
+        self.assertEqual(summary["unchecked_bytes"], 3)
+        self.assertEqual(json.loads(receipt.read_text())["before"]["filesystems"][0]["free"], 10)
+
+    def test_eviction_summary_of_a_pass_that_freed_nothing_is_slim_and_the_receipt_is_bounded(self) -> None:
+        receipt = self.root / "slim.jsonl"
+        fs = [{"dev": 1, "mount": "/data", "free": 10, "total": 20, "low": 12, "target": 15,
+               "under": True, "observed": True}]
+        accounting = [{"mount": "/data", "blocked": 7, "unchecked": 3, "accounting_gap": 4,
+                       "top_level": [{"path": "/x" * 200, "bytes": 1}] * 50}]
+        summary = gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(summary["before"]["accounting"], accounting)  # callers still get the whole record
+        line = json.loads(receipt.read_text())
+        self.assertTrue(line["slim"])
+        self.assertNotIn("accounting", line["before"])
+        self.assertEqual((line["blocked_bytes"], line["accounting_gap_bytes"]), (7, 4))
+        self.assertEqual(line["before"]["filesystems"][0]["free"], 10)
+        # a pass that freed something keeps the accounting
+        gd.write_eviction_summary(receipt, "pressure", 5, fs, fs, accounting, accounting)
+        self.assertEqual(json.loads(receipt.read_text().splitlines()[-1])["before"]["accounting"], accounting)
+        # past the limit the file moves aside once, and the next line starts a new one
+        with mock.patch.object(gd, "RECEIPT_MAX_BYTES", 10):
+            gd.write_eviction_summary(receipt, "pressure", 0, fs, fs, accounting, accounting)
+        self.assertEqual(len(receipt.read_text().splitlines()), 1)
+        self.assertEqual(len(receipt.with_name("slim.jsonl.1").read_text().splitlines()), 2)
 
     def test_runner_profile_accounting_is_scoped_and_does_not_walk_roots_again(self) -> None:
         path = self.root / "cua-cache" / "frame.bin"
@@ -1005,6 +1726,8 @@ class GlaedaDiskTest(unittest.TestCase):
             gd._ACCOUNTING_MEM.clear()
             again = gd.filesystem_accounting([fs], [])
         self.assertEqual(covered.call_count, 3)
+        self.assertTrue(all(call.kwargs == {"record_timeout": False}
+                            for call in covered.call_args_list))
         self.assertEqual(got[0]["coverage"], again[0]["coverage"])
         encoded = json.dumps(got)
         self.assertNotIn("leo", encoded)
@@ -1109,10 +1832,48 @@ class GlaedaDiskTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
 
+    def test_default_low_water_mark_acts_before_100_gib_on_a_256_gb_mini(self) -> None:
+        # Leo, 2026-10-27: "how can <100gb be free on >256gb minis all the time". The old 25%:60-200 started pressure
+        # only under 60 GiB on a 256 GB mini. The default is 35% held between 100 and 200 GiB, whichever is larger.
+        gib = 1024**3
+        low, target = gd.POLICY_DEFAULTS["low"], gd.POLICY_DEFAULTS["target"]
+        self.assertEqual(gd.space(low, 238 * gib), 100 * gib)  # a 256 GB mini: 35% is 83 GiB, the floor is larger
+        self.assertGreaterEqual(gd.space(low, 228 * gib), 100 * gib)  # its APFS data volume
+        self.assertEqual(gd.space(low, 460 * gib), int(460 * gib * 0.35))  # a 512 GB mini: 161 GiB
+        self.assertEqual(gd.space(low, 1863 * gib), 200 * gib)  # 2 TB: held at 200
+        for size in (228, 238, 460, 931, 1863):  # one pass always has room to free past where it started
+            self.assertGreater(gd.space(target, size * gib), gd.space(low, size * gib), size)
+        self.assertLess(gd.space(low, 30 * gib), 30 * gib)  # a small VM is not left permanently under pressure
+
     def test_tmp_family_does_not_treat_marker_search_budget_as_job_use(self) -> None:
         fam = gd.Family("tmp", self.root, True, "scratch")
         with mock.patch.object(gd, "cmux_active", return_value=True):
             self.assertFalse(gd.job_busy(fam, self.root))
+
+    def test_a_tree_wider_than_the_marker_search_is_busy_only_in_the_job_cache(self) -> None:
+        # cmux16, 2026-11-15: a home-scratch folder of several cmux checkouts read "a cmux reload job holds its
+        # unit" for three weeks: the bounded marker search ran out of budget and called that busy.
+        wide = self.root / "hotswap-review"
+        for i in range(12):  # 12 entries fit a budget of 20; their 60 children do not
+            for j in range(5):
+                (wide / f"pr-{i}" / f"d{j}").mkdir(parents=True)
+        fam = gd.Family(gd.HOME_SCRATCH_FAMILY, self.root, True, "x")
+        self.assertTrue(gd.cmux_active(wide, budget=20))  # the default still fails closed
+        self.assertFalse(gd.cmux_active(wide, budget=20, wide_is_busy=False))
+        real = gd.cmux_active
+        with mock.patch.object(gd, "cmux_active", lambda p, **k: real(p, budget=20, **k)):
+            self.assertFalse(gd.job_busy(fam, wide))  # no marker: its process evidence decides
+            # a live marker on the last sibling, after earlier siblings' listings would have spent the budget,
+            # still holds the tree (glaeda#1992 CI: the old per-directory order never read it)
+            (wide / "pr-11/.cmux-active").mkdir()
+            (wide / "pr-11/.cmux-active/pid").write_text(f"{os.getpid()}\n")
+            self.assertTrue(gd.cmux_active(wide, wide_is_busy=False))
+            self.assertTrue(gd.job_busy(fam, wide))
+            (wide / "pr-11/.cmux-active/pid").write_text("garbage")
+            self.assertTrue(gd.cmux_active(wide, wide_is_busy=False))  # an unreadable marker fails closed
+            (wide / "pr-11/.cmux-active/pid").unlink()
+            job = gd.Family("cmux-job-cache", self.root, True, "x", depth=2)
+            self.assertTrue(gd.job_busy(job, wide / "pr-0"))  # the job cache's unit still fails closed
 
     def test_cmux_active_marker_holds_a_slot(self) -> None:
         slot = self.root / "work/slot-1"
@@ -1192,6 +1953,76 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd.subprocess, "run", lambda argv, **_: subprocess.CompletedProcess(argv, 113)):
             self.assertTrue(gd.owner_retired(one))
 
+    @twelve_hour_ages
+    def test_a_retired_workers_cache_entries_idle_a_week_are_mirrors(self) -> None:
+        """cmux14, 2026-10-25: at the 30 GiB floor with 0.0G reclaimable, while its unloaded hq workers'
+        cmux-workspaces (idle 190 h), cmux-tui-target (289 h) and swiftpm (310 h) read git-checkout or unchecked."""
+        real = gd.hq_cache_family()
+        self.assertEqual((real.root, real.reference_root), (gd.FLEET_ROOT / "cache", gd.FLEET_ROOT))
+        self.assertEqual(real.mirror_idle_hours, gd.CMUX_JOB_MIRROR_HOURS)
+        self.assertTrue(real.retired_only)
+        self.assertEqual(real.owner_job, gd.HQ_BUILD_WORKERS)
+        cache = self.root / "cache"
+        fam = gd.hq_cache_family(cache)
+        self.assertEqual(fam.reference_root, self.root)
+        week = gd.CMUX_JOB_MIRROR_HOURS
+        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 6),
+                            ("leased", week + 50), ("cmux-tui-target", week + 121)):
+            make(cache / name, age_hours=hours)
+        for name in ("cmux-workspaces", "fresh-workspaces", "leased"):
+            (cache / name / "key/src/.git").mkdir(parents=True)
+            t = time.time() - (6 if name == "fresh-workspaces" else week + 22) * 3600
+            for d in (cache / name / "key/src/.git", cache / name / "key/src", cache / name / "key", cache / name):
+                os.utime(d, (t, t))
+        (cache / "swiftpm/repositories/dep/.git").mkdir(parents=True)
+        t = time.time() - (week + 142) * 3600
+        for d in (cache / "swiftpm/repositories/dep/.git", cache / "swiftpm/repositories/dep",
+                  cache / "swiftpm/repositories", cache / "swiftpm"):
+            os.utime(d, (t, t))
+        (self.root / "jobs").mkdir()
+        (self.root / "jobs/j.json").write_text(json.dumps({"state": "running", "path": os.fspath(cache / "leased")}))
+        gd._LIVE_REFERENCES.clear()
+        self.addCleanup(gd._LIVE_REFERENCES.clear)
+        real_git = gd.family_git_state
+
+        def git_state(f, path):  # a cargo target dir too large to search
+            return "unchecked" if path.name == "cmux-tui-target" else real_git(f, path)
+
+        with mock.patch.object(gd, "family_git_state", git_state):
+            with mock.patch.object(gd, "owner_retired", return_value=True):
+                items = {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+            with mock.patch.object(gd, "owner_retired", return_value=False):  # a worker builds here
+                live = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual({k: i.verdict for k, i in items.items()}, {
+            "cmux-workspaces": "reclaimable", "swiftpm": "reclaimable", "cmux-tui-target": "reclaimable",
+            "fresh-workspaces": "git-checkout",  # idle 6 h, under the mirror age: its clone has to lose nothing
+            "leased": "in-use"})  # a running fleet job names it
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["cmux-workspaces"].reasons)
+        self.assertIn("live lease or running job", items["leased"].reasons)
+        self.assertEqual({k for k, v in live.items() if v != "report-only"}, {"leased"})
+        reclaim = [i for i in items.values() if i.verdict == "reclaimable"]
+        # between the survey and the delete a fleet job leases swiftpm and a process starts in cmux-tui-target:
+        # apply re-reads both (the survey's cached references and process snapshot are stale by then)
+        (self.root / "jobs/late.json").write_text(json.dumps({"until": time.time() + 600,
+                                                              "path": os.fspath(cache / "swiftpm")}))
+        late = ([], f"cargo build --target-dir {cache / 'cmux-tui-target'}\n")
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "owner_retired", return_value=True), \
+                mock.patch.object(gd, "family_git_state", git_state), \
+                mock.patch.object(gd, "process_evidence", return_value=late), \
+                mock.patch.object(gd, "command_lines", return_value=late[1]), \
+                mock.patch.object(gd, "HOME", self.root / "home"), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}, {}))), \
+                mock.patch.object(gd, "mirror_rename_recheck", lambda p, r: None), \
+                mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
+            gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
+        self.assertEqual(sorted(p.name for p in cache.iterdir()),
+                         ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
+        outcomes = {Path(r["path"]).name: r["outcome"] for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertEqual(outcomes, {"cmux-workspaces": "reclaimed", "swiftpm": "changed:in-use",
+                                    "cmux-tui-target": "changed:in-use"})
+
     def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
         self.assertTrue(gd.CI_WORKER.search(job))
@@ -1255,6 +2086,59 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.ARTIFACT_CUTOFF = None
 
+    def test_a_shared_rustup_home_in_the_fleet_cache_is_never_evicted_whole(self) -> None:
+        """2026-11-23: fleet-artifacts took /Users/Shared/cmux-build-fleet/cache/rustup (the RUSTUP_HOME every hq fleet
+        job gets) as one idle item on ~16 iOS simulator minis, and the next job failed "missing manifest in toolchain
+        '1.95.0-aarch64-apple-darwin'". A rustup home stays whole in any family, found by its layout or by
+        FLEET_RUSTUP_HOMES; the cargo download cache and other artifacts beside it still go."""
+        fleet = self.root / "fleet"
+        cache = fleet / "cache"
+        rh = cache / "rustup"
+        lib = rh / "toolchains/1.95.0-aarch64-apple-darwin/lib/rustlib"
+        lib.mkdir(parents=True)
+        (lib / "multirust-channel-manifest.toml").write_text("x")
+        (rh / "update-hashes").mkdir()
+        (rh / "settings.toml").write_text('version = "12"\n\n[overrides]\n')
+        registry = cache / "cargo/registry"
+        registry.mkdir(parents=True)
+        (registry / "blob").write_bytes(b"\0" * 1024 * 1024)
+        (cache / "old-artifact").mkdir()
+        (cache / "old-artifact/blob").write_bytes(b"\0" * 1024 * 1024)
+        self.age(cache, hours=48)
+        gd.ARTIFACT_CUTOFF = time.time() - 12 * 3600
+        fam = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True, stale_before=gd.ARTIFACT_CUTOFF,
+                        allow_stale_protected=True, reference_root=fleet)
+        receipt = self.root.parent / f"{self.root.name}-r.jsonl"
+        try:
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                    mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("RUSTUP_HOME", None)
+                self.assertTrue(gd.rustup_home_at(rh))
+                self.assertTrue(gd.toolchain_held(rh, fresh=True), "found by its layout, no RUSTUP_HOME needed")
+                self.assertFalse(gd.toolchain_held(registry.parent, fresh=True))
+                items = gd.survey([fam], 24, 0)
+                self.assertNotIn(str(rh), [i.path for i in items])
+                self.assertIn(str(cache / "old-artifact"), [i.path for i in items if i.verdict == "reclaimable"])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {fam.id: fam}, receipt, None, 24)
+                with self.assertRaisesRegex(OSError, "job toolchain"):
+                    gd.remove(rh)
+                # a home set aside before this fix is not a rustup home any more: its deletion finishes
+                aside = cache / f"{gd.DELETING_PREFIX}rustup-1"
+                (aside / "toolchains").mkdir(parents=True)
+                (aside / "settings.toml").write_text("")
+                self.assertFalse(gd.rustup_home_at(aside))
+            # the fleet workers' homes are held at, inside and above even before rustup writes its settings
+            for home in gd.FLEET_RUSTUP_HOMES:
+                self.assertIn(home, gd.toolchain_keep(fresh=True))
+                self.assertTrue(gd.toolchain_held(Path(home) / "toolchains/1.95.0-aarch64-apple-darwin"))
+                self.assertTrue(gd.toolchain_held(Path(home).parent))
+        finally:
+            gd.ARTIFACT_CUTOFF = None
+            receipt.unlink(missing_ok=True)
+        self.assertTrue((lib / "multirust-channel-manifest.toml").exists())
+        self.assertFalse((cache / "old-artifact").exists(), "other fleet artifacts still go by age")
+
     def test_default_families_cover_fleet_and_browser_artifacts(self) -> None:
         saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
         gd.HOME = self.root
@@ -1264,10 +2148,15 @@ class GlaedaDiskTest(unittest.TestCase):
             (gd.HOME / "cmux-browser-fleet").mkdir()
             (gd.FLEET_ROOT / "cache").mkdir(parents=True)
             (gd.FLEET_ROOT / "ci-ios" / "runner-a" / "derived-data").mkdir(parents=True)
+            (gd.HOME / "Library/Caches/cmux-next-ci").mkdir(parents=True)
             fams = {f.id: f for f in gd.default_families()}
             self.assertIn("fleet-artifacts", fams)
             self.assertIn("ci-ios-derived-data", fams)
             self.assertIn("browser-artifacts", fams)
+            self.assertIn(gd.CMUX_NEXT_CI_FAMILY, fams)
+            self.assertEqual(fams[gd.CMUX_NEXT_CI_FAMILY].min_idle_hours,
+                             gd.CMUX_NEXT_CI_MIN_IDLE_HOURS)
+            self.assertIn("cmux-next-ci", fams["library-caches"].skip)
             self.assertTrue(fams["fleet-artifacts"].allow_stale_protected)
             self.assertTrue(fams["browser-artifacts"].allow_stale_protected)
         finally:
@@ -1286,8 +2175,166 @@ class GlaedaDiskTest(unittest.TestCase):
                              gd.HOME / "Library/Application Support/cua-ssh/recordings")
             self.assertEqual(fams["cua-cache"].root, gd.HOME / "Library/Caches/cmux/cmux-cua")
             self.assertTrue(fams["cua-recordings"].reclaimable)
-            self.assertEqual(fams["cua-recordings"].min_idle_hours, 24.0)
+            self.assertEqual(fams["cua-recordings"].min_idle_hours, gd.DEFAULT_AGE_HOURS)
             self.assertEqual(fams["cua-cache"].owner, "cmux CUA")
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_tart_images_are_a_family_one_candidate_per_pulled_image(self) -> None:
+        """2026-11-03: 53.5 GiB of Tart OCI images two weeks idle on a dedicated nightly mini, found by no family."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            oci = gd.HOME / ".tart/cache/OCIs/ghcr.io/cirruslabs"
+            for image in ("macos-sequoia-vanilla", "macos-sonoma-vanilla"):
+                (oci / image / "sha256:abc").mkdir(parents=True)
+                (oci / image / "latest").symlink_to("sha256:abc")
+            (gd.HOME / ".tart/cache/IPSWs").mkdir(parents=True)
+            (gd.HOME / ".tart/cache/IPSWs/UniversalMac.ipsw").write_bytes(b"x")
+            (gd.HOME / ".tart/vms").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            images, ipsws = fams["tart-images"], fams["tart-ipsws"]
+            self.assertEqual(images.root, gd.HOME / ".tart/cache/OCIs")
+            self.assertTrue(images.reclaimable and ipsws.reclaimable)
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                fams_tart = {f.id: f for f in gd.default_families()}
+            self.assertEqual(fams_tart["tart-images"].min_idle_hours, 2 * 24.0)
+            self.assertEqual(fams_tart["tart-ipsws"].min_idle_hours, 2 * 24.0)
+            self.assertEqual(sorted(p.name for p in gd.candidates(images)),
+                             ["macos-sequoia-vanilla", "macos-sonoma-vanilla"], "one image at a time, never ~/.tart/vms")
+            self.assertEqual([p.name for p in gd.candidates(ipsws)], ["UniversalMac.ipsw"])
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_tart_images_nested_paths_access_dates_and_symlinked_roots(self) -> None:
+        """Review of #1809: a nested ghcr path is one item at the image, a clone's access date keeps an image, and a
+        symlinked ~/.tart is never walked."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root / "home"
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            oci = gd.HOME / ".tart/cache/OCIs"
+            nested = oci / "ghcr.io/org/team/macos-tahoe-xcode"
+            (nested / "sha256:def").mkdir(parents=True)
+            (nested / "sha256:def/disk.img").write_bytes(b"d")
+            (nested / "26.0").symlink_to("sha256:def")
+            flat = oci / "ghcr.io/cirruslabs/macos-sequoia-vanilla"
+            (flat / "sha256:abc").mkdir(parents=True)
+            (gd.HOME / ".tart/cache/IPSWs").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            images = fams["tart-images"]
+            self.assertEqual(sorted(str(p.relative_to(oci)) for p in gd.candidates(images)),
+                             ["ghcr.io/cirruslabs/macos-sequoia-vanilla", "ghcr.io/org/team/macos-tahoe-xcode"],
+                             "the image directory, never a namespace above it or a digest below it")
+            # `tart clone` moves no mtime, only the access date: the image is in use
+            old, now = time.time() - 30 * 86400, time.time()
+            for p in (nested / "26.0", nested / "sha256:def/disk.img", nested / "sha256:def", nested):
+                os.utime(p, (old, old), follow_symlinks=False)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                # no Tart: glaeda-disk's own walk moves no date it judges, and an old image reads old
+                self.assertLess(gd.item_mtime(images, nested), old + 1)
+                self.assertLess(gd.item_mtime(images, nested), old + 1, "a second look reads the same")
+            os.utime(nested / "sha256:def", (now, old))  # Tart's contentAccessDate on the digest directory
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                self.assertGreaterEqual(gd.tart_last_use(nested), now - 1)
+                self.assertGreaterEqual(gd.item_mtime(images, nested), now - 1)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                self.assertLess(gd.item_mtime(images, nested), old + 1, "without Tart only mtime counts")
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                self.assertEqual(gd.tart_idle_hours(), gd.TART_IDLE_HOURS)
+            with mock.patch.object(gd, "tart_installed", return_value=False):
+                self.assertEqual(gd.tart_idle_hours(), gd.DEFAULT_AGE_HOURS)
+            # a symlinked ~/.tart (a shared or external store) is someone else's
+            store = self.root / "elsewhere"
+            (gd.HOME / ".tart").rename(store)
+            (gd.HOME / ".tart").symlink_to(store)
+            fams = {f.id: f for f in gd.default_families()}
+            self.assertEqual(gd.candidates(fams["tart-images"]), [])
+            self.assertEqual(gd.candidates(fams["tart-ipsws"]), [])
+            (store / "cache/OCIs" / f"{gd.DELETING_PREFIX}x-1").mkdir(parents=True)
+            self.assertEqual(gd.interrupted_families([fams["tart-images"], fams["tart-ipsws"]]), [],
+                             "no aside tree is finished through a symlinked ~/.tart")
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_tart_survey_judges_tarts_access_date_not_its_own_du(self) -> None:
+        """Router review of #1811: the survey's du lists every digest directory, moving the atime it then judged, so a
+        30-day-old image read as recent. The first reading of this run is judged and handed back to the directory;
+        an aside image under a nested namespace is found by the interrupted-deletions pass."""
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.TART_RUN_STARTED)
+        gd.HOME = self.root / "home"
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        gd.TART_ACCESS.clear()
+        try:
+            image = gd.HOME / ".tart/cache/OCIs/ghcr.io/org/team/macos-sequoia-vanilla"
+            digest = image / "sha256:abc"
+            (digest / "blobs").mkdir(parents=True)
+            (digest / "disk.img").write_bytes(b"x" * 4096)
+            (image / "latest").symlink_to("sha256:abc")
+            old = time.time() - 30 * 86400
+            for p in (digest / "blobs", digest / "disk.img", digest, image / "latest", image):
+                os.utime(p, (old, old), follow_symlinks=False)
+            gd.TART_RUN_STARTED = time.time() - 1
+            with mock.patch.object(gd, "tart_installed", return_value=True):
+                fam = next(f for f in gd.default_families() if f.id == "tart-images")
+                real_du = gd._measure_missing
+
+                def du_then_touch(paths, deadline=None):
+                    now = time.time()
+                    for p in paths:  # what du's readdir does to an atime-updating filesystem
+                        os.utime(Path(p) / "sha256:abc", (now, old), follow_symlinks=False)
+                    return real_du(paths, deadline)
+                with mock.patch.object(gd, "_measure_missing", side_effect=du_then_touch):
+                    items = gd.survey([fam], fam.min_idle_hours, 0)
+                item = next(i for i in items if i.path == os.fspath(image))
+                self.assertGreater(item.idle_hours, 29 * 24, "judged by Tart's date, not the survey's own du")
+                gd.tart_restore_access()  # what the run's exit does
+                self.assertLess(digest.lstat().st_atime, old + 1, "the date is handed back for the next run")
+            # remove() leaves an aside tree beside the image, under a nested namespace
+            aside = image.parent / f"{gd.DELETING_PREFIX}macos-sequoia-vanilla-1"
+            image.rename(aside)
+            found = [f.root for f in gd.interrupted_families([fam])]
+            self.assertIn(image.parent, found)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.TART_RUN_STARTED = saved
+            gd.TART_ACCESS.clear()
+
+    def test_tagged_debug_app_data_is_a_family_but_release_and_next_app_data_never_are(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            for app in ("cmux-next", "cmux", ""):
+                base = gd.HOME / "Library/Application Support" / app
+                for name in ("com.cmuxterm.app.debug.pcrim3.capslot1", "com.cmuxterm.app.next", "com.cmuxterm.app",
+                             "session-com.cmuxterm.app.debug.x.json.d"):
+                    (base / name).mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            for fid in ("cmux-debug-app-data-cmux-next", "cmux-debug-app-data-cmux", "cmux-debug-app-data"):
+                fam = fams[fid]
+                self.assertTrue(fam.reclaimable)
+                self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+                self.assertEqual([p.name for p in gd.candidates(fam)], ["com.cmuxterm.app.debug.pcrim3.capslot1"])
+            devbox = {f.id for f in gd.default_families("devbox")}
+            self.assertFalse({i for i in devbox if i.startswith("cmux-debug-app-data")}, "never on a devbox")
+            # the survey verdict on a realistic tree: an installed app copy far deeper than the git search goes
+            fam = fams["cmux-debug-app-data-cmux-next"]
+            tag = fam.root / "com.cmuxterm.app.debug.pcrim3.capslot1"
+            deep = tag / "versions/108/cmux DEV pcrim3.app/Contents/Frameworks/X.framework/Versions/A/Resources/r"
+            deep.mkdir(parents=True)
+            (deep / "blob").write_bytes(b"x" * (2 << 20))
+            stamp = time.time() - (gd.DEFAULT_AGE_HOURS + 6) * 3600
+            for d, _, files in list(os.walk(tag))[::-1]:
+                for f in files:
+                    os.utime(Path(d) / f, (stamp, stamp))
+                os.utime(d, (stamp, stamp))
+            verdicts = {Path(i.path).name: i.verdict for i in gd.survey([fam], 6, 0)}
+            self.assertEqual(verdicts, {"com.cmuxterm.app.debug.pcrim3.capslot1": "reclaimable"})
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
@@ -1302,6 +2349,227 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0].verdict, "reclaimable")
         self.assertTrue((root / "runner-a").is_dir())
 
+    def test_cmux_next_ci_only_lists_valid_generated_children(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        runner = root / "cmux-scheme/runner-a"
+        daily = root / "dev-daily-release/abcdef0123456789/Release/26f113aa"
+        xcode_daily = root / "dev-daily-release/1234567890abcdef/Release/xcode-2c2299e9015ce0c8"
+        release_compile = root / "release-compile/bcc51113400dc347/Release/xcode-2c2299e9015ce0c8"
+        for state in (runner, daily, xcode_daily, release_compile):
+            state.mkdir(parents=True)
+            for name in ("Build", "Index.noindex", "Logs", "Products"):
+                make(state / name, age_hours=96)
+            for name in gd.CMUX_NEXT_CI_PRESERVED_NAMES:
+                (state / name).mkdir()
+        invalid = root / "dev-daily-release/not-a-fingerprint/Release/26f113aa"
+        (invalid / "Build").mkdir(parents=True)
+        linked_release_target = self.root / "linked-release"
+        linked_release_target.mkdir(parents=True)
+        linked_release = root / "dev-daily-release/2222222222222222/Release"
+        linked_release.parent.mkdir(parents=True, exist_ok=True)
+        linked_release.symlink_to(linked_release_target, target_is_directory=True)
+        (linked_release_target / "xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_daily_target = self.root / "linked-daily"
+        (linked_daily_target / "abcdef0123456789/Release/xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_root = self.root / "symlink-cache"
+        linked_root.mkdir()
+        (linked_root / "dev-daily-release").symlink_to(linked_daily_target, target_is_directory=True)
+        self.assertEqual(gd.cmux_next_ci_state_roots(linked_root), [])
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([fam], 24, 0)
+        paths = {Path(i.path) for i in items}
+        expected = {
+            state / name for state in (runner, daily, xcode_daily, release_compile)
+            for name in ("Build", "Index.noindex", "Logs", "Products")
+        }
+        self.assertEqual(paths, expected)
+        self.assertTrue(all(i.verdict == "reclaimable" for i in items))
+
+    def test_cmux_next_ci_keeps_unknown_state_children(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / "unknown-owner-state").mkdir(parents=True)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertEqual(got[0].verdict, "in-use")
+        self.assertIn("unknown children", got[0].reasons[0])
+
+    def test_cmux_next_ci_preserves_the_binary_module_guard_digest(self) -> None:
+        # cmux's swiftpm-binary-module-guard.sh writes it beside SourcePackages; it is not an unknown owner
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / ".cmux-binary-module-inputs").write_text("0" * 64 + "\n")
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertNotEqual(got[0].verdict, "in-use")
+
+    def test_cmux_next_ci_preserves_compilation_cache_child(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / "CompilationCache.noindex").mkdir(parents=True)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertNotEqual(got[0].verdict, "in-use")
+
+    def test_cmux_next_ci_keeps_recent_and_marked_state(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        recent = make(state / "Logs", age_hours=2)
+        (state / ".lock").write_text("")
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = {Path(i.path): i for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(got[build].verdict, "in-use")
+        self.assertIn("active or ambiguous marker", got[build].reasons[0])
+        self.assertEqual(got[recent].verdict, "in-use")
+        self.assertIn("active or ambiguous marker", got[recent].reasons[0])
+
+    def test_cmux_next_ci_idle_floor_survives_pressure_mode(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        build = make(root / "cmux-scheme/runner-a/Build", age_hours=gd.CMUX_NEXT_CI_MIN_IDLE_HOURS - 1)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 0, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertEqual(got[0].verdict, "recent")
+
+    def test_cmux_next_ci_apply_rechecks_process_and_marker(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([fam], 24, 0)
+        self.assertEqual(items[0].verdict, "reclaimable")
+        (state / ".cmux-active").write_text("")
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {fam.id: fam}, receipt, None, 24)
+        self.assertTrue(build.exists())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_stale_marker_uses_host_activity_before_wall_clock_cap(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        state.mkdir(parents=True)
+        marker = state / ".build.active"
+        marker.write_text("pid=gone\n")
+        now = time.time()
+        old = now - 1.0 * 3600
+        os.utime(marker, (old, old))
+        receipt = self.root / "receipt.jsonl"
+        policy = dict(gd.POLICY)
+        policy.update(stale_marker_min_age_hours=0.5, stale_marker_jobs=3, stale_marker_max_hours=48.0)
+        starts = [old + 600, old + 1200, old + 1800]
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=starts), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=now), len(b"pid=gone\n"))
+        self.assertFalse(marker.exists())
+        record = json.loads(receipt.read_text())
+        self.assertEqual(record["reasons"][0], "host-activity")
+        self.assertEqual(record["reasons"][1]["jobs_since_marker"], 3)
+
+    def test_stale_marker_waits_for_activity_then_uses_long_safety_cap(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        state.mkdir(parents=True)
+        marker = state / ".build.active"
+        marker.write_text("pid=gone\n")
+        now = time.time()
+        old = now - 2.0 * 3600
+        os.utime(marker, (old, old))
+        receipt = self.root / "receipt.jsonl"
+        policy = dict(gd.POLICY)
+        policy.update(stale_marker_min_age_hours=0.5, stale_marker_jobs=3, stale_marker_max_hours=48.0)
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=[old + 600]), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=now), 0)
+        self.assertTrue(marker.exists())
+        cap_now = old + 49.0 * 3600
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=None), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=cap_now), len(b"pid=gone\n"))
+        self.assertFalse(marker.exists())
+
+    def test_cmux_next_ci_products_dedupe_guard_fails_closed_on_marker(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        products = make(state / "Products", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
+        guard = gd.cmux_next_ci_dedupe_guard(root)
+        self.assertTrue(guard(products / "blob"))
+        nested_guard = gd.cmux_next_ci_dedupe_guard(root)
+        self.assertTrue(nested_guard(nested_products / "blob"))
+        (state / ".lock").write_text("")
+        self.assertFalse(guard(products / "blob"))
+        (state / ".lock").unlink()
+        with mock.patch.object(gd, "live_artifact_references", return_value=frozenset({str(state)})):
+            self.assertFalse(guard(products / "blob"))
+        no_evidence_guard = gd.cmux_next_ci_dedupe_guard(root)
+        with mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("unavailable")):
+            self.assertFalse(no_evidence_guard(products / "blob"))
+
+    def test_cmux_next_ci_products_dedupe_roots_are_sealed_dirs_only(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        products = make(state / "Products", age_hours=96)
+        build = make(state / "Build", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
+        (state / "Logs").mkdir(parents=True)
+        (state / "SourcePackages").mkdir()
+        (state / "unknown").mkdir()
+        self.assertEqual(sorted(gd.cmux_next_ci_dedupe_roots(root)), sorted([products, nested_products]))
+
+    def test_cmux_next_ci_input_roots_reach_release_states_and_the_host_root(self) -> None:
+        """A dev-daily-release or release-compile state keeps its own SourcePackages three levels below its kind,
+        where dedupe_roots of the kind never looked: each was a full copy beside the runners' deduped ones."""
+        root = self.root / "Library/Caches/cmux-next-ci"
+        (root / "cmux-scheme/runner-a/SourcePackages").mkdir(parents=True)
+        daily = root / "dev-daily-release/0123456789abcdef/Release/xcode-89abcdef"
+        compile_ = root / "release-compile/fedcba9876543210/Release/xcode-01234567"
+        for state in (daily, compile_):
+            (state / "SourcePackages/artifacts").mkdir(parents=True)
+            (state / "Build/Products").mkdir(parents=True)
+        (daily / "ModuleCache.noindex").mkdir()
+        (root / "dev-daily-release/host/SourcePackages").mkdir(parents=True)
+        (root / "dev-daily-release/notakey/Release/xcode-89abcdef/SourcePackages").mkdir(parents=True)
+        (root / "dev-daily-release/0123456789abcdef/Release/xcode-aaaaaaaa").mkdir()
+        os.symlink(daily / "SourcePackages", root / "release-compile/fedcba9876543210/Release/xcode-01234567"
+                   / "ModuleCache.noindex")
+        got = sorted(p.relative_to(root).as_posix() for p in gd.cmux_next_ci_input_roots(root))
+        self.assertEqual(got, ["dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/ModuleCache.noindex",
+                               "dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/SourcePackages",
+                               "dev-daily-release/host/SourcePackages",
+                               "release-compile/fedcba9876543210/Release/xcode-01234567/SourcePackages"])
+        # cmux-scheme/<runner> stays dedupe_roots(cmux-scheme)'s, so no root is walked twice
+        self.assertNotIn("cmux-scheme/runner-a/SourcePackages", got)
+
+    @twelve_hour_ages
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
@@ -1316,7 +2584,7 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / ".derived-data.discard-7", age_hours=60)
         make(ci / "source-packages", age_hours=60)
         make(ci / "cmux-ci-2/derived-data", age_hours=60)
-        # a root with no seed source keeps its newest two of any prefix; dot entries are never seeds
+        # a root with no seed source keeps its newest of any prefix (SEED_KEEP 1); dot entries are never seeds
         for name, age in (("p-y", 48), ("p-z", 49), ("q-z", 50), (".q-w.incoming-3", 50)):
             make(ci / "cmux-ci-2/seeds" / name, age_hours=age)
         make(ci / "cmux-ci-x/derived-data", age_hours=60)  # not a root store
@@ -1329,10 +2597,12 @@ class GlaedaDiskTest(unittest.TestCase):
         items = gd.survey(gd.fleet_families(ci), 6, 0)
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in items}
         self.assertEqual(got, {
-            "seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
+            # one seed per root stays whatever its age (Leo: "keep only the current seed, not two"); the second
+            # newest waits out the idle window like any other
+            "seeds/p-a": "kept", "seeds/p-b": "recent", "seeds/p-c": "reclaimable", "seeds/q-x": "reclaimable",
             "pr-builds/pr-1": "recent", "pr-builds/pr-2": "recent",
             "derived-data": "recent", ".derived-data.discard-7": "reclaimable",
-            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "kept",
+            "cmux-ci-2/derived-data": "reclaimable", "cmux-ci-2/seeds/p-y": "kept", "cmux-ci-2/seeds/p-z": "reclaimable",
             "cmux-ci-2/seeds/q-z": "reclaimable", "cmux-ci-2/seeds/.q-w.incoming-3": "reclaimable"})
         # apply keeps the hot-tier windows, and re-reads command lines per item: a job that starts cloning a
         # parked build during the run keeps it
@@ -1396,7 +2666,8 @@ class GlaedaDiskTest(unittest.TestCase):
             # a job links "old" between the survey and the delete: apply re-checks the lock and keeps it
             late = open(scratch / "old.lock", "a")
             fcntl.flock(late, fcntl.LOCK_SH)
-            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
             late.close()
         self.assertFalse((scratch / "free").exists())
         self.assertFalse((scratch / "free.size").exists())
@@ -1416,6 +2687,385 @@ class GlaedaDiskTest(unittest.TestCase):
         late.close()
         self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
         self.assertFalse((scratch / "raced").exists())
+
+    def test_the_fast_tier_seed_root_goes_under_its_lock_after_slot_builds(self) -> None:
+        """cmux#44271, 2026-11-18: owned-mini fast-tier jobs restore the base seed at the seed workspace
+        (cmux owned_spm_scratch.py seed_lease). Its package builds go under pressure only while no job holds the
+        root's lock, and after per-slot cold builds of the same size and age: every slot's cold build costs a
+        whole compile, the seed root one restore."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        next_build = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
+        home_build = make(ws / "Packages/Shared/CmuxHomeRender/.build", mib=1, age_hours=50)
+        (ws / "Packages/macOS/CmuxNext/Package.swift").write_text("// swift-tools-version:6.0\n")
+        (seed / ".cmux-seed-root").touch()  # provisioning marks it (cmux owned_spm_scratch.SEED_MARKER)
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY]
+        self.assertEqual([f.root for f in fams], [ws / "Packages"])
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", self.root / "absent"):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "a mini without the seed workspace has no such family")
+        (seed / ".cmux-seed-root").unlink()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            self.assertEqual([f for f in gd.fleet_families(ci) if f.id == gd.SEED_ROOT_FAMILY], [],
+                             "unmarked, it is a runner's workspace (the nightly-next builder's): never this family")
+        (seed / ".cmux-seed-root").touch()
+        fam = fams[0]
+        self.assertFalse(gd.job_busy(fam, next_build), "its lock, not a slot marker search, decides")
+
+        def verdicts() -> dict[str, str]:
+            return {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+
+        self.assertEqual(verdicts(), {"Packages/macOS/CmuxNext/.build": "reclaimable",
+                                      "Packages/Shared/CmuxHomeRender/.build": "reclaimable"})
+        # a fast-tier job's holder keeps the lock exclusive for the whole job
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   "f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX)\n"
+                                   "print('held', flush=True); time.sleep(60)\n", os.fspath(lock)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        self.assertTrue(gd.seed_root_held(fam, next_build))
+        self.assertEqual(set(verdicts().values()), {"in-use"})
+        self.assertFalse(gd.remove_seed_root_build(fam, next_build), "the delete itself takes the lock")
+        self.assertTrue(next_build.exists())
+        holder.kill()
+        holder.wait()
+        self.assertFalse(gd.seed_root_held(fam, next_build))
+
+        # a job takes the root between the survey and the delete: apply re-checks the lock and keeps it
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        late = open(lock, "a")
+        fcntl.flock(late, fcntl.LOCK_EX)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        late.close()
+        self.assertTrue(next_build.exists() and home_build.exists())
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(next_build.exists() or home_build.exists())
+        self.assertTrue((ws / "Packages/macOS/CmuxNext/Package.swift").exists(), "only the builds go")
+        self.assertEqual(sorted(p.name for p in (ws / "Packages/macOS/CmuxNext").iterdir()), ["Package.swift"],
+                         "no aside tree left behind")
+        self.assertTrue(lock.exists())
+
+        # per-slot cold builds (a runner checkout's, a SwiftPM scratch slot's) of the same size and age go first
+        slot = make(self.root / "slot/.build", mib=4, age_hours=50)
+        item = lambda path: gd.Item("x", os.fspath(path), 4 * 1024**2, 50.0, "reclaimable")
+        runner_build = gd.Family(gd.RUNNER_BUILD_FAMILY, slot.parent, True, "rebuild", rebuild_minutes=10)
+        spm = gd.spm_scratch_family(ci)
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), runner_build))
+        self.assertLess(gd.value(item(next_build), fam), gd.value(item(slot), spm))
+
+    def test_the_second_seed_root_is_its_own_family_under_its_own_lock(self) -> None:
+        """2026-11-23: 7 of 15 cold 60-min fast-tier timeouts in 6 h had the one seed root held, so cmux's
+        owned_spm_scratch.py takes a second root, /Users/runner/_work/cmux-2, seeded at its own path. Its builds are
+        a family of their own id (apply maps families by id), marked the same way, and go only under its own lock:
+        a job holding the first root does not keep the second's builds, nor the other way round."""
+        first, second = self.root / "runner/_work/cmux", self.root / "runner/_work/cmux-2"
+        builds = {}
+        for seed in (first, second):
+            builds[seed] = make(seed / "cmux/Packages/macOS/CmuxNext/.build", mib=4, age_hours=50)
+            (seed / gd.SEED_ROOT_MARKER).touch()
+            (seed / gd.SEED_ROOT_LOCK).touch()
+        ci = self.root / "ci"
+        make(ci / "seeds/p-a", age_hours=1)
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", first), mock.patch.object(gd, "CMUX_SECOND_SEED_ROOT", second):
+            fams = [f for f in gd.fleet_families(ci) if f.id in gd.SEED_ROOT_FAMILIES]
+            self.assertEqual([(f.id, f.root) for f in fams],
+                             [(gd.SEED_ROOT_FAMILY, first / "cmux/Packages"),
+                              (gd.SECOND_SEED_ROOT_FAMILY, second / "cmux/Packages")])
+            (second / gd.SEED_ROOT_MARKER).unlink()
+            self.assertEqual([f.id for f in gd.fleet_families(ci) if f.id in gd.SEED_ROOT_FAMILIES],
+                             [gd.SEED_ROOT_FAMILY], "unmarked, the second root is not a seed root")
+            (second / gd.SEED_ROOT_MARKER).touch()
+        self.assertTrue(all(gd.build_cache_family(f) for f in fams))
+        held = open(first / gd.SEED_ROOT_LOCK, "a")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(held.close)
+        verdicts = {i.path: i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(verdicts, {os.fspath(builds[first]): "in-use", os.fspath(builds[second]): "reclaimable"})
+        items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        self.assertTrue(builds[first].exists())
+        self.assertFalse(builds[second].exists())
+        self.assertEqual([p.name for p in second.iterdir() if gd.DELETING_RE.fullmatch(p.name)], [],
+                         "its aside tree went beside its own lock and was deleted")
+
+    def test_a_fresh_seed_root_build_goes_only_below_a_floor(self) -> None:
+        """Review of glaeda#2137: nearly every fast-tier job rewrites the seed root's builds, so they never age past
+        the idle window. Below the runner floor (the floor hold) or the emergency floor they go once no job holds
+        the root, and a delete cut short leaves a deleting-named tree the interrupted sweep finishes."""
+        seed = self.root / "runner/_work/cmux"
+        ws = seed / "cmux"
+        fresh = make(ws / "Packages/macOS/CmuxNext/.build", mib=4, age_hours=0.1)
+        (seed / ".cmux-seed-root").touch()
+        lock = seed / gd.SEED_ROOT_LOCK
+        lock.touch()
+        with mock.patch.object(gd, "CMUX_SEED_ROOT", seed):
+            fams = [f for f in gd.fleet_families(self.root / "ci") if f.id == gd.SEED_ROOT_FAMILY]
+        dev = fams[0].root.stat().st_dev
+
+        def verdict() -> str:
+            got = {os.path.relpath(i.path, ws): i.verdict for i in gd.survey(fams, 6, 0)}
+            self.assertEqual(list(got), ["Packages/macOS/CmuxNext/.build"])
+            return got["Packages/macOS/CmuxNext/.build"]
+
+        self.assertEqual(verdict(), "recent")
+        with mock.patch.object(gd, "FLOOR_HOLD", {dev: 1 << 60}):
+            self.assertEqual(verdict(), "reclaimable")
+        with mock.patch.object(gd, "EMERGENCY_DEVS", frozenset({dev})):
+            self.assertEqual(verdict(), "reclaimable")
+            late = open(lock, "a")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            self.assertEqual(verdict(), "in-use")
+            late.close()
+            # below the emergency floor but above the runner floor's hold, apply deletes it too
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+        self.assertFalse(fresh.exists())
+        # the aside tree sits beside the lock, outside the workspace the next job mirrors into, and a delete cut
+        # short there is finished by the interrupted sweep
+        self.assertEqual([p.name for p in seed.iterdir() if gd.DELETING_RE.fullmatch(p.name)], [])
+        aside = seed / f"{gd.DELETING_PREFIX}CmuxNext.build-99"
+        make(aside)
+        self.assertIn(seed, [f.root for f in gd.interrupted_families(fams)])
+        doomed = gd.seed_root_aside(fams[0], make(ws / "Packages/macOS/CmuxNext/.build"))
+        self.assertEqual(doomed.parent, seed)
+
+    def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
+        """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
+        because the tmp family judged the whole root and its src/ checkout holds untracked build inputs."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = tmp / "cmux-ci", tmp / "cmux-ci-2"
+        make(one / "derived-data-compile-admission", age_hours=50)  # root 1: a job holds it
+        make(two / "derived-data-compile-admission", age_hours=50)
+        make(two / "compile-admission-cas", age_hours=50)
+        make(two / "derived-data-rerun-resolve", age_hours=2)
+        make(two / "src", age_hours=50)  # the root's checkout stays the tmp family's to judge
+        make(tmp / "cmux-ci-next" / "derived-data-x", age_hours=50)  # not a canonical root
+        for odd in ("cmux-ci-\u00b2", "cmux-ci-0", "cmux-ci-02", "cmux-ci-100"):  # not roots the runner hook takes
+            make(tmp / odd / "derived-data-x", age_hours=50)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # glaeda-cmux-runner-hook take-root holds it for the whole job
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            fams = gd.canonical_admission_families(tmp)
+            self.assertEqual([f.root for f in fams], [one, two])
+            self.assertFalse(gd.job_busy(fams[1], two / "derived-data-compile-admission"),
+                             "the root's token, not a slot marker search, decides")
+            items = gd.survey(fams, 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci/derived-data-compile-admission": "in-use",
+                              "cmux-ci-2/derived-data-compile-admission": "reclaimable",
+                              "cmux-ci-2/compile-admission-cas": "reclaimable",
+                              "cmux-ci-2/derived-data-rerun-resolve": "recent"})
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            families = {f.id: f for f in fams}
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps it all
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, families, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue((two / "derived-data-compile-admission").exists())
+            # apply marks what it refused blocked, so the next pass starts from a fresh survey
+            reclaim = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual(len(reclaim), 2)
+            gd.apply(reclaim, families, self.root / "r2.jsonl", None, 6)
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            make(two / "derived-data-raced", age_hours=50)
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_admission(two / "derived-data-raced"))
+            late.close()
+            self.assertTrue(gd.remove_canonical_admission(two / "derived-data-raced"))
+        self.assertEqual(sorted(p.name for p in two.iterdir()), ["derived-data-rerun-resolve", "src"],
+                         "nothing renamed aside is left behind")
+        self.assertTrue((one / "derived-data-compile-admission").exists())
+        for receipt, want in (("r1.jsonl", "changed:in-use"), ("r2.jsonl", "reclaimed")):
+            outcomes = {r["outcome"] for r in map(json.loads, (self.root / receipt).read_text().splitlines())}
+            self.assertEqual(outcomes, {want}, receipt)
+        # no token yet: no job ever took the root; a path outside a canonical root is never this family's to delete
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", self.root / "none"):
+            self.assertFalse(gd.canonical_root_held(two / "src"))
+        self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
+        self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
+
+    @twelve_hour_ages
+    def test_canonical_admission_gives_way_under_the_runner_floor_only_while_no_job_holds_its_root(self) -> None:
+        """cmux14, 2026-10-25: at the 30 GiB floor with 9.1 and 8.7 GiB of admission DerivedData idle 9 and 21 h
+        ("recent" under the 24 h window) on two roots no job held, and 0.0G reclaimable."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2, 3):
+            (capacity / f"root-{k}.token").touch()
+        roots = {k: tmp / ("cmux-ci" if k == 1 else f"cmux-ci-{k}") for k in (1, 2, 3)}
+        for k, hours in ((1, 9.3), (2, 10.9), (3, 0.5)):  # under the 12 h window
+            make(roots[k] / "derived-data-compile-admission", age_hours=hours)
+            make(roots[k] / "src", age_hours=hours)
+        job = open(capacity / "root-3.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # a compile (or a product consumer) holds root 3
+        dev = tmp.stat().st_dev
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                fams = gd.canonical_admission_families(tmp)
+                return fams, {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+        _, above = verdicts({})
+        self.assertEqual(set(above.values()), {"recent", "in-use"})  # above the floor the 12 h window stands
+        fams, under = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(under, {"cmux-ci/derived-data-compile-admission": "reclaimable",
+                                 "cmux-ci-2/derived-data-compile-admission": "reclaimable",
+                                 "cmux-ci-3/derived-data-compile-admission": "in-use"})
+        # least recently used first, and only down to the floor plus target_margin_gib: 35 -> 45 -> stop at 50
+        patches, removed = self._floor_disk(35.0)
+        with patches[0], patches[1], mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertEqual(len(removed), 2)
+        self.assertFalse((roots[2] / "derived-data-compile-admission").exists(), "the older root goes first")
+        self.assertFalse((roots[1] / "derived-data-compile-admission").exists())
+        self.assertTrue((roots[3] / "derived-data-compile-admission").exists(), "a held root keeps its build")
+        self.assertTrue(all((roots[k] / "src").exists() for k in roots), "src stays the tmp family's to judge")
+        # a root without a token file is outside the runner hook's protocol: its 12 h window stands
+        (capacity / "root-1.token").unlink()
+        make(roots[1] / "derived-data-compile-admission", age_hours=9.3)
+        _, under = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(under["cmux-ci/derived-data-compile-admission"], "recent")
+
+    def test_the_tmp_family_deletes_a_whole_canonical_root_only_under_its_root_token(self) -> None:
+        """The tmp family judges /private/tmp/cmux-ci and cmux-ci-<k> as one item each and may delete a whole one
+        after an hour idle. A compile job holds its root's token (glaeda-cmux-runner-hook take-root) for the whole
+        job, and a job's tree can sit an hour unwritten (a long test phase), so only the token tells a root in use:
+        it is in use while held, re-checked at apply, and the delete takes it exclusive as cmux-ci-admission does."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = make(tmp / "cmux-ci", 8, age_hours=50), make(tmp / "cmux-ci-2", 8, age_hours=50)
+        other = make(tmp / "cmux-ci-next", 8, age_hours=50)  # not a canonical root: the tmp family's as before
+        fam = replace(next(f for f in gd.default_families() if f.id == "tmp"), root=tmp, skip=(), min_bytes=None)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # a job holds root 1 for its whole run
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            items = gd.survey([fam], 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci": "in-use", "cmux-ci-2": "reclaimable", "cmux-ci-next": "reclaimable"})
+            self.assertIn("a job holds this canonical root (root token)",
+                          next(i for i in items if i.path == os.fspath(one)).reasons)
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps the root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue(two.exists())
+            self.assertFalse(other.exists())
+            outcomes = {Path(r["path"]).name: r["outcome"]
+                        for r in map(json.loads, (self.root / "r1.jsonl").read_text().splitlines())}
+            self.assertEqual(outcomes, {"cmux-ci-2": "changed:in-use", "cmux-ci-next": "reclaimed"})
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_root(two))
+            late.close()
+            self.assertTrue(two.exists())
+            reclaim = [i for i in gd.survey([fam], 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual([Path(i.path).name for i in reclaim], ["cmux-ci-2"])
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(two.exists())
+        self.assertTrue(one.exists())
+        self.assertEqual(sorted(p.name for p in tmp.iterdir()), ["cmux-ci"], "nothing renamed aside is left behind")
+
+    @twelve_hour_ages
+    def test_a_per_runner_root_gives_its_admission_build_up_while_its_runner_has_no_job(self) -> None:
+        """cmux18, 2026-11-16: /private/tmp/cmux-ci-cmux18-glaeda (a per-runner root canonical-build-root.sh names
+        after RUNNER_NAME) held 9.3G of derived-data-compile-admission beside a 1.2G src/ checkout, idle 10.3 h.
+        The tmp family judged the root whole ("checkout below the top level") and reclaimed 0 at 17G free under the
+        30 GiB runner floor."""
+        tmp, home = self.root / "tmp", self.root / "home"
+        for name, agent in (("actions-runner-glaeda", "cmux18-glaeda"), ("actions-runner-glaeda-1", "cmux18-glaeda-1"),
+                            ("actions-runner-glaeda-3", "cmux18-glaeda-3")):
+            (home / name / "glaeda-hooks").mkdir(parents=True)
+            (home / name / ".runner").write_text(json.dumps({"agentName": agent}))
+        idle, busy = tmp / "cmux-ci-cmux18-glaeda", tmp / "cmux-ci-cmux18-glaeda-1"
+        orphan = tmp / "cmux-ci-retired-runner"  # no enrolled runner has its name
+        # an idle runner's root that glaeda-1's running rerun job builds in (app-host-test-rerun.yml takes the
+        # producer's root and exports it to GITHUB_ENV); its unpacked products keep the producer's old mtimes
+        borrowed = tmp / "cmux-ci-cmux18-glaeda-3"
+        commands = home / "actions-runner-glaeda-1/_work/_temp/_runner_file_commands"
+        commands.mkdir(parents=True)
+        (commands / "set_env_0b1c").write_text(f"CMUX_CI_CANONICAL_ROOT={borrowed}\nCANONICAL_ROOT={borrowed}\n")
+        for root in (idle, busy, orphan, borrowed):
+            make(root / "derived-data-compile-admission", age_hours=10.3)
+            make(root / "compile-admission-cas", age_hours=10.3)
+            src = root / "src"  # the root's checkout, with an untracked build input
+            src.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(src)], check=True)
+            (src / "generated.swift").write_text("// untracked")
+            self._age(root, hours=10.3)
+        make(tmp / "cmux-ci-2" / "derived-data-compile-admission", age_hours=50)  # the token family's, not this one's
+        worker = f"{home}/actions-runner-glaeda-1/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = lambda: ([], worker)
+        tmp_fam = replace(next(f for f in gd.default_families() if f.id == "tmp"), root=tmp, skip=(), min_bytes=None)
+        dev = tmp.stat().st_dev
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            fams = gd.runner_root_admission_families(tmp)
+            self.assertEqual([f.root for f in fams], [idle, busy, borrowed, orphan])
+            with mock.patch.object(gd, "FLOOR_HOLD", {}):  # above the floor the 12 h window stands
+                above = {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+            self.assertEqual(above["cmux-ci-cmux18-glaeda/derived-data-compile-admission"], "recent")
+            with mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}):
+                items = gd.survey([*fams, tmp_fam], 6, 0)
+                v = {os.path.relpath(i.path, tmp): (i.verdict, i.reasons) for i in items}
+                self.assertEqual(v["cmux-ci-cmux18-glaeda/derived-data-compile-admission"][0], "reclaimable")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda/compile-admission-cas"][0], "reclaimable")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda-1/derived-data-compile-admission"],
+                                 ("in-use", ["actions-runner-glaeda-1 is running a job (Runner.Worker)"]))
+                self.assertEqual(v["cmux-ci-retired-runner/derived-data-compile-admission"][0], "in-use",
+                                 "a root no enrolled runner names waits while any runner has a job")
+                self.assertEqual(v["cmux-ci-cmux18-glaeda-3/derived-data-compile-admission"],
+                                 ("in-use", ["actions-runner-glaeda-1 is running a job that builds in this root "
+                                             "(GITHUB_ENV)"]))
+                self.assertNotEqual(v["cmux-ci-cmux18-glaeda"][0], "reclaimable", "src/ is still git's to judge")
+                self.assertNotIn("cmux-ci-cmux18-glaeda/src", v)
+                self.assertNotIn("cmux-ci-2/derived-data-compile-admission", v)
+                patches, _ = self._floor_disk(17.0, freed_gib=1.0)
+                with patches[0], patches[1], mock.patch.object(gd, "command_lines", return_value=worker), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {f.id: f for f in [*fams, tmp_fam]}, self.receipt(), None, 6,
+                             all_families=[*fams, tmp_fam])
+        self.assertEqual(sorted(p.name for p in idle.iterdir()), ["src"], "the build goes, the checkout stays")
+        self.assertTrue((busy / "derived-data-compile-admission").exists(), "a runner with a job keeps its build")
+        self.assertTrue((orphan / "derived-data-compile-admission").exists())
+        self.assertTrue((borrowed / "derived-data-compile-admission").exists(), "a borrowed root keeps its products")
+        # the idle sweep, no job anywhere: past the 12 h window the build goes, src/ still stays
+        make(idle / "derived-data-compile-admission", age_hours=13)
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {}):
+            v = {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(v["cmux-ci-cmux18-glaeda/derived-data-compile-admission"], "reclaimable")
+        self.assertEqual(gd.runner_root_key("mac mini/x"), "mac_mini_x")  # tr -c, C locale
+        self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci-2"))
+        self.assertIsNone(gd.runner_root_of(tmp / "cmux-ci"))
 
     def test_the_emergency_floor_names_its_filesystems(self) -> None:
         total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume
@@ -1460,9 +3110,9 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "SEED_SERVE_LOG", log), mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
             items = gd.survey(gd.fleet_families(ci), 24, 0)
             got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
-            # the newest two stay even when archived; an archived older one goes; the rest wait out the window
+            # the newest stays even when archived; an archived older one goes; the rest wait out the window
             self.assertEqual(got["p-a"][0], "kept")
-            self.assertEqual(got["p-b"][0], "kept")
+            self.assertEqual(got["p-b"][0], "recent")  # not archived: it waits out the window
             self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
             self.assertEqual(got["p-d"][0], "recent")
             self.assertEqual(got["p-e"][0], "recent")
@@ -1471,6 +3121,45 @@ class GlaedaDiskTest(unittest.TestCase):
                 gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
         self.assertFalse((ci / "seeds/p-c").exists())
         for name in ("p-a", "p-b", "p-d", "p-e"):
+            self.assertTrue((ci / "seeds" / name).exists(), name)
+
+    def test_a_seed_the_archive_listed_goes_without_waiting_on_any_mini(self) -> None:
+        ci = self.root / "ci"
+        (ci / "seeds").mkdir(parents=True)
+        (ci / "seed-source.json").write_text(json.dumps({"prefix": "p-"}))
+        for name, age in (("p-a", 0.2), ("p-b", 0.3), ("p-c", 1), ("p-d", 2)):
+            make(ci / "seeds" / name, age_hours=age)
+        listing = ci / gd.ARCHIVE_LIST
+        listing.parent.mkdir()
+
+        def listed(keys: list, age: float = 60, **kw) -> None:
+            listing.write_text(json.dumps({"schema": 1, "time": int(time.time() - age), "keys": keys, **kw}))
+
+        listed(["p-a", "p-c", "../p-d", ".p-d", 7, "p-x"])
+        self.assertEqual(gd.archive_listed_seeds(listing), {"p-a", "p-c", "p-x"})
+        for bad in (lambda: listed(["p-c"], age=gd.ARCHIVE_LIST_MAX_AGE + 60),  # stale: the archive may have pruned
+                    lambda: listed(["p-c"], age=-3600),  # from the future
+                    lambda: listed(["p-c"], schema=2),
+                    lambda: listing.write_text("[" * 5000),
+                    lambda: listing.write_text(json.dumps({"schema": 1, "time": True, "keys": ["p-c"]}))):
+            bad()
+            self.assertEqual(gd.archive_listed_seeds(listing), frozenset())
+        self.assertEqual(gd.archive_listed_seeds(self.root / "missing.json"), frozenset())
+        listed(["p-a", "p-c"])
+        missing_log = self.root / "no-serve-log.jsonl"  # a PR mini: no seed serve log at all
+        self.assertEqual(gd.archived_seeds(missing_log, listing), {"p-a", "p-c"})
+        with mock.patch.object(gd, "SEED_SERVE_LOG", missing_log), mock.patch.object(gd, "FLEET_CI", ci), \
+                mock.patch.object(gd, "cmux_active", lambda *a, **k: True):
+            items = gd.survey(gd.fleet_families(ci), 24, 0)
+            got = {Path(i.path).name: (i.verdict, i.reasons) for i in items}
+            self.assertEqual(got["p-a"][0], "kept")  # the newest stays, listed or not (SEED_KEEP = 1 since #2059)
+            self.assertEqual(got["p-b"][0], "recent")  # second newest: not listed, its usual window
+            self.assertEqual(got["p-c"], ("reclaimable", ["the seed archive holds it"]))
+            self.assertEqual(got["p-d"][0], "recent")  # not listed: its usual window
+            fams = {f.id: f for f in gd.fleet_families(ci)}
+            gd.apply([i for i in items if i.verdict == "reclaimable"], fams, self.root / "r.jsonl", None, 24)
+        self.assertFalse((ci / "seeds/p-c").exists())
+        for name in ("p-a", "p-b", "p-d"):
             self.assertTrue((ci / "seeds" / name).exists(), name)
 
     def test_pressure_targets_are_per_filesystem(self) -> None:
@@ -1553,9 +3242,182 @@ class GlaedaDiskTest(unittest.TestCase):
                 summary = json.loads(gd.HEALTH_SUMMARY.read_text())
                 self.assertEqual(summary["eviction_contention"]["owner"]["pid"], os.getpid())
                 survey.assert_not_called()
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gd.main(["--apply", "--json", "--no-snapshot", *receipt]), 3)
+                report = json.loads(out.getvalue())
+                self.assertEqual((report["status"], report["reason"], report["complete"]),
+                                 ("deferred", "eviction_busy", False))
+                self.assertNotIn("items", report)
+                survey.assert_not_called()
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
             survey.assert_called_once()
+
+    def test_dead_eviction_owner_does_not_keep_contention_health_stale(self) -> None:
+        receipt = self.receipt()
+        lock = self.root / "evict.lock"
+        receipt.write_text(json.dumps({"at": "now", "at_epoch": time.time(), "family": "eviction",
+                                       "outcome": "skipped", "reason": "another eviction running",
+                                       "owner": {"pid": 12345, "owner": "cmux", "state": "live"}}) + "\n")
+        with mock.patch.object(gd, "EVICT_LOCK", lock), \
+                mock.patch.object(gd, "_pid_alive", return_value=False):
+            self.assertIsNone(gd.read_eviction_contention(receipt))
+
+    def test_live_eviction_owner_with_held_lock_keeps_contention_health(self) -> None:
+        receipt = self.receipt()
+        lock = self.root / "evict.lock"
+        receipt.write_text(json.dumps({"at": "now", "at_epoch": time.time(), "family": "eviction",
+                                       "outcome": "skipped", "reason": "another eviction running",
+                                       "owner": {"pid": os.getpid(), "owner": "cmux", "state": "live"}}) + "\n")
+        with mock.patch.object(gd, "EVICT_LOCK", lock), lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            contention = gd.read_eviction_contention(receipt)
+        self.assertIsNotNone(contention)
+        self.assertEqual(contention["owner"]["pid"], os.getpid())
+
+    def test_live_pid_without_held_lock_does_not_keep_contention_health_stale(self) -> None:
+        receipt = self.receipt()
+        lock = self.root / "evict.lock"
+        receipt.write_text(json.dumps({"at": "now", "at_epoch": time.time(), "family": "eviction",
+                                       "outcome": "skipped", "reason": "another eviction running",
+                                       "owner": {"pid": os.getpid(), "owner": "cmux", "state": "live"}}) + "\n")
+        with mock.patch.object(gd, "EVICT_LOCK", lock):
+            self.assertIsNone(gd.read_eviction_contention(receipt))
+
+    def test_measurement_busy_json_is_not_a_completed_empty_report(self) -> None:
+        lock = self.root / "measurement.lock"
+        with mock.patch.object(gd, "MEASURE_LOCK", lock), \
+                mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "filesystems", return_value={}), \
+                mock.patch.object(gd, "survey") as survey:
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    status = gd.main(["--json", "--refresh", "--no-snapshot"])
+                self.assertEqual(status, 3)
+                self.assertEqual(json.loads(out.getvalue()), {
+                    "status": "deferred", "complete": False, "reason": "measurement_busy",
+                    "message": "another measurement running; skipped",
+                })
+                survey.assert_not_called()
+
+    def test_a_pressure_apply_below_the_emergency_floor_does_not_wait_for_a_measurement(self) -> None:
+        lock = self.root / "measurement.lock"
+        dev = gd.HOME.stat().st_dev
+        total = 460 * gd.GIB
+        # main() sets these module globals for the run; later tests read them.
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED", "OUT_OF_BAND_RUN"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+
+        def run(free_gib: float) -> tuple[int, str, mock.MagicMock]:
+            fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 128 * gd.GIB, 170 * gd.GIB)}
+            out = io.StringIO()
+            with mock.patch.object(gd, "MEASURE_LOCK", lock), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "default_families", return_value=[]), \
+                    mock.patch.object(gd, "runner_floor_gib", return_value=0.0), \
+                    mock.patch.object(gd, "filesystems", return_value=fss), \
+                    mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                    mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                    mock.patch.object(gd, "apply", return_value=0), \
+                    mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                    mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                    mock.patch.object(gd, "notify_disk"), \
+                    contextlib.redirect_stdout(out):
+                with lock.open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    status = gd.main(["--json", "--pressure", "--apply", "--no-snapshot", "--top", "0",
+                                      "--receipt", os.fspath(self.receipt())])
+            return status, out.getvalue(), survey
+
+        # Under pressure but above the emergency floor (10% of 460 GiB): a pressure apply goes on too.
+        status, out, survey = run(100)
+        self.assertNotIn("measurement_busy", out)
+        survey.assert_called()
+        # Nearly empty: it goes on.
+        status, out, survey = run(0.9)
+        self.assertNotIn("measurement_busy", out)
+        survey.assert_called()
+
+    def test_report_only_refresh_replaces_stale_timeout_summary_without_apply(self) -> None:
+        receipt = self.receipt()
+        summary_path = self.root / "summary.json"
+        saved_findings = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved_findings)))
+        summary_path.write_text(json.dumps({
+            "schema": "glaeda-disk/v1", "at": 1_790_500_000,
+            "findings": [{"id": "eviction_stuck", "state": "stale", "count": 1}],
+        }))
+        with mock.patch.object(gd, "HEALTH_SUMMARY", summary_path), \
+                mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "filesystems", return_value={1: gd.Fs(1, "/", 2, 3, 0, 0)}), \
+                mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                mock.patch.object(gd, "apply") as apply, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.main(["--refresh", "--json", "--no-snapshot", "--top", "0",
+                                      "--receipt", os.fspath(receipt)]), 0)
+        self.assertEqual(json.loads(summary_path.read_text())["findings"], [])
+        survey.assert_called_once()
+        apply.assert_not_called()
+
+    def test_background_refresh_wall_clock_guard_restores_signal_state(self) -> None:
+        previous = signal.getsignal(signal.SIGALRM)
+        with mock.patch.object(gd, "survey", side_effect=gd.RefreshDeadlineExceeded):
+            self.assertEqual(gd.bounded_refresh_survey([self.fam], 24, 0, {}, False, 1), [])
+        self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+
+    def test_background_refresh_main_guard_catches_timeout_and_cleans_up(self) -> None:
+        previous = signal.getsignal(signal.SIGALRM)
+        with mock.patch.object(gd, "_main_impl", side_effect=gd.RefreshDeadlineExceeded):
+            self.assertEqual(
+                gd.main(["--refresh", "--refresh-lock-fd", "3", "--refresh-budget-s", "1"]),
+                0,
+            )
+        self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+        self.assertFalse(gd._REFRESH_DEADLINE_ACTIVE)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_survey_captures_process_evidence_before_measurement_walks(self) -> None:
+        item = make(self.root / "measure-me", age_hours=48)
+        events = []
+        fam = gd.Family("tmp", self.root, True, "rebuild")
+        with mock.patch.object(gd, "candidates", return_value=[item]), \
+                mock.patch.object(gd, "process_evidence", side_effect=lambda: (events.append("evidence") or ([], ""))), \
+                mock.patch.object(gd, "du_bytes", side_effect=lambda _path: (events.append("du") or 1 << 20)):
+            gd.survey([fam], 24, 0, known={})
+        self.assertEqual(events[:2], ["evidence", "du"])
+
+    def test_survey_keeps_no_evidence_as_a_typed_blind_verdict(self) -> None:
+        item = make(self.root / "blind", age_hours=48)
+        fam = gd.Family("tmp", self.root, True, "rebuild")
+        with mock.patch.object(gd, "candidates", return_value=[item]), \
+                mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("ps failed")), \
+                mock.patch.object(gd, "du_bytes", return_value=1 << 20):
+            result = gd.survey([fam], 24, 0, known={})
+        self.assertEqual(result[0].verdict, "in-use")
+        self.assertTrue(any("no process evidence" in reason for reason in result[0].reasons))
+
+    def test_refresh_timeout_reaps_owned_du_processes(self) -> None:
+        class Proc:
+            pid = 1234
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        proc = Proc()
+        gd._ACTIVE_DU_PROCS[proc.pid] = proc
+        with mock.patch.object(gd.os, "killpg") as killpg:
+            gd._terminate_active_children()
+        killpg.assert_called_once_with(proc.pid, gd.signal.SIGKILL)
+        gd._ACTIVE_DU_PROCS.pop(proc.pid, None)  # worker owns the reap/removal path
 
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")
@@ -1572,17 +3434,23 @@ class GlaedaDiskTest(unittest.TestCase):
         sock = socket.socket(socket.AF_UNIX)
         self.addCleanup(sock.close)
         sock.bind(str(d / "default"))
+        sock.listen(1)
         # a long-lived server's socket is as old as its directory; only an old enough item pays for the socket walk
         for p in (d / "default", d):
             os.utime(p, (time.time() - 48 * 3600,) * 2)
         v = self.verdicts()
         self.assertEqual(v["tmux-1000"], "in-use")
         self.assertEqual(v["plain"], "reclaimable")
+        self.assertTrue(gd.holds_socket(d))
         forced = [gd.Item("xcode-derived-data", str(d), 1, 48, "reclaimable")]
         receipt = self.receipt()
         gd.apply(forced, {self.fam.id: self.fam}, receipt, None, 24)
         self.assertTrue(d.exists())
         self.assertIn("changed:in-use", receipt.read_text())
+        sock.close()  # its owner exited and left the file: a stopped Tart VM's control.sock (cmux11s, 40 GiB)
+        self.assertFalse(gd.socket_live(str(d / "default")))
+        self.assertFalse(gd.holds_socket(d))
+        self.assertEqual(self.verdicts()["tmux-1000"], "reclaimable")
 
     def _age(self, root: Path, hours: float = 48) -> None:
         t = time.time() - hours * 3600
@@ -1766,6 +3634,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("refs/heads/wt", self._git("-C", str(origin), "for-each-ref"))
 
     def test_checkouts_with_hidden_git_state_are_kept(self) -> None:
+        self.maxDiff = None
         root, origin = self._tmp_repos()
         # a clean, pushed clone that backs a worktree with an unpushed detached commit
         self._git("clone", "-q", str(origin), str(root / "main"))
@@ -1799,8 +3668,11 @@ class GlaedaDiskTest(unittest.TestCase):
         for d in root.iterdir():
             self._age(d)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
+        # the worktree outside keeps its repository, named (git_used_from_outside)
+        self.assertEqual(why.pop("main"), ("in-use", [
+            f"a repository in it is used from outside: {self.root / 'elsewhere'} (a linked worktree of "
+            f"{root / 'main/.git'}); kept"]))
         self.assertEqual(why, {
-            "main": ("git-checkout", ["other worktrees use this repository"]),
             "super": ("git-checkout", ["submodule sm: commits no remote confirms"]),
             "skipped": ("git-checkout", ["files hidden from status"]),
             "bisect": ("git-checkout", ["HEAD on no ref"]),
@@ -1919,12 +3791,14 @@ class GlaedaDiskTest(unittest.TestCase):
             self._age(c)
         why = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([self.fam], 24, 0)}
         confirm = ["submodule sm: commits no remote confirms"]
+        verdict, reasons = why.pop("sub-worktree")  # the worktree outside keeps it, named (git_used_from_outside)
+        self.assertEqual(verdict, "in-use")
+        self.assertIn(f"{self.root / 'sub-wt'} (a linked worktree of", reasons[0])
         self.assertEqual(why, {
             "orphaned": ("git-checkout", confirm),
             "commit-tree": ("git-checkout", confirm),
             "expired": ("git-checkout", confirm),
             "embedded": ("git-checkout", confirm),
-            "sub-worktree": ("git-checkout", ["submodule sm: has worktrees of its own"]),
             "local-fetch": ("git-checkout", confirm)})
 
     def test_local_remotes_never_vouch_for_commits(self) -> None:
@@ -1941,6 +3815,53 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(v, {"a": ("git-checkout", ["commits no remote confirms"]),
                              "b": ("git-checkout", ["commits no remote confirms"])})
         self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
+
+    def test_a_nearly_full_disk_gets_the_reserve_back_before_anything_writes(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        roomy, tight, full = (lambda: gd.FULL_DISK_REFILL_OVER), (lambda: gd.FULL_DISK_REFILL_OVER - 1), (lambda: 0)
+        self.assertFalse(gd.refill_full_disk_reserve(reserve, tight))  # no spare room: no reserve
+        self.assertFalse(reserve.exists())
+        self.assertTrue(gd.refill_full_disk_reserve(reserve, roomy))
+        self.assertEqual(reserve.stat().st_size, gd.FULL_DISK_RESERVE_BYTES)
+        self.assertGreaterEqual(reserve.stat().st_blocks * 512, gd.FULL_DISK_RESERVE_BYTES)  # not sparse
+        self.assertEqual(gd.release_full_disk_reserve(reserve, tight), 0)  # tight is not full: kept
+        self.assertTrue(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), gd.FULL_DISK_RESERVE_BYTES)
+        self.assertFalse(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), 0)  # already used
+        self.assertEqual(list(reserve.parent.iterdir()), [])  # no tmp left behind
+
+    def test_a_reserve_that_cannot_be_written_leaves_nothing(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        real_open = open
+
+        def enospc_after_open(path, mode="r", *a, **k):
+            f = real_open(path, mode, *a, **k)
+            if "w" in mode:
+                f.write = lambda b: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left on device"))
+            return f
+        with mock.patch("builtins.open", enospc_after_open):
+            self.assertFalse(gd.refill_full_disk_reserve(reserve, lambda: gd.FULL_DISK_REFILL_OVER))
+        self.assertEqual(list(reserve.parent.iterdir()), [])
+
+    def test_the_fleet_git_mirror_vouches_like_a_server(self) -> None:
+        root, origin = self._tmp_repos()
+        a = root / "a"
+        self._git("clone", "-q", str(origin), str(a))
+        gd.TRUSTED_LOCAL_REMOTES = ()
+        self.assertEqual(gd.network_remotes(a / ".git"), [])  # a plain local path is no copy
+        self.addCleanup(setattr, gd, "FLEET_MIRROR_REMOTES", gd.FLEET_MIRROR_REMOTES)
+        gd.FLEET_MIRROR_REMOTES = (str(origin.parent),)  # as cmux.git sits under the fleet's git/
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        head = self._git("-C", str(a), "rev-parse", "HEAD").strip()
+        pushed = self._git("-C", str(origin), "rev-parse", "HEAD").strip()
+        why, _, known = gd._server_known(a / ".git", ["origin"], {head, pushed})
+        self.assertEqual((why, known), ("", [pushed]))  # the bundle needs only the commit made here
 
     def test_network_remote_urls(self) -> None:
         for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
@@ -2052,14 +3973,14 @@ class GlaedaDiskTest(unittest.TestCase):
         fd = os.open(state / "build.lock", os.O_RDWR | os.O_CREAT, 0o600)
         self.addCleanup(os.close, fd)
         fcntl.flock(fd, fcntl.LOCK_EX)
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
         fcntl.flock(fd, fcntl.LOCK_UN)
         (state / "inflight.json").write_text("{}")
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "kept")
         (state / "inflight.json").unlink()
-        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 6, 0)}
+        v = {str(Path(i.path).relative_to(projects)): i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual(v["app/.glaeda/apple-build/cache/k1"], "reclaimable")
 
     def test_checkout_builds_ignore_the_callers_git_dir(self) -> None:
@@ -2075,6 +3996,4842 @@ class GlaedaDiskTest(unittest.TestCase):
                          {str(projects / "app"): 2, str(projects / "wts/feature"): 3})
 
 
+    def _runner_checkouts(self) -> tuple[Path, list[gd.Family]]:
+        """Two enrolled runners, each with a cmux checkout holding SwiftPM and cargo output and git temp packs."""
+        home = self.root / "home"
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            co = runner / "_work/cmux/cmux"
+            (co / ".git/objects/pack").mkdir(parents=True)
+            (co / ".git/objects/ab").mkdir()
+            (co / "Sources").mkdir()
+            make(co / "Packages/macOS/CmuxNext/.build")
+            make(co / "Packages/Shared/.build")
+            make(co / "cmux-tui/target")
+            (co / "cmux-tui/target/CACHEDIR.TAG").write_text(
+                "Signature: 8a477f597d28d172789f06886806bc55\n"
+                "# This file is a cache directory tag created by cargo.\n")
+            make(co / "Sources/target")  # no cargo tag: someone's source directory, not cargo's
+            for rel in (".git/objects/pack/tmp_pack_Ab12Cd", ".git/objects/ab/tmp_obj_Xy98Zw",
+                        ".git/objects/pack/pack-1234.pack"):
+                (co / rel).write_bytes(b"\0" * (2 * 1024 * 1024))
+            make(runner / "_work/_temp/cmux-derived-data-tests-1")  # the runner's own scratch is not a checkout
+            # $RUNNER_WORKSPACE/.glaeda-state: its DerivedData is build output; SourcePackages and cas are kept
+            for name in ("ios-e2e-mac-derived-data", "SourcePackages", "cas"):
+                make(runner / "_work/cmux/.glaeda-state" / name)
+            make(runner / "_work/_temp/.glaeda-state/DerivedData")  # not a workspace
+            self._age(runner / "_work", hours=3)
+        unenrolled = home / "actions-runner-old/_work/cmux/cmux"
+        (unenrolled / ".git").mkdir(parents=True)
+        make(unenrolled / "Packages/macOS/X/.build")
+        return home, gd.runner_checkout_families(home)
+
+    def test_runner_checkout_families_find_build_output_and_git_garbage(self) -> None:
+        home, fams = self._runner_checkouts()
+        self.assertEqual(sorted({(f.id, str(f.root.relative_to(home))) for f in fams}), [
+            ("runner-checkout-build", "actions-runner-glaeda-2/_work"),
+            ("runner-checkout-build", "actions-runner-glaeda/_work"),
+            ("runner-git-garbage", "actions-runner-glaeda-2/_work"),
+            ("runner-git-garbage", "actions-runner-glaeda/_work")])
+        work = home / "actions-runner-glaeda/_work"
+        build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY and f.root == work)
+        garbage = next(f for f in fams if f.id == gd.RUNNER_GIT_GARBAGE_FAMILY and f.root == work)
+        self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(build)), [
+            "cmux/.glaeda-state/ios-e2e-mac-derived-data",
+            "cmux/cmux/Packages/Shared/.build", "cmux/cmux/Packages/macOS/CmuxNext/.build",
+            "cmux/cmux/cmux-tui/target"])
+        self.assertEqual(sorted(str(p.relative_to(work)) for p in gd.candidates(garbage)), [
+            "cmux/cmux/.git/objects/ab/tmp_obj_Xy98Zw", "cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"])
+
+    def test_runner_build_output_goes_under_pressure_only_while_its_runner_has_no_job(self) -> None:
+        home, fams = self._runner_checkouts()
+        busy = home / "actions-runner-glaeda-2"
+        gd.process_evidence = lambda: ([], f"{busy}/bin/Runner.Worker spawnclient 151 154\n"
+                                           f"{home}/actions-runner-glaeda/bin/Runner.Listener run\n")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = gd.survey(fams, 6, 0)
+        v = {str(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in items}
+        idle = "actions-runner-glaeda/_work/cmux/cmux/"
+        live = "actions-runner-glaeda-2/_work/cmux/cmux/"
+        for rel in ("Packages/macOS/CmuxNext/.build", "Packages/Shared/.build", "cmux-tui/target"):
+            self.assertEqual(v[idle + rel][0], "reclaimable", rel)  # three hours idle, no Runner.Worker
+            self.assertEqual(v[live + rel], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        state = "actions-runner-glaeda/_work/cmux/.glaeda-state/"
+        self.assertEqual(v[state + "ios-e2e-mac-derived-data"][0], "reclaimable")
+        self.assertEqual(v["actions-runner-glaeda-2/_work/cmux/.glaeda-state/ios-e2e-mac-derived-data"],
+                         ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        self.assertNotIn(state + "SourcePackages", v)
+        self.assertNotIn(state + "cas", v)
+        # an hour-old temp pack is garbage even while that runner has a job
+        self.assertEqual(v[live + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
+        self.assertNotIn(live + ".git/objects/pack/pack-1234.pack", v)
+        self.assertNotIn("actions-runner-old/_work/cmux/cmux/Packages/macOS/X/.build", v)
+        # outside a pressure run (the idle sweep, a report) build output is kept; temp packs still go
+        with mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            v = {str(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in gd.survey(fams, 24, 0)}
+        self.assertEqual(v[idle + "cmux-tui/target"], ("kept", ["runner build output: pressure-only policy"]))
+        self.assertEqual(v[idle + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
+
+    def test_runner_build_output_goes_at_once_under_the_runner_floor(self) -> None:
+        home, fams = self._runner_checkouts()
+        fams = [f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY]
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            self._age(home / name / "_work", hours=0.2)  # built minutes ago, then the disk went under the floor
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = lambda: ([], worker)
+        dev = home.stat().st_dev
+        idle = "actions-runner-glaeda/_work/cmux/"
+        live = "actions-runner-glaeda-2/_work/cmux/cmux/"
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {str(Path(i.path).relative_to(home)): i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(verdicts({})[idle + "cmux/cmux-tui/target"], "recent")  # above the floor: the hour stands
+        v = verdicts({dev: 50 * gd.GIB})
+        for rel in ("cmux/Packages/macOS/CmuxNext/.build", "cmux/Packages/Shared/.build", "cmux/cmux-tui/target",
+                    ".glaeda-state/ios-e2e-mac-derived-data"):
+            self.assertEqual(v[idle + rel], "reclaimable", rel)
+        self.assertEqual(v[live + "cmux-tui/target"], "in-use")  # a runner with a job keeps its output
+        # apply stops at the floor plus target_margin_gib (50 GiB here): 25 -> 35 -> 45 -> 55, one item stays
+        patches, removed = self._floor_disk(25.0)
+        with patches[0], patches[1], mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertEqual(len(removed), 3)
+        self.assertTrue(all(r.startswith(str(home / idle)) for r in removed))
+        self.assertTrue((home / live / "cmux-tui/target").exists())
+
+    def test_code_sign_clones_go_at_once_under_the_runner_floor(self) -> None:
+        # cmux7s, 2026-10-21: 21 GiB free under a 30 GiB floor with 40 GiB of media CI's cmux DEV copies
+        # "recent" (min_idle_hours 2): every launch copies the bundle again, so two hours of jobs filled it
+        user_tmp, clones = self._clone_tree()
+        bundle = clones / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone"
+        for name, age_h in (("code_sign_clone.Old1", 1.5), ("code_sign_clone.Old2", 1.0), ("code_sign_clone.New", 0.5)):
+            self._age(bundle / name, hours=age_h)
+        fam = self._clone_family(user_tmp)
+        dev = clones.stat().st_dev
+
+        def not_newest(level, commands=None):
+            return [p for p in level if p.name != "code_sign_clone.New"]
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "keep_live_app_clones", side_effect=not_newest), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(verdicts({}), {"code_sign_clone.Old1": "recent", "code_sign_clone.Old2": "recent"})
+        self.assertEqual(verdicts({dev: 50 * gd.GIB}),
+                         {"code_sign_clone.Old1": "reclaimable", "code_sign_clone.Old2": "reclaimable"})
+        # apply: an app that started from a copy since the survey keeps it; else they go, down to the hold's stop
+        patches, removed = self._floor_disk(25.0)
+        running = "/x/cmux DEV.app/Contents/MacOS/cmux\n"
+        with patches[0], patches[1], mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "keep_live_app_clones", side_effect=not_newest), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            with mock.patch.object(gd, "command_lines", return_value=running), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], running)):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+            self.assertEqual(removed, [])
+            items = gd.survey([fam], 6, 0)  # apply marks what it held back: the next pass surveys again
+            with mock.patch.object(gd, "command_lines", return_value="/bin/zsh\n"):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(sorted(Path(r).name for r in removed), ["code_sign_clone.Old1", "code_sign_clone.Old2"])
+        self.assertTrue((bundle / "code_sign_clone.New").is_dir())
+
+    @staticmethod
+    def _registered_long_ago(runner_file: Path) -> None:
+        """A .runner written a day ago: no worker under an older name can still be running (enrolled_runner_roster)."""
+        old = time.time() - 24 * 3600
+        os.utime(runner_file, (old, old))
+
+    def _cmux_next_runners(self) -> tuple[Path, "gd.Family"]:
+        """Two enrolled runners named mini-glaeda and mini-glaeda-2, each with its cmux-next scheme state, and
+        a state no enrolled runner owns, all built an hour ago."""
+        home = self.root / "home"
+        for runner, name in (("actions-runner-glaeda", "mini-glaeda"), ("actions-runner-glaeda-2", "mini-glaeda-2")):
+            (home / runner / "glaeda-hooks").mkdir(parents=True)
+            # the runner writes .runner as UTF-8 with a byte order mark
+            (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+            self._registered_long_ago(home / runner / ".runner")
+        root = home / "Library/Caches/cmux-next-ci"
+        for name in ("mini-glaeda", "mini-glaeda-2", "gone-runner"):
+            make(root / "cmux-scheme" / name / "Build", age_hours=1)
+            (root / "cmux-scheme" / name / "SourcePackages").mkdir()
+        return home, gd.cmux_next_ci_family(root)
+
+    def test_idle_runners_cmux_next_build_output_goes_at_once_under_the_runner_floor(self) -> None:
+        # cmux7s, 2026-10-21: 19.9 GiB of per-runner cmux-next Build "recent" (72 h window) under the floor
+        home, fam = self._cmux_next_runners()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        dev = home.stat().st_dev
+
+        def verdicts(hold):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {Path(i.path).parent.name: (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)
+                        if Path(i.path).name == "Build"}
+        v = verdicts({})
+        self.assertEqual(v["mini-glaeda"][0], "recent")
+        self.assertEqual(v["mini-glaeda-2"], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        v = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(v["mini-glaeda"][0], "reclaimable")
+        self.assertEqual(v["mini-glaeda-2"][0], "in-use")  # a runner with a job keeps its output
+        self.assertEqual(v["gone-runner"][0], "recent")  # no enrolled runner to ask: its window stands
+        patches, removed = self._floor_disk(25.0, freed_gib=30.0)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        # the Build alone brought free (25 + 30) past the hold's stop (50): the slot's inputs stay
+        self.assertEqual(removed, [str(fam.root / "cmux-scheme/mini-glaeda/Build")])
+        self.assertTrue((fam.root / "cmux-scheme/mini-glaeda/SourcePackages").is_dir())
+
+    def test_the_cmux_next_build_log_is_generated_not_an_unknown_owners_state(self) -> None:
+        # cmux14, 2026-10-25: every idle state's Build "in-use: cmux-next state has unknown children:
+        # cmux-next-build.log", so the pressure runs freed 0.0 GiB at 10.8 GiB free under a 30 GiB floor
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        make(state / "Build", age_hours=96)
+        (state / "cmux-next-build.log").write_text("** BUILD SUCCEEDED **\n")
+        self._age(state / "cmux-next-build.log", hours=96)
+        (state / "SourcePackages").mkdir()
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(got, {"Build": "reclaimable", "cmux-next-build.log": "reclaimable"})
+
+    @twelve_hour_ages
+    def test_under_the_runner_floor_idle_runners_whole_slots_go_least_recently_used_after_their_output(self) -> None:
+        """cmux14, 2026-10-25: 115 GiB of cmux-next-ci, most of it the slots' inputs, at 10.8 GiB free under a
+        30 GiB floor. Under the floor hold an idle enrolled runner's whole slot may go, after every generated
+        child, least recently used first, until free reaches the hold's stop; a runner with a job, a process in a
+        slot and a slot no enrolled runner owns keep theirs."""
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        dev = home.stat().st_dev
+
+        def survey(hold):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return gd.survey([fam], 6, 0)
+        # no hold: no whole slot is listed at all
+        self.assertFalse({Path(i.path) for i in survey({})} & set(st.values()))
+        v = {Path(i.path): (i.verdict, i.reasons) for i in survey({dev: 50 * gd.GIB})}
+        # enrolled runners' slots are listed whole; a slot no enrolled runner owns is not (the cap's 6 h rule)
+        for key in ("mini-glaeda", "daily", "mini-glaeda-2", "release-new"):
+            self.assertIn(st[key], v, key)
+        for key in ("gone-runner", "release-old"):
+            self.assertNotIn(st[key], v, key)
+        self.assertEqual(v[st["mini-glaeda"]][0], "reclaimable")
+        self.assertIn("whole cmux-next slot", " ".join(v[st["mini-glaeda"]][1]))
+        for key in ("mini-glaeda-2", "release-new"):  # runner 2 has a job
+            self.assertEqual(v[st[key]][0], "in-use", key)
+        # apply: every idle Build first, then the slots least recently used first, until free reaches 50 GiB
+        patches, removed = self._floor_disk(20.0, freed_gib=4.0)
+        receipt = self.receipt()
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        self.assertEqual([Path(r) for r in removed],
+                         [st["mini-glaeda"] / "Build", st["daily"] / "Build",  # generated output first (5 h, 3 h)
+                          st["mini-glaeda"], st["daily"]])  # then the idle slots, least recently used first
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertTrue((st[key] / "SourcePackages").is_dir(), key)
+        # the stop: with free already at the hold's stop, no slot goes
+        for key in ("mini-glaeda", "daily"):
+            (st[key] / "SourcePackages").mkdir(parents=True)
+            (st[key] / "info.plist").write_text("{}")
+        patches, removed = self._floor_disk(50.0)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertFalse(set(map(Path, removed)) & set(st.values()))
+
+    def test_a_slot_a_job_takes_after_the_survey_is_kept(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        patches, removed = self._floor_disk(20.0, freed_gib=1.0)
+        named = f"xcodebuild -derivedDataPath {st['mini-glaeda']}\n"
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            with mock.patch.object(gd, "process_evidence", return_value=([], named)):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(removed, [])
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
+
+    def _floor_apply(self, home, fam, free_gib, freed_gib, evidence=([], ""), over=0, slots_only=False, during=None):
+        """One pressure apply under a 50 GiB floor hold stop. Returns (released, removed, items)."""
+        dev = home.stat().st_dev
+        patches, removed = self._floor_disk(free_gib, freed_gib=freed_gib)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=evidence[1]), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = gd.survey([fam], 6, 0)
+            if slots_only:
+                items = [i for i in items if Path(i.path).name not in gd.CMUX_NEXT_CI_GENERATED_NAMES]
+            with mock.patch.object(gd, "process_evidence", side_effect=during or (lambda: evidence)):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        return released, [Path(r) for r in removed], items
+
+    def test_a_floor_slot_is_not_stopped_by_the_spent_cap_budget(self) -> None:
+        # over the cap by one byte: the first Build spends the cap's budget, and the floor hold still wants 50 GiB
+        home, fam, st = self._cmux_next_cap_tree()
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, over=1)
+        for key in ("mini-glaeda", "daily"):
+            self.assertIn(st[key], removed, key)
+
+    @twelve_hour_ages
+    def test_a_slots_bytes_count_once_with_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"  # runner 2 has a job
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, evidence=([], worker))
+        size = {Path(i.path): i.bytes for i in items}
+        self.assertEqual(removed, [st["mini-glaeda"] / "Build", st["daily"] / "Build", st["mini-glaeda"],
+                                       st["daily"]])
+        # each slot's measured size includes its Build: the pass counts what the slots held, not more
+        self.assertEqual(released, size[st["mini-glaeda"]] + size[st["daily"]])
+
+    def test_the_floor_stop_is_read_again_right_before_a_slot_goes(self) -> None:
+        # free reaches the stop while the fresh evidence is taken: the slot stays
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB}
+
+        calls = {"n": 0}
+
+        def evidence():  # apply's first read leaves free under the stop; the per-item fresh read sees it met
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                state["free"] = 60 * gd.GIB  # another job's cleanup finished meanwhile
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "remove") as remove, mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertGreaterEqual(calls["n"], 2)  # it got past the pre-item stop check to the fresh evidence
+        remove.assert_not_called()
+
+    def test_a_slot_whose_runner_takes_a_job_during_the_rename_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # idle at the last check before the rename, then runner 1's Runner.Worker appears
+            calls["n"] += 1
+            return ([], "") if calls["n"] <= 2 else ([], worker)  # before the loop, before the rename, after it
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # back at its path
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_with_inputs_wider_than_the_marker_search_still_goes(self) -> None:
+        # a real slot's module cache holds thousands of entries: more than cmux_active's 5000-entry budget
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(5001):
+            (wide / f"m{n}.pcm").touch()
+        self._age(st["mini-glaeda"], hours=5)
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "reclaimable")
+        self.assertIn(st["mini-glaeda"], removed)
+
+    def test_a_slot_in_use_is_kept_aside_when_a_new_slot_took_its_path(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has already made a new slot at the path
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                make(st["mini-glaeda"] / "Build")
+            return [], worker
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)  # the tree the job may still use is not deleted
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # nor the job's new slot
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_put_back_never_replaces_an_empty_slot_a_job_made(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has made an empty slot (its cwd)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                st["mini-glaeda"].mkdir()
+                made.append(st["mini-glaeda"].stat().st_ino)
+            return [], worker
+        made: list[int] = []
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertEqual(st["mini-glaeda"].stat().st_ino, made[0])  # the job's directory is still the one there
+        self.assertEqual(list(st["mini-glaeda"].iterdir()), [])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+
+    def test_rename_noreplace_refuses_an_empty_directory(self) -> None:
+        src, dst = self.root / "src", self.root / "dst"
+        src.mkdir()
+        dst.mkdir()
+        with self.assertRaises(OSError) as raised:
+            gd.rename_noreplace(src, dst)
+        self.assertIn(raised.exception.errno, (errno.EEXIST, errno.ENOTSUP))
+        self.assertTrue(src.is_dir() and dst.is_dir())
+        if raised.exception.errno == errno.EEXIST:
+            dst.rmdir()
+            gd.rename_noreplace(src, dst)
+            self.assertTrue(dst.is_dir() and not src.exists())
+
+    def test_an_unknown_owner_vetoes_a_state_and_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "FLOOR_HOLD", {home.stat().st_dev: 50 * gd.GIB}):
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            # mini-glaeda-2's own slot and children: no runner matches by name, and one .runner cannot be read
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            for path in (st["mini-glaeda-2"], st["mini-glaeda-2"] / "Build", st["gone-runner"]):
+                self.assertIn("unknown", gd.cmux_next_ci_busy(fam, path, [], ""), path)
+            # a runner it can read still owns its own
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), home / "actions-runner-glaeda")
+
+    def test_a_release_owner_comes_from_one_read_of_its_runner(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        good = (runner / ".runner").read_text(encoding="utf-8-sig")
+        reads = {"n": 0}
+        real = gd.runner_config
+
+        def config(r):  # the first read of runner 1 succeeds, any later one fails
+            if r == runner:
+                reads["n"] += 1
+                if reads["n"] > 1:
+                    return {}
+            return real(r)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "runner_config", side_effect=config):
+            self.assertEqual(gd.cmux_next_ci_owner(st["daily"], fam.root), runner)
+        self.assertEqual(reads["n"], 1)
+        self.assertTrue(good)
+
+    def test_a_stale_root_the_cap_takes_is_put_back_when_its_tree_turns_busy(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        vetted = mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {st["gone-runner"]: None})
+        vetted.start()
+        self.addCleanup(vetted.stop)
+        doomed = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}{st['gone-runner'].name}-{os.getpid()}")
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        (doomed / "unknown-child").mkdir()  # something new arrived in the detached tree
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((st["gone-runner"] / "SourcePackages").is_dir())
+        (st["gone-runner"] / "unknown-child").rmdir()
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "free_bytes", return_value=(400 * gd.GIB, 460 * gd.GIB)):
+            recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
+        self.assertTrue(doomed.is_dir())
+
+    def test_a_state_a_renamed_runner_left_stays_unknown_for_a_jobs_timeout(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        # runner 1 re-registered as another name just now: its old Runner.Worker may still use cmux-scheme/mini-glaeda
+        (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertIn("unknown", gd.cmux_next_ci_busy(fam, st["mini-glaeda"], [], ""))
+            self.assertNotIn(st["mini-glaeda"], gd.cmux_next_ci_stale_roots(fam.root))  # on every later pass too
+            self._registered_long_ago(runner / ".runner")
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root))  # a job's timeout later: gone
+
+    def test_a_runner_whose_config_went_missing_just_now_is_not_known_gone(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda-2"
+        (runner / ".runner").unlink()  # mid re-registration: its old Runner.Worker may still use its state
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertNotIn(st["mini-glaeda-2"], gd.cmux_next_ci_stale_roots(fam.root))
+            self._registered_long_ago(runner)  # removed a job's timeout ago: gone
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root))
+
+    def test_an_aside_slot_finished_counts_against_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        aside = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}gone-runner-999999")
+        os.rename(st["gone-runner"], aside)
+        self._age(aside, hours=30)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            fams = [fam] + [f for f in gd.interrupted_families([fam]) if f.root == aside.parent]
+            items = gd.survey(fams, 6, 0)
+            by_path = {Path(i.path): i for i in items}
+            self.assertIn(aside, by_path)
+            for i in items:  # the aside first, then the cap's young output
+                i.verdict = "reclaimable" if Path(i.path) in (aside, st["mini-glaeda"] / "Build") else "blocked"
+            items.sort(key=lambda i: Path(i.path) != aside)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # the aside's bytes already met the cap
+
+    def test_a_drain_lists_no_whole_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertIn(st["mini-glaeda"], gd.cmux_next_ci_floor_slots(fam.root))
+            with mock.patch.object(gd, "CMUX_NEXT_CI_DRAIN", True), mock.patch.dict(gd._DISCOVERED, {}, clear=True):
+                self.assertEqual(gd.cmux_next_ci_floor_slots(fam.root), [])
+                listed = gd.candidates(fam)
+                self.assertFalse(set(listed) & set(gd.cmux_next_ci_state_roots(fam.root)))
+                self.assertIn(st["mini-glaeda"] / "Build", listed)
+
+    def test_an_unreadable_directory_in_a_slot_counts_as_holding_a_socket(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        home, fam, st = self._cmux_next_cap_tree()
+        build = st["mini-glaeda"] / "Build"
+        build.chmod(0)
+        try:
+            self.assertTrue(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+        finally:
+            build.chmod(0o755)
+        self.assertFalse(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+
+    def test_a_blank_agent_name_leaves_the_roster_incomplete(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        (home / "actions-runner-glaeda-2/.runner").write_text(json.dumps({"agentName": " "}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home):
+            names, complete, _ = gd.enrolled_runner_roster()
+            self.assertNotIn(" ", names)
+            self.assertFalse(complete)
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+
+    def test_a_slot_is_not_deleted_beside_a_new_one_when_free_space_cannot_be_read(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {slot: runner}), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            slot.mkdir()  # a new slot stands at the path
+            with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "unreadable")), \
+                    self.assertRaises(gd.SlotNotNeeded):
+                recheck()
+        self.assertTrue((doomed / "SourcePackages").is_dir())  # left aside, not handed to remove()
+
+    def test_a_slot_whose_runner_is_renamed_after_its_veto_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        worker = f"{runner}/bin/Runner.Worker spawnclient 1 2\n"
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "free_bytes", return_value=(10 * gd.GIB, 460 * gd.GIB)), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {}):
+            self.assertEqual(gd.cmux_next_ci_busy(fam, slot, [], ""), "")  # vetted under runner 1
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            # runner 1 is re-registered under another name while its old Runner.Worker still runs
+            (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+            self._registered_long_ago(runner / ".runner")  # past the roster's own window: the vetted owner holds it
+            self.assertIsNone(gd.cmux_next_ci_owner(slot, fam.root))
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((slot / "SourcePackages").is_dir())  # put back
+
+    def test_no_state_parent_is_found_through_a_symlink(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        outside = self.root / "outside"
+        (outside / ("ab" * 8) / "Release").mkdir(parents=True)
+        os.symlink(outside, fam.root / "dev-daily-release-link")
+        shutil.rmtree(fam.root / "release-compile")
+        os.symlink(outside, fam.root / "release-compile")
+        parents = gd.cmux_next_ci_state_parents(fam.root)
+        self.assertFalse([d for d in parents if d.resolve().is_relative_to(outside.resolve())], parents)
+        self.assertIn(fam.root / "cmux-scheme", parents)
+        linked_root = self.root / "linked-cmux-next-ci"
+        os.symlink(fam.root, linked_root)
+        self.assertEqual(gd.cmux_next_ci_state_parents(linked_root), [])
+
+    def test_an_aside_slot_keeps_its_vetoes_on_a_later_pass(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        os.rename(st["mini-glaeda"], aside)
+        wide = aside / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", aside / "Build" / "s")
+            # the generic search gives up past its budget (where it meets the wide cache first depends on the
+            # filesystem's listing order, so that is simulated): the aside's own vetoes still see the socket
+            with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "holds_socket", return_value=False), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                fams = [f for f in gd.interrupted_families([fam]) if f.root == scheme]
+                self.assertEqual(len(fams), 1)
+                self.assertIn("socket", gd.cmux_next_ci_aside_busy(aside, [], ""))
+                worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+                os.unlink(aside / "Build" / "s")
+                self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
+                self.assertIn("Runner.Worker", gd.cmux_next_ci_aside_busy(aside, [], worker))
+                with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                        mock.patch.object(gd, "command_lines", return_value=worker):
+                    items = [i for i in gd.survey(fams, 6, 0) if Path(i.path) == aside]
+                    self.assertEqual(len(items), 1)
+                    items[0].verdict = "reclaimable"
+                    gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+            self.assertTrue((aside / "SourcePackages").is_dir())  # its runner's job keeps it on the second pass
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+    def test_no_cmux_next_state_root_is_busy_for_its_width_alone(self) -> None:
+        # an unowned stale root the cap takes whole, and an enrolled runner's slot, each wider than cmux_active's budget
+        home, fam, st = self._cmux_next_cap_tree()
+        for key in ("gone-runner", "mini-glaeda"):
+            wide = st[key] / "ModuleCache.noindex"
+            wide.mkdir()
+            for n in range(5001):
+                (wide / f"m{n}.pcm").touch()
+            self.assertTrue(gd.cmux_active(st[key]), key)  # the generic search gives up
+            self.assertFalse(gd.job_busy(fam, st[key]), key)
+
+    def test_a_socket_past_a_wide_cache_still_keeps_a_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        self.assertFalse(gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))  # the cache alone is not activity
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))  # AF_UNIX paths are short: bind short, then move in
+        try:
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", st["mini-glaeda"] / "Build" / "s")
+            self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+        crowded = st["daily"] / "Build"
+        for n in range(3001):
+            (crowded / f"f{n}").touch()
+        self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["daily"]))  # a search that cannot finish fails closed
+
+    def test_an_unreadable_runner_config_makes_no_state_unowned(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        old = time.time() - 30 * 86400
+        for key in ("gone-runner", "release-old"):
+            for d in (st[key], *st[key].rglob("*")):
+                os.utime(d, (old, old))
+        with mock.patch.object(gd, "HOME", home):
+            self.assertIn(st["gone-runner"], gd.cmux_next_ci_stale_roots(fam.root))
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            self.assertEqual(gd.cmux_next_ci_stale_roots(fam.root), [])
+
+    def test_a_slot_left_aside_is_found_when_no_state_is_left_beside_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        for child in list(scheme.iterdir()):
+            shutil.rmtree(child)
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        make(aside / "Build")
+        release = st["daily"].parent
+        shutil.rmtree(st["daily"])
+        aside_release = release / f"{gd.DELETING_PREFIX}{st['daily'].name}-999999"
+        make(aside_release / "Build")
+        with mock.patch.object(gd, "HOME", home):
+            roots = {f.root for f in gd.interrupted_families([fam])}
+        self.assertIn(scheme, roots)
+        self.assertIn(release, roots)
+
+    def test_a_socket_that_moves_with_the_slot_keeps_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        calls = {"n": 0}
+        real_tree_busy = gd.cmux_next_ci_tree_busy
+
+        def tree_busy(state):  # a socket appears in the tree between the last check and the rename
+            return "cmux-next state holds a socket" if gd.DELETING_PREFIX in state.name else real_tree_busy(state)
+        with mock.patch.object(gd, "cmux_next_ci_tree_busy", side_effect=tree_busy):
+            _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # put back
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_that_cannot_be_put_back_for_another_reason_stays_aside(self) -> None:
+        # the floor is met after the rename, and the rename back fails without a new slot at the path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:
+                state["free"] = 60 * gd.GIB
+            return [], ""
+
+        def rename(src, dst):  # the put-back alone fails
+            raise PermissionError(errno.EACCES, "Permission denied")
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "rename_noreplace", rename), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())  # not deleted
+
+    def test_a_slot_no_longer_needed_after_the_rename_is_put_back(self) -> None:
+        # free reaches the stop while the post-rename evidence is taken: the slot goes back to its path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:  # before the loop, before the rename, after it
+                state["free"] = 60 * gd.GIB
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(released, 0)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+
+    def _cmux_next_host_tree(self, hours: float = 2.0):
+        """_cmux_next_cap_tree plus cmux#25147's per-host DEV build root: dev-daily-release/host with its source
+        clone (.git included), its Release DerivedData and the lock its builds flock."""
+        home, fam, st = self._cmux_next_cap_tree()
+        host = fam.root / "dev-daily-release/host"
+        make(host / "src/.git", age_hours=hours)
+        xcode = host / "Release/xcode-2c2299e9015ce0c8"
+        for name in ("CompilationCache.noindex", "SourcePackages", "Build"):
+            make(xcode / name, age_hours=hours)
+        (host / "lock").write_text('{"pid": 1, "runner": "mini-glaeda"}')
+        self._age(host, hours=hours)
+        return home, fam, st, host
+
+    def test_the_per_host_cmux_next_root_goes_last_and_only_under_the_floor(self) -> None:
+        """cmux#25147's host tree (14-16 GiB, 424 of 502 compile jobs hit warm on cmux14, 2026-10-26) is never the
+        cap's: under the runner floor hold everything else goes first, the per-instance dev-daily state (its
+        fallback) before all, and the host tree only while free is still below the floor itself."""
+        home, fam, st, host = self._cmux_next_host_tree()
+        dev = home.stat().st_dev
+        everything_else = [st["daily"] / "Build", st["daily"],  # the per-instance fallback state first, then whole
+                           st["release-old"], st["gone-runner"],  # then least recently used: 8 h, 7 h (whole)
+                           st["mini-glaeda"] / "Build", st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
+                           st["mini-glaeda"], st["mini-glaeda-2"], st["release-new"]]  # then the other slots
+        # over the cap with no floor hold: the host tree is listed, but its age exemption (cmux_next_ci_host_idle_hours, inf by default) holds
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            v = {Path(i.path): i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(v[host], "recent")
+        self.assertNotIn(host / "Release/xcode-2c2299e9015ce0c8", v)  # never a state root of its own
+        # 35 GiB free: under the hold's 50 GiB stop, above the 30 GiB floor. Everything else goes; the host stays
+        with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+            _, removed, items = self._floor_apply(home, fam, 35.0, 0.0, over=100 * gd.GIB)
+        self.assertIn("per-host cmux-next build root", " ".join(
+            next(i for i in items if Path(i.path) == host).reasons))
+        self.assertEqual(removed, everything_else)
+        self.assertTrue((host / "Release/xcode-2c2299e9015ce0c8/CompilationCache.noindex").is_dir())
+        # over the cap, a state idle past a job's timeout goes whole, inputs included: the per-instance fallback
+        # and an enrolled runner's own state alike
+        shutil.rmtree(home)
+        home, fam, st, host = self._cmux_next_host_tree()
+        for key in ("daily", "mini-glaeda"):
+            self._age(st[key], hours=7)
+        with mock.patch.object(gd, "HOME", home):
+            stale = gd.cmux_next_ci_stale_roots(fam.root)
+        self.assertIn(st["daily"], stale)
+        self.assertIn(st["mini-glaeda"], stale)
+        self.assertNotIn(st["mini-glaeda-2"], stale)  # 4 h
+        self.assertNotIn(host, stale)
+        # 10 GiB free: still under the floor after everything else, so the host tree goes, last
+        shutil.rmtree(home)
+        home, fam, st, host = self._cmux_next_host_tree()
+        with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+            _, removed, _ = self._floor_apply(home, fam, 10.0, 0.0, over=100 * gd.GIB)
+        self.assertEqual(removed[:len(everything_else)], everything_else)
+        self.assertEqual(sorted(removed[len(everything_else):]), [host / "Release", host / "src"])  # last
+        # emptied, its lock left in place (the same inode a build may already have open), and no aside left
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+
+    def test_the_per_host_cmux_next_root_is_kept_while_its_lock_is_held_and_goes_once_idle(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        dev = home.stat().st_dev
+        with open(host / "lock", "a") as build:  # cmux host_build_lock.py: flock(LOCK_EX | LOCK_NB), held by xcodebuild
+            fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+                _, removed, items = self._floor_apply(home, fam, 10.0, 0.0, over=100 * gd.GIB)
+            self.assertNotIn(host, removed)
+            self.assertEqual(next(i for i in items if Path(i.path) == host).verdict, "in-use")
+            # a build that takes the lock between the survey and the rename keeps it too
+            fcntl.flock(build, fcntl.LOCK_UN)
+            self.assertEqual(gd.cmux_next_ci_host_lock_held(host), "")
+            fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(gd.remove_cmux_next_host(host))
+        self.assertTrue((host / "src/.git").is_dir())
+        # the newest warm compile cache per builder is exempt from age by role: an idle sweep (no pressure, no floor)
+        # never takes it, however old; a finite cmux_next_ci_host_idle_hours in disk-policy.json ages it again
+        receipt = self.receipt()
+        for hours, gone, window in ((49.0, False, float("inf")), (500.0, False, float("inf")),
+                                    (47.0, False, 48.0), (49.0, True, 48.0)):
+            self._age(host, hours=hours)
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "command_lines", return_value=""), \
+                    mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_idle_hours": window}), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == host]
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+            self.assertEqual(not (host / "src").exists(), gone, hours)
+        # an interrupted removal's aside tree is finished like any other, unless a build holds its lock
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x")
+        with mock.patch.object(gd, "HOME", home):
+            self.assertIn(host, gd.cmux_next_ci_host_parents(fam.root))
+            self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
+            with open(host / "lock", "a") as build:
+                fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertIn("holds the host root", gd.cmux_next_ci_aside_busy(aside, [], ""))
+        # [] in disk-policy.json turns the rule off: the tree is then nobody's to judge, and kept
+        with mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_roots": []}):
+            self.assertEqual(gd.cmux_next_ci_host_roots(fam.root), [])
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_roots"], ["dev-daily-release/host"])
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
+
+    def test_the_host_lock_keeps_its_inode_so_a_build_that_opened_it_still_excludes_others(self) -> None:
+        # a build opened host/lock (fd 9) before the removal and flocks it after: a new lock file at the path would
+        # let a second build lock another inode and share host/src with it
+        home, fam, st, host = self._cmux_next_host_tree()
+        inode = (host / "lock").stat().st_ino
+        with open(host / "lock", "a") as early:
+            self.assertTrue(gd.remove_cmux_next_host(host))
+            fcntl.flock(early, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual((host / "lock").stat().st_ino, inode)
+            with open(host / "lock", "a") as late, self.assertRaises(BlockingIOError):
+                fcntl.flock(late, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_over_the_cap_an_idle_owned_fallback_state_goes_whole_without_a_floor_hold(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        for key in st:
+            self._age(st[key], hours=3)
+        self._age(st["daily"], hours=7)  # the owned per-instance fallback, idle past a job's timeout
+        receipt = self.receipt()
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            self.assertFalse(gd.cmux_next_ci_floor_slot(fam, st["daily"]))
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records], [(st["daily"], "reclaimed")])
+        self.assertFalse(st["daily"].exists())
+        self.assertTrue((host / "src").is_dir())
+
+    def test_a_finished_host_aside_counts_against_the_cap(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x", mib=3)
+        inter = gd.Family(gd.INTERRUPTED, host, True, "finish", build_output=True, max_idle_hours=0.0,
+                          rebuild_minutes=0.1)
+        items = [gd.Item(gd.INTERRUPTED, os.fspath(aside), 3 * 1024 * 1024, 48, "reclaimable", []),
+                 gd.Item(fam.id, os.fspath(st["mini-glaeda"] / "Build"), 1024 * 1024, 5, "reclaimable", [])]
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 2 * 1024 * 1024), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam, inter.id: inter}, receipt, None, 6, all_families=[fam, inter])
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").is_dir())  # the aside alone brought the cache under its cap
+        # the host root measured with that aside in it: a later pass sharing the tally counts only the rest
+        taken = {host: 3 * 1024 * 1024}
+        self._age(host, hours=49)
+        item = gd.Item(fam.id, os.fspath(host), 5 * 1024 * 1024, 49, "reclaimable", [])
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_idle_hours": 48.0}), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
+            released = gd.apply([item], {fam.id: fam}, receipt, None, 6, all_families=[fam], taken=taken)
+        self.assertEqual(released, 2 * 1024 * 1024)
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+        # for the floor alone, free is read again under the lock: met by then, nothing goes
+        make(host / "src")
+        with self.assertRaises(gd.SlotNotNeeded):
+            gd.remove_cmux_next_host(host, needed=lambda: False)
+        self.assertTrue((host / "src").is_dir())
+        # a host root that is a mount point is refused whole
+        with mock.patch.object(gd.os.path, "ismount", return_value=True), self.assertRaises(OSError):
+            gd.remove_cmux_next_host(host)
+
+    def test_main_takes_the_per_host_cmux_next_root_after_idle_runners_checkouts(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        other = gd.Item(fam.id, os.fspath(st["mini-glaeda"] / "Build"), gd.GIB, 5.0, "reclaimable", [])
+        last = gd.Item(fam.id, os.fspath(host), 14 * gd.GIB, 2.0, "reclaimable", [])
+        with mock.patch.object(gd, "HOME", home):
+            _, _, _, apply = self._main_run(["--pressure", "--apply"], items=[last, other], families=[fam])
+        self.assertEqual([[i.path for i in call.args[0]] for call in apply.call_args_list],
+                         [[other.path], [last.path]])  # its own pass, after the runner checkouts' last resort
+
+    @staticmethod
+    def _release_key(name: str, runner: Path) -> str:
+        """cmux scripts/cmux-next/release-derived-data-path.sh: sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]."""
+        return hashlib.sha256(f"{name}\n{runner}/_work/cmux/cmux\n".encode()).hexdigest()[:16]
+
+    def _cmux_next_cap_tree(self, runners: bool = True) -> tuple[Path, "gd.Family", dict[str, Path]]:
+        """cmux11s's layout, 2026-10-21: two enrolled runners' scheme states and a scheme state no enrolled
+        runner owns; release-compile states keyed by runner 2 and by a runner no longer enrolled, and a dev-daily
+        state keyed by runner 1; all younger than the family's 12 h window. Each state keeps its SourcePackages
+        input beside a 1 MiB Build."""
+        home = self.root / "home"
+        if runners:
+            for runner, name in (("actions-runner-glaeda", "mini-glaeda"),
+                                 ("actions-runner-glaeda-2", "mini-glaeda-2")):
+                (home / runner / "glaeda-hooks").mkdir(parents=True)
+                (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+                self._registered_long_ago(home / runner / ".runner")
+        root = home / "Library/Caches/cmux-next-ci"
+        xcode = "Release/xcode-2c2299e9015ce0c8"
+        key1 = self._release_key("mini-glaeda", home / "actions-runner-glaeda")
+        key2 = self._release_key("mini-glaeda-2", home / "actions-runner-glaeda-2")
+        states = {
+            "mini-glaeda": (root / "cmux-scheme/mini-glaeda", 5),
+            "mini-glaeda-2": (root / "cmux-scheme/mini-glaeda-2", 4),
+            "gone-runner": (root / "cmux-scheme/gone-runner", 7),
+            "release-old": (root / "release-compile/aaaaaaaaaaaaaaaa" / xcode, 8),  # no enrolled runner's key
+            "release-new": (root / "release-compile" / key2 / xcode, 1),
+            "daily": (root / "dev-daily-release" / key1 / xcode, 3),
+        }
+        for state, hours in states.values():
+            make(state / "Build", age_hours=hours)
+            (state / "SourcePackages").mkdir()
+            (state / "info.plist").write_text("{}")
+            self._age(state, hours=hours)
+        return home, gd.cmux_next_ci_family(root), {k: s for k, (s, _) in states.items()}
+
+    def test_cmux_next_ci_cap_policy_default_and_override(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_cap_gib"], 40.0)
+        policy = self.root / "disk-policy.json"
+        policy.write_text('{"cmux_next_ci_cap_gib": 25}')
+        self.assertEqual(gd.disk_policy(policy)["cmux_next_ci_cap_gib"], 25.0)
+
+    def test_cmux_next_ci_cap_state_measures_the_whole_cache(self) -> None:
+        home, fam, _ = self._cmux_next_cap_tree()
+        other = gd.Family("tmp", self.root, True, "x")
+        record = self.root / "cmux-next-cap.json"
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "CMUX_NEXT_CAP_RECORD", record):
+            # a report reads the last pressure run's measurement and never walks the cache itself
+            with mock.patch.object(gd, "du_bytes", return_value=78 * gd.GIB) as du:
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 40.0, measure=False))
+                du.assert_not_called()
+                got = gd.cmux_next_ci_cap_state([other, fam], 40.0, measure=True)
+                self.assertEqual({k: got[k] for k in ("used", "cap", "over")},
+                                 {"used": 78 * gd.GIB, "cap": 40 * gd.GIB, "over": 38 * gd.GIB})
+                # a size probe, not an eviction measurement: no eviction_stuck or cooldown from its timeout
+                du.assert_called_once_with(fam.root, record_timeout=False)
+                du.reset_mock()
+                seen = gd.cmux_next_ci_cap_state([other, fam], 25.0, measure=False)
+                du.assert_not_called()
+                self.assertEqual((seen["used"], seen["over"]), (78 * gd.GIB, 53 * gd.GIB))
+                self.assertLessEqual(time.time() - seen["at"], 60)
+                du.reset_mock()
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 0.0, measure=True))  # 0 turns the cap off
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other], 40.0, measure=True))  # family not in this run
+                du.assert_not_called()
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other, fam], 0.0))  # 0 turns the cap off
+                self.assertIsNone(gd.cmux_next_ci_cap_state([other], 40.0))  # the family is not in this run
+            with mock.patch.object(gd, "du_bytes", return_value=30 * gd.GIB):
+                self.assertEqual(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True)["over"], 0)
+            with mock.patch.object(gd, "du_bytes", return_value=None):  # an unsized cache keeps the 12 h window
+                self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True))
+        # a host with no enrolled glaeda runner is no CI host: the cap never applies there
+        with mock.patch.object(gd, "HOME", self.root / "bare"), mock.patch.object(gd, "CMUX_NEXT_CAP_RECORD", record), \
+                mock.patch.object(gd, "du_bytes", return_value=78 * gd.GIB) as du:
+            self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True))
+            self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=False))
+            du.assert_not_called()
+
+    def test_cmux_next_ci_unowned_states_go_whole_only_past_the_job_timeout(self) -> None:
+        # a state no enrolled runner owns but used within a job's timeout may still be a job's (a runner renamed
+        # or re-enrolled mid-job): it keeps its inputs until it has been idle for GitHub's default job timeout
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_unowned_idle_hours"], 6.0)
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)),
+                             sorted([st["gone-runner"], st["release-old"]]))  # 7 h and 8 h idle
+            self._age(st["gone-runner"], hours=2)
+            self.assertEqual(gd.cmux_next_ci_stale_roots(fam.root), [st["release-old"]])
+            with mock.patch.dict(gd.POLICY, {"cmux_next_ci_unowned_idle_hours": 1.0}):
+                self.assertIn(st["gone-runner"], gd.cmux_next_ci_stale_roots(fam.root))
+
+    def test_cmux_next_ci_release_key_uses_the_runner_work_folder(self) -> None:
+        # .runner's workFolder: relative to the runner directory, or absolute
+        home, fam, _ = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        elsewhere = self.root / "work-elsewhere"
+        (runner / ".runner").write_text(json.dumps({"agentName": "mini-glaeda", "workFolder": os.fspath(elsewhere)}),
+                                        encoding="utf-8-sig")
+        (home / "actions-runner-glaeda-2/.runner").write_text(
+            json.dumps({"agentName": "mini-glaeda-2", "workFolder": "w"}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home):
+            keys = gd.cmux_next_ci_release_keys()
+        self.assertEqual(keys[gd.cmux_next_ci_release_key("mini-glaeda", f"{elsewhere}/cmux/cmux")], runner)
+        self.assertEqual(keys[gd.cmux_next_ci_release_key("mini-glaeda-2", f"{home}/actions-runner-glaeda-2/w/cmux/cmux")],
+                         home / "actions-runner-glaeda-2")
+        self.assertNotIn(self._release_key("mini-glaeda", runner), keys)
+
+    def test_cmux_next_ci_release_states_are_keyed_by_runner(self) -> None:
+        # cmux11s, 2026-10-21: release-compile/3c965dbc3ce04dc2 is cmux11s-mac-mini-glaeda-1's
+        self.assertEqual(gd.cmux_next_ci_release_key("cmux11s-mac-mini-glaeda-1",
+                                                     "/Users/cmux/actions-runner-glaeda-1/_work/cmux/cmux"),
+                         "3c965dbc3ce04dc2")
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(gd.cmux_next_ci_runner(st["release-new"] / "Build", fam.root),
+                             home / "actions-runner-glaeda-2")
+            self.assertEqual(gd.cmux_next_ci_runner(st["daily"] / "Build", fam.root), home / "actions-runner-glaeda")
+            self.assertIsNone(gd.cmux_next_ci_runner(st["release-old"] / "Build", fam.root))
+            # so the runner floor hold covers a live runner's Release output too
+            self.assertTrue(gd.floor_hold_family(fam, st["release-new"] / "Build"))
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)), sorted([st["gone-runner"], st["release-old"]]))
+        # an aside tree a deletion left is never a state root
+        aside = fam.root / "cmux-scheme" / f"{gd.DELETING_PREFIX}gone-runner-123"
+        aside.mkdir()
+        self.assertNotIn(aside, gd.cmux_next_ci_state_roots(fam.root))
+
+    def test_cmux_next_ci_over_its_cap_lists_stale_roots_whole_and_drops_the_idle_window(self) -> None:
+        # cmux11s, 2026-10-21: 78 GiB of cmux-next-ci, "reclaimable 0.0G", jobs refused at 21 GiB under a 40 GiB floor
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(over, mode="pressure"):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        # within the cap: the generated children alone, each waiting out the 12 h window
+        v = verdicts(0)
+        self.assertEqual(set(v), {s / "Build" for s in st.values()})
+        self.assertEqual(v[st["mini-glaeda"] / "Build"][0], "recent")
+        self.assertEqual(v[st["release-old"] / "Build"][0], "recent")
+        # over the cap: states of runners no longer enrolled (scheme by name, Release by key) go whole; every
+        # enrolled runner's states keep their inputs, and a runner with a job keeps its output too
+        v = verdicts(5 * gd.GIB)
+        self.assertEqual(set(v), {st["release-old"], st["gone-runner"], st["mini-glaeda"] / "Build",
+                                  st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
+                                  st["daily"] / "Build"})
+        for key in ("release-old", "gone-runner"):
+            self.assertEqual(v[st[key]][0], "reclaimable", key)
+        for key in ("mini-glaeda", "daily"):
+            self.assertEqual(v[st[key] / "Build"][0], "reclaimable", key)
+        self.assertTrue(any("cap" in r for r in v[st["release-old"]][1]))
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertEqual(v[st[key] / "Build"],
+                             ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]), key)
+        # the cap is a pressure rule: an idle sweep or a report keeps the window
+        v = verdicts(5 * gd.GIB, mode="sweep")
+        self.assertEqual(set(v), {s / "Build" for s in st.values()})
+        self.assertTrue(all(verdict != "reclaimable" for verdict, _ in v.values()))
+
+    def test_cmux_next_ci_cap_keeps_every_in_use_guard(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        (st["release-old"] / ".build.active").write_text("pid=1\n")  # an active marker in an unowned state
+        self._age(st["release-old"], hours=8)
+        (st["gone-runner"] / "unknown-owner-state").mkdir()  # an unknown child: someone else's state
+        self._age(st["gone-runner"], hours=7)  # still past the job timeout
+        xcodebuild = f"xcodebuild -derivedDataPath {st['daily']} build\n"  # a process naming a root
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([os.fspath(st["release-new"])], xcodebuild)), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            v = {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(v[st["release-old"]][0], "in-use")
+        self.assertIn("active or ambiguous marker", v[st["release-old"]][1][0])
+        self.assertEqual(v[st["gone-runner"]][0], "in-use")
+        self.assertIn("unknown children", v[st["gone-runner"]][1][0])
+        self.assertEqual(v[st["daily"] / "Build"][0], "in-use")  # named by a running command
+        self.assertEqual(v[st["release-new"] / "Build"][0], "in-use")  # a process's cwd
+        self.assertEqual(v[st["mini-glaeda"] / "Build"][0], "reclaimable")
+
+    def test_cmux_next_ci_states_stay_partial_without_enrolled_runners(self) -> None:
+        # with no enrolled runner to ask, no state (scheme or release) can be called a gone runner's
+        home, fam, st = self._cmux_next_cap_tree(runners=False)
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            paths = {Path(i.path) for i in gd.survey([fam], 24, 0)}
+        for key in ("gone-runner", "release-old"):
+            self.assertIn(st[key] / "Build", paths)
+            self.assertNotIn(st[key], paths)
+
+    def test_cmux_next_ci_cap_evicts_least_recently_used_until_under_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        over = int(2.5 * 1024 * 1024)  # three 1 MiB entries bring it under
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = gd.survey([fam], 6, 0)
+            # a job starts on the unowned release state after the survey: the fresh recheck keeps it
+            named = f"xcodebuild -derivedDataPath {st['release-old']}\n"
+            with mock.patch.object(gd, "process_evidence", return_value=([], named)):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["release-old"], "changed:in-use"),  # 8 h, the oldest, but in use now
+                          (st["gone-runner"], "reclaimed"),  # 6 h
+                          (st["mini-glaeda"] / "Build", "reclaimed"),  # 5 h
+                          (st["mini-glaeda-2"] / "Build", "reclaimed")])  # 4 h: now under the cap
+        self.assertTrue(st["release-old"].is_dir())
+        self.assertFalse(st["gone-runner"].exists())
+        # with nothing naming it, the unowned Release state goes whole, leaving no empty <key>/Release behind
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["release-old"]]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        self.assertFalse((fam.root / "release-compile/aaaaaaaaaaaaaaaa").exists())
+        self.assertTrue((fam.root / "release-compile").is_dir())
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # an enrolled runner's inputs stay
+        for key in ("daily", "release-new"):
+            self.assertTrue((st[key] / "Build").is_dir(), key)
+
+    def _cmux_tui_trees(self, home: Path, fam: "gd.Family") -> dict[str, Path]:
+        """A Mac Studio's layout, 2026-11-08: cmux-tui-cargo/<worker key>/rust-<toolchain key>, one Cargo target per
+        runner (keyed as cmux's cmux-tui-warm-target.sh keys it) and one of a runner no longer enrolled; 1 MiB
+        each, idle 5 h (runner 1), 4 h (runner 2) and 9 h (gone)."""
+        toolchain = "rust-ad584c1c79663752"
+        trees = {
+            "tui-1": (fam.root / "cmux-tui-cargo" / self._release_key("mini-glaeda", home / "actions-runner-glaeda")
+                      / toolchain, 5),
+            "tui-2": (fam.root / "cmux-tui-cargo" / self._release_key("mini-glaeda-2", home / "actions-runner-glaeda-2")
+                      / toolchain, 4),
+            "tui-gone": (fam.root / "cmux-tui-cargo/bbbbbbbbbbbbbbbb" / toolchain, 9),
+        }
+        for tree, hours in trees.values():
+            make(tree / "debug/deps/libcmux.rlib", age_hours=hours)
+            (tree / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+            self._age(tree, hours=hours)
+        return {k: t for k, (t, _) in trees.items()}
+
+    def test_cmux_tui_targets_are_listed_whole_and_keyed_to_their_runner(self) -> None:
+        # A Mac Studio, 2026-11-08: 118 GiB of cmux-tui-cargo trees, "cmux_next_ci_over_gib": 119.2, "reclaimed_gib": 0.0
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        (fam.root / "cmux-tui-cargo/not-a-key/rust-ad584c1c79663752").mkdir(parents=True)  # another layout: never
+        (fam.root / "cmux-tui-cargo" / tui["tui-1"].parent.name / "notes").mkdir()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_tui_trees(fam.root)), sorted(tui.values()))
+            self.assertEqual(gd.cmux_next_ci_tui_owner(tui["tui-1"].parent), home / "actions-runner-glaeda")
+            self.assertEqual(gd.cmux_next_ci_tui_owner(tui["tui-2"].parent), home / "actions-runner-glaeda-2")
+            self.assertIsNone(gd.cmux_next_ci_tui_owner(tui["tui-gone"].parent))
+            for tree in tui.values():
+                self.assertIn(tree, gd.cmux_next_ci_generated_paths(fam.root))
+                self.assertTrue(gd.cmux_next_ci_tui_tree(fam, tree))
+            self.assertFalse(gd.cmux_next_ci_tui_tree(fam, tui["tui-1"] / "debug"))
+
+    def test_cmux_tui_targets_age_out_and_go_least_recently_written_first_over_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(over, opened=(), cmds=worker):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=(list(opened), cmds)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        # within the cap: each waits out the family's window (24 h here)
+        v = verdicts(0)
+        self.assertEqual(v[tui["tui-1"]][0], "recent")
+        self.assertEqual(v[tui["tui-gone"]][0], "recent")
+        self._age(tui["tui-gone"], hours=25)
+        self.assertEqual(verdicts(0)[tui["tui-gone"]][0], "reclaimable")
+        # over the cap the window gives way; the runner with a job keeps its tree
+        v = verdicts(5 * gd.GIB)
+        self.assertEqual(v[tui["tui-1"]][0], "reclaimable")
+        self.assertTrue(any("cmux-tui Cargo target" in r for r in v[tui["tui-1"]][1]))
+        self.assertEqual(v[tui["tui-2"]], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        # a tree written within the settle window stays, even over the cap
+        self._age(tui["tui-1"], hours=0.5)
+        self.assertEqual(verdicts(5 * gd.GIB)[tui["tui-1"]][0], "recent")
+        self._age(tui["tui-1"], hours=5)
+        # an open file in it (cargo's .cargo-lock) or a command naming it keeps it
+        lock = tui["tui-1"] / "debug/.cargo-lock"
+        self.assertEqual(verdicts(5 * gd.GIB, opened=[os.fspath(lock)], cmds="")[tui["tui-1"]][0], "in-use")
+        rustc = f"rustc --out-dir {tui['tui-gone']}/debug/deps src/lib.rs\n"
+        self.assertEqual(verdicts(5 * gd.GIB, cmds=rustc)[tui["tui-gone"]][0], "in-use")
+        # a .runner that cannot be read: whose tree this is is unknown, so none goes
+        (home / "actions-runner-glaeda/.runner").write_text("{")
+        self.assertEqual(verdicts(5 * gd.GIB, cmds="")[tui["tui-gone"]][0], "in-use")
+
+    def test_cmux_tui_targets_are_evicted_whole_least_recently_written_first(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        self._age(tui["tui-gone"], hours=9)
+        over = int(1.5 * 1024 * 1024)  # two 1 MiB entries bring it under
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) in tui.values()]
+            # runner 1 takes a job after the survey: the fresh recheck keeps its tree
+            worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(tui["tui-gone"], "reclaimed"),  # 9 h, the least recently written
+                          (tui["tui-1"], "changed:in-use"),  # 5 h, but its runner has a job now
+                          (tui["tui-2"], "reclaimed")])  # 4 h: now under the cap
+        self.assertFalse(tui["tui-gone"].exists())
+        self.assertFalse(tui["tui-2"].exists())
+        self.assertTrue((tui["tui-1"] / "debug/deps/libcmux.rlib/blob").is_file())
+
+    def test_cmux_tui_targets_past_their_window_are_not_held_to_the_cap(self) -> None:
+        # one byte over the cap must not stop expired trees once the cap is met: they are due by their own window
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        for tree in tui.values():
+            self._age(tree, hours=30)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 24, 0) if Path(i.path) in tui.values()]
+            self.assertFalse(any(gd.cmux_next_cap_only(fam, Path(i.path), i.idle_hours, 24) for i in items))
+            gd.apply(items, {fam.id: fam}, receipt, None, 24, all_families=[fam])
+        for tree in tui.values():
+            self.assertFalse(tree.exists(), tree)
+
+    def test_cmux_tui_target_goes_back_when_its_runner_takes_a_job_after_the_rename(self) -> None:
+        home, fam, _ = self._cmux_next_cap_tree()
+        tui = self._cmux_tui_trees(home, fam)
+        tree = tui["tui-1"]
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        with mock.patch.object(gd, "HOME", home):
+            gd.CMUX_NEXT_CI_VETTED_OWNER[tree] = home / "actions-runner-glaeda"
+            recheck = gd.cmux_next_ci_tui_recheck(fam, tree)
+            doomed = tree.with_name(f"{gd.DELETING_PREFIX}{tree.name}-{os.getpid()}")
+            os.rename(tree, doomed)
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                with self.assertRaises(gd.SlotTaken):
+                    recheck()
+            self.assertTrue(tree.is_dir())
+            self.assertFalse(doomed.exists())
+            # an aside tree an interrupted removal left keeps its runner's vetoes too
+            os.rename(tree, doomed)
+            self.assertIn("Runner.Worker", gd.cmux_next_ci_aside_busy(doomed, [], worker))
+            self.assertEqual(gd.cmux_next_ci_aside_busy(doomed, [], ""), "")
+            self.assertIn(tree.parent, gd.cmux_next_ci_aside_parents(fam.root))
+
+    def test_runner_job_started_reads_the_workers_start_from_ps(self) -> None:
+        runner = self.root / "actions-runner-glaeda-2"
+        out = (f"Tue Oct 27 01:10:26 2026 {runner}/bin.2.338.0/Runner.Worker spawnclient 1 2\n"
+               f"Mon Oct  5 09:00:00 2026 {self.root}/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 1 2\n"
+               f"Tue Oct 27 02:00:00 2026 /usr/bin/xcodebuild -derivedDataPath {runner}/x\n")
+        done = subprocess.CompletedProcess([], 0, out, "")
+        with mock.patch.object(gd.subprocess, "run", return_value=done) as run:
+            self.assertEqual(gd.runner_job_started(runner),
+                             time.mktime(time.strptime("Tue Oct 27 01:10:26 2026", "%a %b %d %H:%M:%S %Y")))
+        self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+        with mock.patch.object(gd.subprocess, "run", return_value=done):
+            self.assertIsNone(gd.runner_job_started(self.root / "actions-runner-glaeda-4"))  # no job
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            self.assertIsNone(gd.runner_job_started(runner))  # ps failed: unknown, so the job holds its states
+
+    def test_a_busy_runner_keeps_only_the_states_its_job_has_built_in(self) -> None:
+        # cmux14, 2026-10-27: 79 GiB against the 40 GiB cap and "reclaimable 0.0G": ten runners always had a job,
+        # and every state was last built in hours before its runner's job began
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+
+        def verdicts(started, over=5 * gd.GIB):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "runner_job_started", return_value=started), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
+                return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
+        # the job began 2 h ago: runner 2's scheme state (4 h) is its last job's; its Release state (1 h) is this one's
+        v = verdicts(time.time() - 2 * 3600)
+        self.assertEqual(v[st["mini-glaeda-2"] / "Build"][0], "reclaimable")
+        self.assertEqual(v[st["release-new"] / "Build"],
+                         ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
+        # a job whose start cannot be read keeps everything its runner owns
+        v = verdicts(None)
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertEqual(v[st[key] / "Build"][0], "in-use", key)
+        # a drain keeps its own rule: no live Runner.Worker at all
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "CMUX_NEXT_CI_DRAIN", True), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time()):
+            self.assertIn("Runner.Worker", gd.cmux_next_ci_busy(fam, st["mini-glaeda-2"] / "Build", [], worker))
+
+    def test_over_the_cap_an_enrolled_runners_state_idle_past_a_jobs_timeout_goes_whole(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        self._age(st["mini-glaeda"], hours=9)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(sorted(gd.cmux_next_ci_stale_roots(fam.root)),
+                             sorted([st["mini-glaeda"], st["gone-runner"], st["release-old"]]))
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", int(1.5 * 1024 * 1024)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = gd.survey([fam], 6, 0)
+            self.assertFalse(gd.cmux_next_ci_floor_slot(fam, st["mini-glaeda"]))
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda"], "reclaimed"),  # 9 h, least recently used, inputs and all
+                          (st["release-old"], "reclaimed")])  # 8 h: now under the cap
+        self.assertFalse(st["mini-glaeda"].exists())
+        self.assertTrue((st["mini-glaeda-2"] / "SourcePackages").is_dir())  # a state used within 6 h keeps its inputs
+
+    def test_a_childs_removal_is_undone_when_its_runners_job_starts_on_the_state(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        building = worker + f"xcodebuild -derivedDataPath {st['mini-glaeda-2']} build\n"
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time() - 2 * 3600), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda-2"] / "Build"]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            # the fresh evidence before the rename shows only the job; once the child is aside, its build has begun
+            with mock.patch.object(gd, "process_evidence", side_effect=[([], worker), ([], building)]):
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda-2"] / "Build", "changed:in-use")])
+        self.assertTrue((st["mini-glaeda-2"] / "Build/blob").is_file())
+        self.assertEqual([p.name for p in st["mini-glaeda-2"].iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_a_childs_recheck_reads_the_states_times_from_before_the_rename(self) -> None:
+        # the rename aside moves the state directory's mtime: that alone never puts the child back
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "runner_job_started", return_value=time.time() - 2 * 3600), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda-2"] / "Build"]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda-2"] / "Build", "reclaimed")])
+        self.assertTrue((st["mini-glaeda-2"] / "SourcePackages").is_dir())
+
+    def test_an_idle_runners_child_is_put_back_when_a_build_starts_during_the_rename(self) -> None:
+        # no job when the evidence was taken; once the child is aside, a build has rewritten the state's info.plist
+        home, fam, st = self._cmux_next_cap_tree()
+        receipt = self.receipt()
+        real_remove = gd.remove
+
+        def remove(path, after_rename=None):
+            def started():
+                (st["mini-glaeda"] / "info.plist").write_text("{}")
+                if after_rename is not None:
+                    after_rename()
+            return real_remove(path, after_rename=started)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), mock.patch.object(gd, "remove", remove), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"] / "Build"]
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records],
+                         [(st["mini-glaeda"] / "Build", "changed:in-use")])
+        self.assertTrue((st["mini-glaeda"] / "Build/blob").is_file())
+
+    def test_a_childs_recheck_puts_it_back_for_a_marker_a_drain_job_or_a_new_owner(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        state = st["mini-glaeda"]
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+
+        def outcome(during, evidence=([], ""), **patches):
+            for child in ("Build", "Logs"):
+                if not (state / child).exists():
+                    make(state / child, age_hours=5)
+            self._age(state, hours=5)
+            receipt = self.receipt()
+            real_remove = gd.remove
+            calls: list[int] = []
+
+            def remove(path, after_rename=None):
+                def hook():
+                    calls.append(1)  # the recheck's evidence is the job's
+                    during()
+                    if after_rename is not None:
+                        after_rename()
+                return real_remove(path, after_rename=hook)
+            with contextlib.ExitStack() as stack:
+                for name, value in {"HOME": home, "process_evidence": mock.Mock(side_effect=lambda: evidence if calls.append(1) or len(calls) > 1 else ([], "")),
+                                    "command_lines": lambda: "", "remove": remove, "ACTIVITY_MODE": "pressure",
+                                    "CMUX_NEXT_CI_OVER": gd.GIB,
+                                    "runner_job_started": lambda runner: time.time() - 3600, **patches}.items():
+                    stack.enter_context(mock.patch.object(gd, name, value))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                gd._DISCOVERED.clear()
+                with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                    items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == state / "Build"]
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+            return [json.loads(line)["outcome"] for line in receipt.read_text().splitlines()][-1:]
+        # an activity marker beside the state appears during the rename
+        marker = state.parent / ".lock"
+        self.assertEqual(outcome(lambda: marker.write_text("")), ["changed:in-use"])
+        self.assertTrue((state / "Build/blob").is_file())
+        marker.unlink()
+        # in a drain, a job that started meanwhile keeps it even though it predates the state's last build
+        self.assertEqual(outcome(lambda: None, evidence=([], worker), CMUX_NEXT_CI_DRAIN=True), ["changed:in-use"])
+        # the runner re-registered under another name meanwhile: whose state it is changed
+        runner = home / "actions-runner-glaeda/.runner"
+        self.assertEqual(outcome(lambda: runner.write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")),
+                         ["changed:in-use"])
+
+    def test_main_shows_the_cmux_next_cap_and_records_it_in_the_run_line(self) -> None:
+        self.addCleanup(setattr, gd, "CMUX_NEXT_CI_OVER", gd.CMUX_NEXT_CI_OVER)
+        state = {"used": 47 * gd.GIB, "cap": 25 * gd.GIB, "over": 22 * gd.GIB, "at": time.time() - 600}
+        with mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=state) as cap:
+            _, rows, _, _ = self._main_run(["--pressure", "--apply", "--cmux-next-cap-gib", "25"])
+            self.assertEqual(cap.call_args[0][1], 25.0)
+            self.assertIs(cap.call_args[1]["measure"], True)  # only a pressure run walks the cache
+            self.assertEqual(gd.CMUX_NEXT_CI_OVER, 22 * gd.GIB)
+            self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], 22.0)
+            # a report and a keepup without --apply show the last measurement; only a pressure run acts on it
+            for argv in (["report"], ["keepup"]):
+                cap.reset_mock()
+                printed = io.StringIO()
+                with mock.patch.object(gd, "print", create=True,
+                                          side_effect=lambda *x, **k: printed.write(" ".join(map(str, x)) + "\n")):
+                    self._main_run(argv)
+                cap.assert_called_once()
+                self.assertIs(cap.call_args[1]["measure"], False, argv)
+                self.assertRegex(printed.getvalue(),
+                                 r"cmux-next-ci: 47\.0G of its 25 GiB cap \(22\.0G over\), measured 1\d min ago", argv)
+                self.assertEqual(gd.cmux_next_ci_over(), 0)  # no pressure run: the 12 h window stands
+            # glaeda-fleet-status's `--json --top 0 --max-age 1000000` on every mini neither measures nor prints it
+            cap.reset_mock()
+            self._main_run(["--json", "--max-age", "1000000"])
+            cap.assert_not_called()
+        with mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"])
+            self.assertEqual(cap.call_args[0][1], gd.POLICY["cmux_next_ci_cap_gib"])
+            self.assertEqual(gd.CMUX_NEXT_CI_OVER, 0)
+            self.assertIsNone(rows[-1]["cmux_next_ci_over_gib"])
+
+    def _main_run(self, argv: list[str], free_gib: float = 20.0, **over):
+        """One main() run on a fake 460 GiB HOME volume; returns (status, run log rows, survey and apply mocks)."""
+        log = self.root / "runs.jsonl"
+        dev = gd.HOME.stat().st_dev
+        total = 460 * gd.GIB
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED", "OUT_OF_BAND_RUN"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd._MEASURE_BUDGET_REACHED = False  # survey resets it; a mocked survey must start from a clean run too
+        fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 120 * gd.GIB, 170 * gd.GIB)}
+        items = over.pop("items", [])
+        with mock.patch.object(gd, "RUN_LOG", log), \
+                mock.patch.object(gd, "DISK_OFF", over.pop("off", self.root / "disk-off")), \
+                mock.patch.dict(gd.POLICY, over.pop("policy", {})), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=over.pop("families", [])), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total),
+                                  side_effect=over.pop("free_effect", None)), \
+                mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                mock.patch.object(gd, "survey", return_value=items,
+                                  side_effect=over.pop("survey_effect", None)) as survey, \
+                mock.patch.object(gd, "apply", return_value=over.pop("released", 0),
+                                  side_effect=over.pop("apply_effect", None)) as apply, \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk", side_effect=over.pop("notify", None)), \
+                contextlib.redirect_stdout(out := io.StringIO()):
+            status = gd.main(argv + ["--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.said = out.getvalue()  # what the run printed, for a test that checks its wording
+        rows = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        return status, rows, survey, apply
+
+    def test_pressure_page_waits_for_maintenance_and_a_complete_unscoped_pass(self) -> None:
+        compacted = []
+        free_after = 130
+        def free(_):
+            return (free_after if compacted else 20) * gd.GIB, 460 * gd.GIB
+        def spent(*args, **kwargs):
+            gd._MEASURE_BUDGET_REACHED = True
+            return []
+        notify = mock.Mock()
+        argv = ["--pressure", "--apply", "--role", "devbox"]
+        with mock.patch.object(gd, "compact_shared_mirrors", side_effect=lambda *a, **k: compacted.append(True)):
+            self._main_run(argv, free_effect=free, notify=notify)
+            self.assertTrue(compacted)
+            notify.assert_not_called()  # recovered during the last post-lock operation
+            free_after = 20
+            self._main_run(argv, free_effect=free, notify=notify)
+            self.assertEqual(notify.call_args.args[0], "glaeda disk pressure")
+            notify.reset_mock()
+            self._main_run(argv + ["--family", gd.SHARED_MIRROR_COMPACT_FAMILY],
+                           families=[gd.Family(gd.SHARED_MIRROR_COMPACT_FAMILY, self.root, False, "")],
+                           free_effect=free, notify=notify)
+            self._main_run(argv, survey_effect=spent, free_effect=free, notify=notify)
+            notify.assert_not_called()
+            (self.root / "cache-input").mkdir()
+            def truncated(*args, **kwargs):
+                return gd.discover_caches(self.root, seconds=-1)
+            self._main_run(argv, survey_effect=truncated, free_effect=free, notify=notify)
+            notify.assert_not_called()
+
+    def test_pressure_page_names_only_surviving_holders_of_an_observed_low_volume(self) -> None:
+        dev = self.root.stat().st_dev
+        volumes = [gd.Fs(dev + n, f"/v{n}", gd.GIB, 100 * gd.GIB, 20 * gd.GIB, 30 * gd.GIB)
+                   for n in range(3)]
+        held = []
+        for name, size in (("small", 1), ("large", 8), ("large/nested", 7), ("middle", 4), ("tiny", 0.5)):
+            path = self.root / name
+            path.mkdir()
+            held.append(gd.Item("ci", str(path), int(size * gd.GIB), 1, "in-use", hold={"by": "open by job 42"}))
+        # Accounting saw this path before the post-lock maintenance removed it.
+        held.append(gd.Item("ci", str(self.root / "gone"), 9 * gd.GIB, 1, "kept", hold={"by": "reserved"}))
+        family = gd.Family("ci", self.root, False, "", owner="runner")
+        with mock.patch.object(gd, "free_bytes", side_effect=[(gd.GIB, 100 * gd.GIB), OSError("df"),
+                                                              (30 * gd.GIB, 100 * gd.GIB)]), \
+                mock.patch.object(gd, "notify_disk") as notify:
+            gd.notify_remaining_pressure(volumes, {dev: held}, [family], [{"dev": dev, "accounting_gap": gd.GIB}])
+        notify.assert_called_once()
+        body = notify.call_args.args[1]
+        self.assertIn("free on /v0", body)
+        self.assertLess(body.index("/large:"), body.index("/middle:"))
+        self.assertLess(body.index("/middle:"), body.index("/small:"))
+        for absent in ("/v1", "/v2", "/nested", "/gone", "/tiny"):
+            self.assertNotIn(absent, body)
+        self.assertIn("open by job 42 (owner: runner)", body)
+        self.assertIn("last accounting gap", body)
+
+    def test_the_release_is_the_ota_generation_holding_these_exact_bytes(self) -> None:
+        state = self.root / "update"
+        own = Path(gd.__file__).read_bytes()
+
+        def generation(tag: str, body: bytes, source: str) -> None:
+            gen = state / "generations" / tag
+            (gen / "glaeda/scripts").mkdir(parents=True)
+            (gen / "glaeda/scripts/glaeda-disk").write_bytes(body)
+            (gen / "release.json").write_text(json.dumps({"source": source}))
+
+        generation("v-20261121-new", b"other bytes", "b" * 40)
+        generation("v-20261121-old", own, "a" * 40)
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": "v-20261121-old",
+                                                      "quarantined": []}))
+        sha = hashlib.sha256(own).hexdigest()
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # current holds other bytes (a setup that has not installed yet): the previous one is what runs
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": "v-20261121-old", "source": "a" * 40})
+            self.assertIn("v-20261121-old (source " + "a" * 40, gd.version_line())
+        (state / "state.json").write_text(json.dumps({"current": "v-20261121-new", "previous": None,
+                                                      "quarantined": []}))
+        with mock.patch.object(gd, "UPDATE_STATE_DIR", state), mock.patch.object(gd, "_OWN_RELEASE", None):
+            # a hand install: no generation holds these bytes, and the line says so instead of guessing
+            self.assertEqual(gd.glaeda_disk_release(), {"sha256": sha, "tag": None, "source": None})
+            self.assertTrue(gd.version_line().startswith("glaeda-disk unreleased"))
+
+    def test_every_applying_run_writes_one_run_line(self) -> None:
+        blocked = gd.Item("code-sign-clones", "/x/c", 12 * gd.GIB, 1.0, "recent", [])
+        status, rows, survey, apply = self._main_run(["--pressure", "--apply"], items=[blocked], released=3 * gd.GIB)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        for key in ("at", "host", "mode", "off", "free_gib_before", "free_gib_after", "target_gib", "floor_gib",
+                    "reclaimed_gib", "reached", "blocked", "duration_s", "skipped"):
+            self.assertIn(key, row)
+        self.assertEqual((row["mode"], row["off"], row["skipped"]), ("pressure", False, None))
+        self.assertEqual((row["free_gib_before"], row["target_gib"], row["floor_gib"]), (20.0, 170.0, 30.0))
+        self.assertEqual(row["target_bytes"], 170 * gd.GIB)
+        self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
+        self.assertEqual(row["config_sha256"], gd.config_sha256())
+        self.assertEqual(row["release"], gd.glaeda_disk_release())  # which bytes wrote the row: a deploy is provable
+        self.assertEqual(row["reclaimed_gib"], 3.0)
+        self.assertFalse(row["reached"])
+        self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
+        # no pressure, where build caches keep their windows: still one line, nothing reclaimed, the target already met
+        with mock.patch.dict(gd.POLICY, build_caches_unwindowed=False):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[1]["skipped"], rows[1]["reached"]), ("no pressure", True))
+        # a fleet mini's pass with no pressure sweeps instead (a build's caches go when it ends): one line, not skipped
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=200.0)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual((rows[2]["mode"], rows[2]["skipped"]), ("idle", None))
+        # a report writes none
+        self._main_run(["report"])
+        self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 3)
+
+    def test_the_cache_budget_runs_on_fresh_sizes_and_only_in_a_pressure_run(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        if self.root.stat().st_dev != dev:
+            self.skipTest("the fake volume is HOME's; this temp dir is on another")
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        dd = gd.Family("xcode-derived-data", self.root / "dd", True, "", min_idle_hours=12)
+        dd.root.mkdir()
+        warm, gone = dd.root / "warm", dd.root / "gone"
+        warm.mkdir()
+        stale = {os.fspath(warm): 100 * gd.GIB, os.fspath(gone): 300 * gd.GIB}  # gone was deleted since
+
+        def survey(fams, idle, min_bytes, known, **kw):  # what the survey measured just now
+            known.clear()
+            known[os.fspath(warm)] = 10 * gd.GIB
+            return [gd.Item(dd.id, os.fspath(warm), 10 * gd.GIB, 3.0, "reclaimable", [])]
+        record = self.root / "fleet-cas-bytes.json"
+        record.write_text(json.dumps({"at": time.time(), "dev": dev, "bytes": 5 * gd.GIB}))
+        left = self.root / "cache-budget.json"
+        with mock.patch.object(gd, "load_snapshot", return_value=(0.0, stale)), \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record), \
+                mock.patch.object(gd, "CACHE_BUDGET_RECORD", left), \
+                mock.patch.object(gd, "fleet_cas_node_cap", return_value=0):
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], families=[dd], survey_effect=survey)
+            self.assertEqual(gd.BUDGET_WARM_DEVS, frozenset({dev}))  # the snapshot's 100 GiB put it over
+            row = rows[-1]["cache_budget"][0]
+            # fresh: 10 GiB measured plus the prune's 5, not 400 from the snapshot; 30% of 460 free is 118 GiB
+            # short of 20 GiB free, of which only the 10 GiB found reclaimable is the caches' to close
+            self.assertEqual((row["used_gib"], row["over_gib"]), (15.0, 10.0), row)
+            self.assertEqual(row["families_gib"], {"xcode-derived-data": 10.0, "fleet-cas": 5.0})
+            self.assertEqual(row["free_short_left_gib"], 108.0)
+            # the next pass counts only the shortfall beyond what this one could not close: 118 - 108 = 10 GiB
+            self.assertEqual(gd.read_budget_left(left), {dev: 108 * gd.GIB})
+            fs = gd.Fs(dev, "/", 20 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+            pre = gd.cache_budget_state([dd], {dev: fs}, {os.fspath(warm): 10 * gd.GIB}, {},
+                                        unclosable=gd.read_budget_left(left))[dev]
+            self.assertEqual(pre["over"], 10 * gd.GIB)
+            # a report, --json and a plain --apply never apply it
+            for argv in (["report"], ["--json"], ["--apply"]):
+                gd.BUDGET_WARM_DEVS, gd.CACHE_BUDGET = frozenset(), {}
+                before = len(rows)
+                _, rows, _, _ = self._main_run(argv, families=[dd], survey_effect=survey)
+                self.assertEqual((gd.BUDGET_WARM_DEVS, gd.CACHE_BUDGET), (frozenset(), {}), argv)
+                self.assertNotIn("cache budget:", self.said, argv)
+                self.assertFalse(any("cache_budget" in r for r in rows[before:]), argv)
+
+    def test_a_stale_fleet_cas_record_is_measured_again_on_a_pass_with_no_pressure(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        if self.root.stat().st_dev != dev:
+            self.skipTest("the fake volume is HOME's; this temp dir is on another")
+        for name in ("CACHE_BUDGET", "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        root = self.root / "xcode"
+        (root / "node-store/cas/00").mkdir(parents=True)
+        (root / "node-store/cas/00/obj").write_bytes(b"\0" * 8192)
+        (root / "cas/v1").mkdir(parents=True)
+        (root / "cas/v1/blob").write_bytes(b"\0" * 4096)
+        (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+        record = self.root / "fleet-cas-bytes.json"
+        record.write_text(json.dumps({"at": time.time() - gd.FLEET_CAS_RECORD_MAX_AGE_S - 60, "dev": dev,
+                                      "bytes": gd.GIB}))  # the last capped pass, long ago
+        self.assertFalse(gd.fleet_cas_record_fresh(gd.read_fleet_cas_record(record)))
+        with mock.patch.object(gd, "FLEET_CAS_RECORD", record), mock.patch.object(gd, "FLEET_CAS_ROOT", root), \
+                mock.patch.object(gd, "CACHE_BUDGET_RECORD", self.root / "cache-budget.json"), \
+                mock.patch.object(gd, "load_snapshot", return_value=(0.0, {})):
+            # plenty free: no pressure. With build_caches_unwindowed off the pass returns "no pressure"; on (the
+            # fleet mini's default since #2150) every pass sweeps instead. Both refresh the record.
+            for unwindowed in (False, True):
+                record.write_text(json.dumps({"at": time.time() - gd.FLEET_CAS_RECORD_MAX_AGE_S - 60, "dev": dev,
+                                              "bytes": gd.GIB}))
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=400.0,
+                                               policy={"build_caches_unwindowed": unwindowed})
+                if not unwindowed:
+                    self.assertEqual(rows[-1]["skipped"], "no pressure")
+                doc = gd.read_fleet_cas_record(record)
+                self.assertTrue(gd.fleet_cas_record_fresh(doc), unwindowed)  # the plan-only prune measured both again
+                self.assertEqual((doc["dev"], doc["bytes"]), (dev, 8192 + 4096))
+                self.assertTrue((root / "node-store/cas/00/obj").exists() and (root / "cas/v1/blob").exists())
+            fs = gd.Fs(dev, "/", 400 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+            fam = gd.Family("cmux-seeds", self.root / "seeds", True, "")
+            fam.root.mkdir()
+            row = gd.cache_budget_state([fam], {dev: fs}, {})[dev]
+            self.assertEqual(row["families"], {"fleet-cas": 8192 + 4096})  # the CAS is counted again
+
+    def test_a_pressure_apply_bounds_its_survey(self) -> None:
+        """Every pressure --apply measures for at most pressure_measure_budget_s and judges until twice that, so it
+        reaches its deletes inside the runner hook's bound; a report and a 0 budget keep the unbounded survey."""
+        start = time.monotonic()
+        _, rows, survey, _ = self._main_run(["--pressure", "--apply"])
+        kw = survey.call_args.kwargs
+        budget = gd.POLICY["pressure_measure_budget_s"]
+        self.assertEqual(budget, gd.PRESSURE_MEASURE_BUDGET_S)
+        self.assertGreaterEqual(kw["deadline"], start + budget)
+        self.assertLess(kw["deadline"], time.monotonic() + budget)
+        self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
+        self.assertFalse(rows[-1]["measure_budget_reached"])
+        _, _, survey, _ = self._main_run(["report"])
+        self.assertIsNone(survey.call_args.kwargs["deadline"])
+        self.assertIsNone(survey.call_args.kwargs["judge_deadline"])
+        _, _, survey, _ = self._main_run(["--pressure", "--apply"], policy={"pressure_measure_budget_s": 0.0})
+        self.assertIsNone(survey.call_args.kwargs["deadline"])
+        self.assertIsNone(survey.call_args.kwargs["judge_deadline"])
+
+        def spent(*_args, **_kwargs):
+            gd._MEASURE_BUDGET_REACHED = True
+            return []
+        _, rows, _, _ = self._main_run(["--pressure", "--apply"], survey_effect=spent)
+        self.assertTrue(rows[-1]["measure_budget_reached"])
+
+    def test_the_idle_sweep_and_the_callers_deadline_bound_the_survey(self) -> None:
+        """leo-workspace's hygiene reconciler runs `--pressure --idle --apply` with HYGIENE_RUN_DEADLINE and stops it at
+        900 s. With no pressure that is the idle sweep, whose survey had no bound: at load 200-300 an agent host's sweeps
+        ran 377-819 s and then past the stop, mid-walk, with no run line (leo-workspace#2682). The sweep now has the
+        pressure apply's measure and judge budgets, both inside the caller's deadline, and the later steps halt there."""
+        stamp = self.root / "idle.last"
+        sweep = ["--pressure", "--idle", "--apply"]
+        with mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]), \
+                mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: ""}):
+            start = time.monotonic()
+            _, rows, survey, apply = self._main_run(sweep, free_gib=300.0)
+            self.assertEqual(rows[-1]["mode"], "idle")
+            kw = survey.call_args.kwargs
+            budget = gd.PRESSURE_MEASURE_BUDGET_S
+            self.assertGreaterEqual(kw["deadline"], start + budget)
+            self.assertAlmostEqual(kw["judge_deadline"] - kw["deadline"], budget, delta=0.01)
+            halt = apply.call_args[0][5]
+            self.assertEqual(halt(), "")
+            self.assertNotIn("apply_stopped", gd.RUN)
+            with mock.patch.object(os, "getloadavg", return_value=(8.0, 0.0, 0.0)), \
+                    mock.patch.object(os, "cpu_count", return_value=4):
+                reason = gd.host_saturated()
+                self.assertTrue(reason)
+                self.assertEqual(halt(), reason)
+                self.assertEqual(gd.RUN["apply_stopped"], reason)
+            self.assertFalse(rows[-1]["run_deadline_reached"])
+            # the caller's deadline 5 min away: walks get a third of the 240 s before its margin, verdicts two thirds
+            stamp.unlink()
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 300:.0f}"}):
+                start = time.monotonic()
+                _, rows, survey, apply = self._main_run(sweep, free_gib=300.0)
+                kw = survey.call_args.kwargs
+                self.assertLessEqual(kw["deadline"], time.monotonic() + 81)
+                self.assertGreaterEqual(kw["deadline"], start + 78)
+                self.assertLessEqual(kw["judge_deadline"], time.monotonic() + 161)
+                halt = apply.call_args[0][5]
+                self.assertEqual(halt(), "")
+                self.assertNotIn("apply_stopped", gd.RUN, "a previous pass's saturation must not mark this one stopped")
+            # past it: nothing more is started, and the run line says why
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 10:.0f}"}):
+                self.assertIn(gd.RUN_DEADLINE_ENV, halt())
+                measure, judge = gd.pressure_survey_deadlines()
+                self.assertLessEqual(judge, time.monotonic())
+                stamp.unlink()
+                def spent(*_args, **_kwargs):
+                    gd._MEASURE_BUDGET_REACHED = True
+                    return []
+                _, rows, survey, apply = self._main_run(sweep, free_gib=300.0, survey_effect=spent,
+                                                        policy={"pressure_measure_budget_s": 0.0})
+                self.assertLessEqual(survey.call_args.kwargs["judge_deadline"], time.monotonic(),
+                                     "a 0 budget still keeps the caller's deadline")
+                self.assertIn(gd.RUN_DEADLINE_ENV, apply.call_args[0][5]())
+                self.assertTrue(rows[-1]["run_deadline_reached"])
+        for raw in ("", "soon", "inf", "nan"):
+            with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: raw}):
+                self.assertIsNone(gd.run_deadline_left(), raw)
+                self.assertIsNone(gd.with_run_deadline(None), raw)
+
+    def test_the_run_line_says_when_its_targets_are_not_the_defaults(self) -> None:
+        """The runner hook skips its pass on a run line's targets only when they are a plain --pressure --apply's
+        under the same glaeda-disk and disk-policy.json (config_sha256)."""
+        _, rows, _, _ = self._main_run(["--pressure", "--apply", "--target", "100"])
+        self.assertFalse(rows[-1]["default_targets"], "a custom target must never let the runner hook skip")
+        policy = self.root / "policy.json"
+        before = gd.config_sha256(policy=policy)
+        policy.write_text("{}")
+        self.assertNotEqual(before, gd.config_sha256(policy=policy))
+
+    def _queue(self):
+        """This test's runner-hook queue files, in place of the home's."""
+        lock, pending = self.root / "hook-pass.lock", self.root / "hook-pass.pending"
+        lock.touch()
+        return lock, pending, mock.patch.object(gd, "HOOK_PASS_LOCK", lock), \
+            mock.patch.object(gd, "HOOK_PASS_PENDING", pending)
+
+    def test_a_pressure_run_joins_a_running_hook_pass_instead_of_skipping_as_busy(self) -> None:
+        """The LaunchAgent's 15-minute pass raced the runner hook's queued pass and skipped as eviction_busy."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, \
+                mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        self.assertEqual((rows[-1]["skipped"], rows[-1]["caller"]), (gd.COALESCED_INTO_HOOK, "disk-pressure LaunchAgent"))
+        self.assertTrue(pending.exists(), "the running hook pass serves this trigger with its follow-up")
+        survey.assert_not_called()
+        cap.assert_not_called()
+
+    def test_a_run_that_takes_the_hook_lock_holds_it_and_serves_the_waiting_triggers(self) -> None:
+        """A run that finds the hook's lock free takes it for its whole run, so a hook pass started meanwhile only
+        queues behind it, and it clears the triggers it served (and only when it did its pass)."""
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        seen = []
+
+        def working(*_a, **_k) -> None:
+            seen.append(hook_held())
+
+        def hook_held() -> bool:
+            with lock.open("a") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+
+        pending.touch()
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with mock.patch.object(gd, "write_health_summary", side_effect=working):
+                status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        self.assertTrue(seen and all(seen), "the hook lock is held while the run works")
+        self.assertFalse(pending.exists() or claimed.exists(), "the triggers it served are cleared")
+        self.assertFalse(hook_held(), "and the lock is let go")
+
+    def test_a_run_deferred_for_ci_still_leaves_or_keeps_its_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0,
+                                               policy={"defer_during_ci": True})
+                self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+                self.assertTrue(pending.exists(), "joined before the deferral")
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists(), "a deferred run did no pass, so its claimed trigger stays")
+
+    def test_a_lock_taking_run_that_does_no_pass_leaves_its_own_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        self.assertFalse(pending.exists())
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists())
+
+    def test_a_trigger_that_cannot_be_left_never_overlaps_the_running_pass(self) -> None:
+        lock, _, p_lock, _ = self._queue()
+        with p_lock, mock.patch.object(gd, "HOOK_PASS_PENDING", self.root / "missing" / "hook-pass.pending"), \
+                lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+        survey.assert_not_called()
+
+    def test_a_json_run_that_joins_the_queue_reports_deferred(self) -> None:
+        lock, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, _, _, _ = self._main_run(["--pressure", "--apply", "--json"], free_gib=100.0)
+        self.assertEqual(status, 3)
+
+    def test_an_emergency_run_joins_the_queue_too(self) -> None:
+        """Below the emergency mark the hook's pass deletes the same way, so the LaunchAgent's run still joins it."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+
+    def test_the_hook_pass_itself_and_floor_evictions_are_never_queued(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        self.assertFalse(pending.exists())
+        survey.assert_called()
+
+    def _oob_families(self):
+        """A disposable family no job owns, and two job-owned ones, all on this test's HOME volume."""
+        appcast = self.root / "Library/Caches/Sparkle_generate_appcast"
+        work = self.root / "actions-runner-2/_work/cmux"
+        inside = work / "Library/Caches/Sparkle_generate_appcast"
+        for d in (appcast, work, inside):
+            d.mkdir(parents=True, exist_ok=True)
+        return [gd.Family("sparkle-appcast", appcast, True, "the next appcast run extracts it again"),
+                gd.Family(gd.RUNNER_BUILD_FAMILY, work, True, "the next job clones it again"),
+                gd.Family("sparkle-appcast", inside, True, "a job's own extract: the hook pass owns it")]
+
+    def test_out_of_band_families_are_the_disposable_ones_outside_every_runner_work_dir(self) -> None:
+        fams = self._oob_families()
+        self.assertEqual([f.root for f in gd.out_of_band_families(fams)], [fams[0].root],
+                         "a job-owned id, and any family under <runner>/_work, stay with the hook's pass")
+        self.assertTrue(gd.job_owned_root(self.root / "actions-runner-2/_work/cmux/x"))
+        self.assertFalse(gd.job_owned_root(self.root / "actions-runner-2/_diag"))
+        self.assertFalse(gd.job_owned_root(self.root / "_work/cmux"), "only a runner's own _work")
+        self.assertNotIn(gd.RUNNER_BUILD_FAMILY, gd.OUT_OF_BAND_FAMILY_IDS)
+        for job_owned in ("xcode-derived-data", "ci-derived-data", "cmux-pr-builds", "cmux-seeds", "tmp", "user-tmp"):
+            self.assertNotIn(job_owned, gd.OUT_OF_BAND_FAMILY_IDS, job_owned)
+
+    def test_the_queue_pass_is_only_the_hooks_bound_not_its_floor_evictions(self) -> None:
+        with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1", gd.CALLER_ENV: "runner hook pass"}):
+            self.assertTrue(gd.queue_pass())
+        with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1", gd.CALLER_ENV: "runner hook floor eviction"}):
+            self.assertFalse(gd.queue_pass())
+        with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1", gd.CALLER_ENV: "listener gate floor eviction"}):
+            self.assertFalse(gd.queue_pass())
+        with mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            self.assertFalse(gd.queue_pass())
+
+    def test_a_pressure_run_reclaims_out_of_band_instead_of_waiting_for_a_held_hook_pass(self) -> None:
+        """A signing job's hook pass holds the queue for hours (DISK_PASS_LIFETIME_FACTOR bounds, every pass
+        deferring). A manual or LaunchAgent run now frees the families no job owns instead of joining it."""
+        lock, pending, p_lock, p_pending = self._queue()
+        fams = self._oob_families()
+        with p_lock, p_pending, lock.open("a") as held, \
+                mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams)
+        self.assertEqual(status, 0)
+        self.assertEqual(rows[-1]["skipped"], None, "it ran a pass; it did not join the queue")
+        self.assertEqual(rows[-1]["out_of_band"], "a runner hook pass is under way")
+        survey.assert_called()
+        self.assertEqual([f.root for f in survey.call_args[0][0] if f.id != gd.INTERRUPTED], [fams[0].root],
+                         "only the disposable family; the job-owned dirs stay with the hook's pass")
+        self.assertTrue(pending.exists(), "the hook's pass still gets its follow-up for the job-owned dirs")
+        aside = [f for f in survey.call_args[0][0] if f.id == gd.INTERRUPTED]
+        self.assertTrue(all(f.root.is_relative_to(fams[0].root) for f in aside), aside)
+        self.assertIn(gd.INTERRUPTED, gd.OUT_OF_BAND_FAMILY_IDS,
+                      "an aside tree a killed deletion left in those roots is still finished out of band")
+
+    def test_a_running_ci_job_sends_every_run_but_the_queues_own_pass_out_of_band(self) -> None:
+        """The hook's bound treats the CI deferral as busy and keeps holding the queue, so a run that defers too
+        frees nothing. Only that bound waits now: it is the one that comes back for the job-owned dirs."""
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        pending.touch()  # a trigger the free lock lets this run claim before the CI job narrows it
+        fams = self._oob_families()
+        defer = f"{gd.CI_DEFER_MARK} (/Users/cmux/actions-runner/bin/Runner.Worker)"
+        with p_lock, p_pending, mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value=defer):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams,
+                                                     policy={"defer_during_ci": True})
+            self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+            self.assertEqual(rows[-1]["out_of_band"],
+                             "a CI job is running (/Users/cmux/actions-runner/bin/Runner.Worker)")
+            self.assertNotIn(gd.CI_DEFER_MARK, rows[-1]["out_of_band"],
+                             "the hook's bound reads that phrase as 'nothing was freed'")
+            self.assertEqual([f.root for f in survey.call_args[0][0] if f.id != gd.INTERRUPTED], [fams[0].root])
+            self.assertTrue(claimed.exists() or pending.exists(),
+                            "it skipped the job-owned families, so the queue's trigger is kept for a full pass")
+            # the hook's floor evictions must free space now, so they go out of band too
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1",
+                                              gd.CALLER_ENV: "runner hook floor eviction"}):
+                _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams,
+                                                    policy={"defer_during_ci": True})
+            self.assertEqual((rows[-1]["skipped"], bool(rows[-1]["out_of_band"])), (None, True))
+            survey.assert_called()
+            # the queue's own pass keeps deferring, so its trigger stays and it returns for the job-owned dirs
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1", gd.CALLER_ENV: "runner hook pass"}):
+                _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams,
+                                                    policy={"defer_during_ci": True})
+            self.assertEqual((rows[-1]["skipped"], rows[-1]["out_of_band"]), ("defer_during_ci", None))
+            survey.assert_not_called()
+
+    def test_an_out_of_band_run_leaves_the_pass_steps_outside_its_families_to_the_hook_pass(self) -> None:
+        """A pressure pass also reaps $TMPDIR test scratch, idle runner checkouts, clone gc and the CAS prune --
+        job-adjacent work, some of it minutes of git beside the job's compile. Out of band it does none of them."""
+        lock, _, p_lock, p_pending = self._queue()
+        fams = self._oob_families()
+        steps = dict(reap_tmpdir_test_residue=mock.DEFAULT, gc_home_clones=mock.DEFAULT)
+        with p_lock, p_pending, mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.multiple(gd, **{k: mock.DEFAULT for k in steps}) as mocks:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            for m in mocks.values():
+                m.return_value = 0
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams)
+            self.assertEqual(rows[-1]["out_of_band"], None, "a plain pass: every step runs")
+            for name, m in mocks.items():
+                m.assert_called()
+                m.reset_mock()
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=fams)
+            self.assertTrue(rows[-1]["out_of_band"])
+            for name, m in mocks.items():
+                m.assert_not_called()
+
+    def test_a_run_with_nothing_disposable_left_still_joins_the_queue_or_defers(self) -> None:
+        """With no family of its own to free, the old behaviour stands: the trigger goes to the running pass."""
+        lock, pending, p_lock, p_pending = self._queue()
+        job_owned = [self._oob_families()[1]]
+        with p_lock, p_pending, mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=job_owned)
+            self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+            survey.assert_not_called()
+            cap.assert_not_called()
+            self.assertTrue(pending.exists())
+            with mock.patch.object(gd, "ci_defer", return_value=f"{gd.CI_DEFER_MARK} (x)"):
+                _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, families=job_owned,
+                                                    policy={"defer_during_ci": True})
+            self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+            survey.assert_not_called()
+
+    def test_an_out_of_band_deletion_still_refuses_a_path_a_live_job_holds(self) -> None:
+        """Out of band or not, a file the signing job holds open (or names) is never deleted."""
+        appcast = self.root / "Library/Caches/Sparkle_generate_appcast"
+        extract = appcast / "cmux-nightly"
+        extract.mkdir(parents=True)
+        (extract / "cmux.app").write_text("x" * 32)
+        fam = gd.Family("sparkle-appcast", appcast, True, "the next appcast run extracts it again")
+        self.assertEqual(gd.out_of_band_families([fam]), [fam])
+        items = [gd.Item(fam.id, os.fspath(extract), 40 * gd.GIB, 99.0, "reclaimable", [])]
+        job = "/Users/cmux/actions-runner/bin/Runner.Worker sign-nightly-identity"
+        gd.process_evidence = lambda: ([os.fspath(extract / "cmux.app")], job)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam]), 0)
+        self.assertTrue(extract.exists(), "a held extract stays")
+        self.assertEqual(items[0].verdict, "blocked")
+        self.assertIn("changed:in-use", items[0].reasons)
+
+    def test_an_out_of_band_run_re_reads_the_open_files_before_every_item(self) -> None:
+        """glaeda#1895's first head deleted an extract a job opened during the pass: apply()'s one snapshot was
+        from its start, and sparkle-appcast is not a discover family, so nothing re-read it."""
+        appcast = self.root / "Library/Caches/Sparkle_generate_appcast"
+        big, held = appcast / "first", appcast / "second"
+        old = time.time() - 100 * 3600
+        for d in (big, held):
+            d.mkdir(parents=True)
+            (d / "cmux.app").write_text("x")
+            for q in (d / "cmux.app", d, appcast):
+                os.utime(q, (old, old))
+        fam = gd.Family("sparkle-appcast", appcast, True, "the next appcast run extracts it again")
+        items = [gd.Item(fam.id, os.fspath(big), 40 * gd.GIB, 99.0, "reclaimable", []),
+                 gd.Item(fam.id, os.fspath(held), 10 * gd.GIB, 99.0, "reclaimable", [])]
+        job = "/Users/cmux/actions-runner/bin/Runner.Worker sign-nightly-identity"
+        calls = itertools.count()
+        # the job opens the second extract only after the pass started on the first
+        gd.process_evidence = lambda: (([os.fspath(held / "cmux.app")], job) if next(calls) >= 2 else ([], job))
+        with mock.patch.object(gd, "OUT_OF_BAND_RUN", "a runner hook pass is under way"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertFalse(big.exists(), "the first extract, held by nobody, goes")
+        self.assertTrue(held.exists(), "the one the job opened mid-pass stays")
+        self.assertIn("changed:in-use", items[1].reasons)
+
+    def test_an_out_of_band_run_refuses_a_discovered_cache_inside_a_jobs_work_dir(self) -> None:
+        """home-caches is rooted at the home, and discovery descends into the runners: the family root passing
+        job_owned_root is not enough (glaeda#1895 review F2)."""
+        inside = self.root / "actions-runner-2/_work/_temp/cargo-cache"
+        inside.mkdir(parents=True)
+        (inside / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        fam = gd.Family("home-caches", self.root, True, "the tool re-downloads it", discover=True)
+        items = [gd.Item(fam.id, os.fspath(inside), 12 * gd.GIB, 99.0, "reclaimable", [])]
+        self.assertTrue(gd.job_owned_root(inside))
+        with mock.patch.object(gd, "OUT_OF_BAND_RUN", "a CI job is running"), \
+                mock.patch.object(gd, "discoverable", return_value="cachedir-tag"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertTrue(inside.exists())
+        self.assertIn("changed:job-owned", items[0].reasons)
+
+    def test_the_hook_reads_the_ci_deferral_phrase_glaeda_disk_prints(self) -> None:
+        """The hook's DISK_BOUND keeps its trigger on that exact phrase; an out-of-band run must not print it."""
+        low = gd.Fs(1, "/", 100 * gd.GIB, 460 * gd.GIB, 120 * gd.GIB, 170 * gd.GIB)
+        self.assertIn(gd.CI_DEFER_MARK, gd.ci_defer({1: low}, ["Runner.Worker"], "10%:30-60"))
+        hook = ROOT / "scripts/glaeda-cmux-runner-hook"
+        self.assertIn(f'b"{gd.CI_DEFER_MARK}"', hook.read_text(),
+                      "the hook's BUSY list and glaeda-disk's message must stay the same words")
+
+    def test_a_held_evict_lock_skips_before_the_cap_measurement(self) -> None:
+        """A busy run spent 10-20 s in the cmux-next cap's du before it found evict.lock taken; it now stops first,
+        and its run line names its caller and the holder with when it took the lock."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            (self.root / "evict.owner.json").write_text(json.dumps({
+                "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60,
+                "command": "glaeda-disk --pressure --apply --top 0"}))
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["caller"]), ("eviction_busy", "test"))
+        self.assertEqual((row["evict_owner"]["pid"], row["evict_owner"]["command"]),
+                         (os.getpid(), "glaeda-disk --pressure --apply --top 0"))
+        self.assertIsNotNone(row["evict_owner"]["since"])
+        cap.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_floor_run_waits_for_the_running_eviction_and_then_takes_its_turn(self) -> None:
+        """A mini at 47.8 GiB free against a 50 GiB floor skipped every out-of-band run as eviction_busy while the
+        holder evicted families the floor did not need (glaeda#1897 F2). A run the floor needs waits for its turn."""
+        _, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]) as held, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited for the lock and ran; it did not skip")
+        self.assertEqual(row["evict_floor_wait"], "took its turn")
+        self.assertGreater(held.call_count, 1, "it probed again instead of giving up on the first answer")
+        survey.assert_called()
+
+    def test_the_floor_wait_refuses_a_lock_that_came_free_after_the_deadline(self) -> None:
+        """The deadline bounds the whole run, not just the wait: a holder that releases a moment too late does not
+        buy this run a cap measurement and an eviction past it (router-review F1 on glaeda#1902)."""
+        with mock.patch.object(gd, "eviction_lock_is_held", return_value=False):
+            self.assertFalse(gd.wait_for_evict_lock(time.monotonic() - 0.01),
+                             "free, but only after the deadline")
+            self.assertTrue(gd.wait_for_evict_lock(time.monotonic() + 5.0))
+
+    def test_the_floor_wait_is_bounded_by_what_its_caller_allows(self) -> None:
+        """The gate gives half its timeout as the wait (floor_disk_env), so a short gate never leaves its child
+        waiting past the kill, and the run deadline still bounds it when one is set (router-review F2 on #1902)."""
+        self.addCleanup(setattr, gd, "FLOOR_HOLD", gd.FLOOR_HOLD)
+        gd.FLOOR_HOLD = {1: 1}
+        for env, why in (
+                ({gd.FLOOR_WAIT_ENV: repr(time.time())}, "a caller with no room to wait"),
+                ({gd.FLOOR_WAIT_ENV: repr(time.time() - 5.0)}, "a caller already out of time"),
+                ({gd.RUN_DEADLINE_ENV: repr(time.time() + 30.0)}, "less time left than the deadline margin"),
+        ):
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(gd.floor_evict_wait_until(True), 0.0, why)
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 10.0)}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= 10.0, f"its caller's 10 s, not {gd.EVICT_WAIT_FLOOR_S:g}: {left}")
+        # the caller's timeout starts at its launch, so a slow start eats the wait instead of pushing it past the kill
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: repr(time.time() + 15.0)}), \
+                mock.patch.object(gd.time, "time", return_value=time.time() + 20.0):
+            self.assertEqual(gd.floor_evict_wait_until(True), 0.0, "20 s of start-up spent the 15 s cutoff")
+        with mock.patch.dict(os.environ, {gd.FLOOR_WAIT_ENV: "not a number"}):
+            left = gd.floor_evict_wait_until(True) - time.monotonic()
+            self.assertTrue(0 < left <= gd.EVICT_WAIT_FLOOR_S, f"unreadable: the plain budget, not none: {left}")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for name in (gd.FLOOR_WAIT_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            self.assertGreater(gd.floor_evict_wait_until(True), time.monotonic(), "unbounded caller: the full budget")
+
+    def test_a_wait_at_the_acquisition_measures_the_cap_again(self) -> None:
+        """The holder was evicting while this run waited, so a cap measured before it is spent: a waiter that kept
+        its old budget took young build output the holder had already freed (router-review F1 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        cap = {"used": 3 * gd.GIB, "cap": 4 * gd.GIB, "over": 0, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=cap) as measured:
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(rows[-1]["evict_floor_wait"], "took its turn")
+        self.assertEqual(measured.call_count, 2, "once before the wait, once after it")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], 0.0, "the fresh reading, not the one from before")
+        self.assertTrue(all(call.kwargs.get("measure") for call in measured.call_args_list),
+                        "the second reading is a fresh measurement, not the stale snapshot")
+        survey.assert_called()
+
+    def test_a_cap_reading_that_fails_after_the_wait_takes_the_budget_with_it(self) -> None:
+        """A du that failed or timed out gives None: reading `over` from it raised, and keeping the stale budget
+        would delete output the holder already freed (router-review F2 on glaeda#1902)."""
+        _, _, p_lock, p_pending = self._queue()
+        first = {"used": 6 * gd.GIB, "cap": 4 * gd.GIB, "over": 2 * gd.GIB, "at": time.time()}
+        taken = (self.root / "taken.lock").open("a")
+        self.addCleanup(taken.close)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "eviction_lock_is_held", return_value=False), \
+                mock.patch.object(gd, "acquire_evict_lock", side_effect=[None, taken]), \
+                mock.patch.object(gd, "release_evict_lock"), \
+                mock.patch.object(gd, "wait_for_evict_lock", return_value=True), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", side_effect=[first, None]):
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0, "the run goes on; an unreadable cap is not a crash")
+        self.assertEqual(rows[-1]["cmux_next_ci_over_gib"], None, "no budget from a reading it does not have")
+        self.assertEqual(gd.CMUX_NEXT_CI_OVER, 0)
+        survey.assert_called()
+
+    def test_a_floor_runs_wait_that_expires_says_the_holders_pass_serves_the_floor(self) -> None:
+        """The wait is bounded: it never blocks a floor run behind a long eviction, and the line says who serves."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "EVICT_WAIT_FLOOR_S", 0.05), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=28.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", "expired"))
+        self.assertIn("its pass serves this floor", self.said)
+        survey.assert_not_called()
+
+    def test_a_run_above_the_floor_still_skips_a_held_lock_at_once(self) -> None:
+        """Manual and LaunchAgent runs above the floor keep today's behaviour: no wait, no sleep."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_floor_wait"]), ("eviction_busy", None))
+        self.assertNotIn("serves this floor", self.said)
+        slept.assert_not_called()
+        survey.assert_not_called()
+
+    def test_the_run_line_names_its_caller_without_the_variable(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.CALLER_ENV, None)
+            self.assertTrue(gd.run_caller())
+
+    def test_a_deferred_run_writes_its_reason(self) -> None:
+        lock = self.root / "measure.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply", "--refresh"], free_gib=100.0)
+        survey.assert_not_called()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["skipped"], "measurement_busy")
+
+    def test_a_second_pressure_apply_on_the_host_skips_at_once(self) -> None:
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        lock = self.root / "pressure-pass.lock"  # beside the EVICT_LOCK _main_run uses
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+        self.assertIsNone(gd._PRESSURE_PASS_HANDLE)
+        status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_called()
+        self.assertIsNotNone(gd._PRESSURE_PASS_HANDLE, "the pass keeps the lock for the rest of its run")
+        os.close(gd._PRESSURE_PASS_HANDLE)
+
+    def test_a_second_pressure_apply_skips_before_queueing_behind_a_running_eviction(self) -> None:
+        # 2026-11-21: with the pass lock taken after the evict.lock queue, 8 to 14 pressure applies still waited
+        # in that queue at once on one mini; the second must leave at once, never join the queue
+        self.addCleanup(setattr, gd, "_PRESSURE_PASS_HANDLE", None)
+        gd._PRESSURE_PASS_HANDLE = None
+        with (self.root / "pressure-pass.lock").open("a") as held, (self.root / "evict.lock").open("a") as ev:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(ev, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "wait_for_evict_lock", side_effect=AssertionError("queued")):
+                status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=2.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], "pressure_pass_running")
+
+    def test_the_kill_switch_deletes_nothing_and_says_so(self) -> None:
+        off = self.root / "disk-off"
+        off.write_text("")
+        for over in ({"off": off}, {"policy": {"enabled": False}}):
+            with self.subTest(over=list(over)):
+                (self.root / "runs.jsonl").unlink(missing_ok=True)
+                status, rows, survey, apply = self._main_run(["--pressure", "--apply"], **over)
+                self.assertEqual(status, 0)
+                survey.assert_not_called()
+                apply.assert_not_called()
+                self.assertEqual(len(rows), 1)
+                self.assertTrue(rows[0]["off"])
+                self.assertEqual(rows[0]["reclaimed_gib"], 0.0)
+        self.assertIn("disk-off", gd.__doc__)
+
+    def test_floor_hold_only_below_the_gates_resume_mark(self) -> None:
+        dev = self.root.stat().st_dev
+
+        def fss(free_gib, tmpfs=False):
+            return {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), 460 * gd.GIB, 0, 0, tmpfs)}
+        self.assertEqual(gd.floor_hold(fss(31.9), 30.0, self.root), {dev: 50 * gd.GIB})  # floor 30 + margin 20
+        self.assertEqual(gd.floor_hold(fss(32.0), 30.0, self.root), {})  # the gate has let go
+        self.assertEqual(gd.floor_hold(fss(10.0), 0.0, self.root), {})  # no runner floor
+        self.assertEqual(gd.floor_hold(fss(10.0, tmpfs=True), 30.0, self.root), {})
+
+    def test_runner_git_garbage_younger_than_an_hour_or_open_stays(self) -> None:
+        home, fams = self._runner_checkouts()
+        co = home / "actions-runner-glaeda/_work/cmux/cmux"
+        os.utime(co / ".git/objects/pack/tmp_pack_Ab12Cd")  # a fetch is writing it now
+        held = home / "actions-runner-glaeda-2/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"
+        gd.process_evidence = lambda: ([str(held)], "git index-pack --stdin\n")
+        garbage = [f for f in fams if f.id == gd.RUNNER_GIT_GARBAGE_FAMILY]
+        v = {str(Path(i.path).relative_to(home)): i.verdict for i in gd.survey(garbage, 6, 0)}
+        self.assertEqual(v["actions-runner-glaeda/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"], "recent")
+        self.assertEqual(v["actions-runner-glaeda/_work/cmux/cmux/.git/objects/ab/tmp_obj_Xy98Zw"], "reclaimable")
+        self.assertEqual(v["actions-runner-glaeda-2/_work/cmux/cmux/.git/objects/pack/tmp_pack_Ab12Cd"], "in-use")
+
+    def test_apply_evicts_idle_runner_output_oldest_first_and_rechecks_the_runner(self) -> None:
+        home, fams = self._runner_checkouts()
+        idle = home / "actions-runner-glaeda/_work/cmux/cmux"
+        other = home / "actions-runner-glaeda-2/_work/cmux/cmux"
+        self._age(idle / "cmux-tui/target", hours=30)
+        self._age(other / "Packages/Shared/.build", hours=10)
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = gd.survey(fams, 6, 0)
+            receipt = self.receipt()
+            # a job starts on runner 2 after the survey: the fresh ps before each deletion shows its Worker
+            worker = f"{home}/actions-runner-glaeda-2/bin.2.330.0/Runner.Worker spawnclient 1 2\n"
+            with mock.patch.object(gd, "command_lines", return_value=worker):
+                gd.apply(items, {f.id: f for f in fams}, receipt, None, 6, all_families=fams)
+        recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+        build = [r for r in recs if r["family"] == gd.RUNNER_BUILD_FAMILY]
+        # git garbage goes before any build output that costs a rebuild
+        self.assertEqual({r["family"] for r in recs[:4]}, {gd.RUNNER_GIT_GARBAGE_FAMILY})
+        self.assertEqual(build[0]["path"], str(idle / "cmux-tui/target"))  # least recently modified first
+        self.assertEqual(build[1]["path"], str(other / "Packages/Shared/.build"))
+        self.assertEqual({r["outcome"] for r in build if r["path"].startswith(str(other) + "/")},
+                         {"changed:in-use"})
+        self.assertEqual({r["outcome"] for r in build if r["path"].startswith(str(idle) + "/")}, {"reclaimed"})
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertFalse((idle / "Packages/macOS/CmuxNext/.build").exists())
+        self.assertTrue((other / "cmux-tui/target").exists())
+        self.assertFalse((other / ".git/objects/pack/tmp_pack_Ab12Cd").exists())
+        self.assertTrue((other / ".git/objects/pack/pack-1234.pack").exists())
+        self.assertTrue((idle / "Sources/target").exists())
+        self.assertTrue((idle / ".git").is_dir())
+        self.assertFalse((idle.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
+        self.assertTrue((idle.parent / ".glaeda-state/SourcePackages").exists())
+        self.assertTrue((idle.parent / ".glaeda-state/cas").exists())
+        self.assertTrue((other.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
+
+    def test_a_hygiene_pass_keeps_runner_submodule_stores_and_still_prunes_build_output(self) -> None:
+        """Git metadata in a runner workspace is never stale cache: .git/modules (the stores its submodule checkouts'
+        gitfiles name) survives a pressure pass however old, while DerivedData and other build output still go.
+        2026-10-28: a workspace without .git/modules failed the warm nightly-next checkout with `fatal: not a
+        git repository: ghostty/../.git/modules/ghostty`."""
+        home, fams = self._runner_checkouts()
+        idle = home / "actions-runner-glaeda/_work/cmux/cmux"
+        store = idle / ".git/modules/ghostty"
+        (store / "objects/pack").mkdir(parents=True)
+        (store / "objects/pack/pack-5678.pack").write_bytes(b"\0" * 4096)
+        (store / "HEAD").write_text("0" * 40 + "\n")
+        (idle / "ghostty").mkdir()
+        (idle / "ghostty/.git").write_text("gitdir: ../.git/modules/ghostty\n")
+        self._age(home / "actions-runner-glaeda/_work", hours=30)  # the store is as old as the build output
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "command_lines", return_value="/sbin/launchd\n"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertFalse((idle.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
+        self.assertTrue((store / "objects/pack/pack-5678.pack").is_file())
+        self.assertTrue((store / "HEAD").is_file())
+        self.assertEqual((idle / "ghostty/.git").read_text(), "gitdir: ../.git/modules/ghostty\n")
+
+    def test_runner_git_garbage_stays_inside_the_runners_work(self) -> None:
+        home, _ = self._runner_checkouts()
+        outside = self.root / "main-clone/.git"
+        (outside / "objects/pack").mkdir(parents=True)
+        (outside / "objects/pack/tmp_pack_Zz12Yy").write_bytes(b"\0" * 1024)
+        co = home / "actions-runner-glaeda/_work/cmux/cmux"
+        shutil.rmtree(co / ".git")
+        (co / ".git").symlink_to(outside)  # a .git that points at a clone outside _work
+        other = home / "actions-runner-glaeda-2/_work/cmux/cmux/.git/objects"
+        shutil.rmtree(other / "pack")
+        (other / "pack").symlink_to(outside / "objects/pack")
+        found = [str(p) for w in ("actions-runner-glaeda", "actions-runner-glaeda-2")
+                 for p in gd.runner_git_garbage(home / w / "_work")]
+        self.assertFalse([f for f in found if "Zz12Yy" in f or f.startswith(str(co))], found)
+        self.assertIn(str(other / "ab/tmp_obj_Xy98Zw"), found)
+
+    def test_runner_job_live_matches_either_spelling_of_the_runner_path(self) -> None:
+        real = self.root / "real-home/actions-runner-glaeda"
+        real.mkdir(parents=True)
+        (self.root / "home-link").symlink_to(self.root / "real-home")
+        runner = self.root / "home-link/actions-runner-glaeda"
+        self.assertIn("running a job", gd.runner_job_live(runner, f"{real.resolve()}/bin/Runner.Worker spawnclient 1 2\n"))
+        self.assertIn("running a job", gd.runner_job_live(runner, f"{runner}/bin/Runner.Worker spawnclient 1 2\n"))
+        self.assertEqual(gd.runner_job_live(runner, f"{runner}-2/bin/Runner.Worker spawnclient 1 2\n"), "")
+
+    def _floor_disk(self, free_gib: float, freed_gib: float = 10.0):
+        """A fake HOME volume at free_gib; each removal frees freed_gib. Returns (patches, removed paths)."""
+        state = {"free": int(free_gib * gd.GIB)}
+        removed: list[str] = []
+        real_remove = gd.remove
+
+        def remove(path, after_rename=None):
+            real_remove(path, after_rename)
+            removed.append(str(path))
+            state["free"] += int(freed_gib * gd.GIB)
+        return (mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)),
+                mock.patch.object(gd, "remove", side_effect=remove)), removed
+
+    def _idle_checkouts(self, hours: dict[str, float]) -> tuple[Path, dict[str, Path]]:
+        home, _ = self._runner_checkouts()
+        cos = {}
+        for name, age in hours.items():
+            runner = home / name
+            if not runner.exists():
+                (runner / "glaeda-hooks").mkdir(parents=True)
+                (runner / ".runner").write_text("{}")
+                (runner / "_work/cmux/cmux/.git").mkdir(parents=True)
+            (runner / "_diag").mkdir(exist_ok=True)
+            (runner / "_diag/Worker_20261021-000000-utc.log").write_text("job")
+            self._age(runner, hours=age)
+            cos[name] = runner / "_work/cmux/cmux"
+        return home, cos
+
+    def test_idle_runner_checkouts_stay_while_above_the_floor(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+        patches, removed = self._floor_disk(32.5)  # over the gate's resume mark (floor + GATE_DISK_RESUME_GIB)
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 0.0, home), 0)  # no runner floor
+        self.assertEqual(removed, [])
+        self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def _git_checkout(self, co: Path, pushed: bool = True) -> None:
+        """A real checkout at co whose HEAD is on origin/main (pushed) or one commit past it."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", os.fspath(co), *args], env=env, check=True, capture_output=True)
+        if (co / ".git").exists():
+            shutil.rmtree(co / ".git")
+        co.mkdir(parents=True, exist_ok=True)
+        git("init", "-q")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("checkout", "-q", "--detach")
+        if not pushed:
+            git("commit", "-q", "--allow-empty", "-m", "local only")
+        (co / "build-output.o").write_text("x")  # untracked build output never keeps a checkout
+
+    def _git_worktree_commit(self, co: Path) -> None:
+        """A detached linked worktree of co (inside its _work dir) with a commit no ref names."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        wt = co.parent / "linked"
+        if wt.exists():
+            shutil.rmtree(wt)
+        subprocess.run(["git", "-C", os.fspath(co), "worktree", "add", "-q", "--detach", os.fspath(wt)], env=env,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", os.fspath(wt), "commit", "-q", "--allow-empty", "-m", "only in the worktree"],
+                       env=env, check=True, capture_output=True)
+
+    def test_a_dedicated_runners_warm_state_is_kept_by_role(self) -> None:
+        """The dedicated nightly builder's checkout and its DerivedData cache stay by role (ROLE_KEEP_MARKER), however
+        old; its _temp leftovers, other runners' checkouts and other caches still go by age."""
+        stale = gd.RUNNER_STALE_CHECKOUT_HOURS
+        names = {"actions-runner-glaeda-nightly-next": stale + 30, "actions-runner-glaeda": stale + 30}
+        home, cos = self._idle_checkouts(names)
+        patch_home = mock.patch.object(gd, "HOME", home)
+        patch_home.start()
+        self.addCleanup(patch_home.stop)
+        runner = home / "actions-runner-glaeda-nightly-next"
+        cache = home / "Library/Caches/cmux-nightly-next/mini-glaeda-nightly-next"
+        (cache / "DerivedData").mkdir(parents=True)
+        other_cache = home / "Library/Caches/cmux-nightly-next/someone-else"
+        other_cache.mkdir(parents=True)
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cos[runner.name]), os.fspath(cache)]))
+        self.assertTrue(gd.toolchain_held(cos[runner.name]))
+        self.assertTrue(gd.toolchain_held(cos[runner.name] / ".git"), "inside a kept path")
+        self.assertTrue(gd.toolchain_held(cache / "DerivedData"))
+        self.assertFalse(gd.toolchain_held(other_cache))
+        self.assertFalse(gd.toolchain_held(cos["actions-runner-glaeda"]))
+        self.assertFalse(gd.toolchain_held(runner / "_work/_temp"), "_temp is not kept")
+        self.assertTrue(gd.toolchain_held(runner), "above a kept path: the runner dir is never taken whole")
+        with self.assertRaises(OSError):
+            gd.remove(cache)
+        # a marker naming the runner, its _work, the home or a path outside home keeps nothing more
+        for bad in (os.fspath(runner), os.fspath(runner / "_work"), os.fspath(home), "/tmp", "relative"):
+            with self.subTest(bad=bad):
+                (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([bad]))
+                self.assertEqual(gd.role_keep(), ())
+        # an unenrolled directory's marker counts for nothing
+        stray = home / "actions-runner-glaeda-stray"
+        stray.mkdir()
+        (stray / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cache)]))
+        self.assertEqual(gd.role_keep(), ())
+        # a symlink named like a dedicated runner, to an enrolled runner elsewhere, keeps nothing
+        outside = self.root / "outside-runner"
+        (outside / "glaeda-hooks").mkdir(parents=True)
+        (outside / ".runner").write_text("{}")
+        (outside / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cache)]))
+        (home / "actions-runner-glaeda-linked").symlink_to(outside)
+        self.assertEqual(gd.role_keep(), ())
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(cos[runner.name]), os.fspath(cache)]))
+        gd.process_evidence = lambda: ([], "")
+        for name in names:
+            self._git_checkout(cos[name])
+            self._age(home / name, hours=names[name])
+        patches, removed = self._floor_disk(400.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])], "only the pool runner's old checkout goes")
+
+    def test_a_dedicated_runners_temp_goes_by_age_with_or_without_keep(self) -> None:
+        home = self.root / "home"
+        for name, keep in (("actions-runner-glaeda-nightly-next", True), ("actions-runner-glaeda-ios-internal", False),
+                           ("actions-runner-glaeda-2", False)):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            (runner / "_work/_temp").mkdir(parents=True)
+            if name != "actions-runner-glaeda-2":
+                (runner / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
+            if keep:
+                (runner / gd.ROLE_KEEP_MARKER).write_text("[]")
+        # a symlink named like a dedicated runner, to one outside the home: its _temp is never swept
+        outside = self.root / "outside-runner"
+        (outside / "glaeda-hooks").mkdir(parents=True)
+        (outside / ".runner").write_text("{}")
+        (outside / "_work/_temp").mkdir(parents=True)
+        (outside / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
+        (home / "actions-runner-glaeda-linked").symlink_to(outside)
+        # a real runner whose _temp is a symlink out of the home: not swept either
+        swapped = home / "actions-runner-glaeda-swapped"
+        (swapped / "glaeda-hooks").mkdir(parents=True)
+        (swapped / ".runner").write_text("{}")
+        (swapped / "_work").mkdir()
+        (swapped / "_work/_temp").symlink_to(outside / "_work/_temp")
+        (swapped / "glaeda-hooks/dedicated-admit.sh").write_text("#!/bin/sh\n")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            fams = [f for f in gd.default_families() if f.id == "dedicated-runner-temp"]
+        roots = sorted(os.fspath(f.root.relative_to(home)) for f in fams)
+        self.assertEqual(roots, ["actions-runner-glaeda-ios-internal/_work/_temp",
+                                 "actions-runner-glaeda-nightly-next/_work/_temp"], "a pool runner's _temp is not this")
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            pool = [f for f in gd.default_families() if f.id == gd.RUNNER_TEMP_FAMILY]
+        # the pool runner's _temp is runner-temp; a linked runner or _temp is neither family's
+        self.assertEqual([os.fspath(f.root.relative_to(home)) for f in pool], ["actions-runner-glaeda-2/_work/_temp"])
+        for fam in fams:  # at least DEFAULT_AGE_HOURS idle, however tight the disk (the pressure window is shorter)
+            self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+            self.assertIsNone(fam.max_idle_hours)
+            self.assertEqual(gd.idle_window(fam, 0.5), gd.DEFAULT_AGE_HOURS)
+        # a job's scratch wider than cmux_active's bounded search is not "busy" forever: age decides
+        big = home / "actions-runner-glaeda-ios-internal/_work/_temp/archive-scratch"
+        big.mkdir()
+        for i in range(5001):
+            (big / f"f{i}").write_bytes(b"")
+        self.assertTrue(gd.cmux_active(big), "the bounded search alone would call it busy")
+        self.assertFalse(gd.job_busy(fams[0], big))
+
+    def test_a_pool_runners_temp_goes_by_age_only_while_its_runner_has_no_job(self) -> None:
+        """What a killed job left in a pool runner's _work/_temp (cmux17's actions-runner-glaeda-2, 2026-11-22: "No
+        space left on device" there) goes once idle DEFAULT_AGE_HOURS, on a pressure pass or a sweep, but never
+        while that runner has a Runner.Worker, and never the runner's own file-command or ci-derived-data entries."""
+        home = self.root / "home"
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            runner = home / name
+            (runner / "glaeda-hooks").mkdir(parents=True)
+            (runner / ".runner").write_text("{}")
+            temp = runner / "_work/_temp"
+            make(temp / "killed-job-scratch", age_hours=8)
+            make(temp / "_runner_file_commands", age_hours=8)
+            make(temp / "cmux-derived-data-tests-1", age_hours=8)
+            make(temp / "fresh-job-scratch", age_hours=0.1)
+            (temp / "leftover.tar").write_bytes(b"\0" * (2 * 1024 * 1024))
+            t = time.time() - 8 * 3600
+            os.utime(temp / "leftover.tar", (t, t))
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "DARWIN", True):
+            fams = [f for f in gd.default_families() if f.id == gd.RUNNER_TEMP_FAMILY]
+        self.assertEqual(sorted(os.fspath(f.root.relative_to(home)) for f in fams),
+                         ["actions-runner-glaeda-2/_work/_temp", "actions-runner-glaeda/_work/_temp"])
+        for fam in fams:
+            self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+            self.assertFalse(gd.job_busy(fam, fam.root / "killed-job-scratch"))
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+                                           f"{home}/actions-runner-glaeda/bin/Runner.Listener run\n")
+        idle, live = "actions-runner-glaeda/_work/_temp/", "actions-runner-glaeda-2/_work/_temp/"
+        for mode in ("pressure", "sweep"):
+            with self.subTest(mode=mode), mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                v = {os.fspath(Path(i.path).relative_to(home)): (i.verdict, i.reasons) for i in gd.survey(fams, 6, 0)}
+                for rel in ("killed-job-scratch", "leftover.tar"):
+                    self.assertEqual(v[idle + rel][0], "reclaimable", rel)
+                    self.assertEqual(v[live + rel],
+                                     ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]), rel)
+                self.assertNotEqual(v[idle + "fresh-job-scratch"][0], "reclaimable")
+                for rel in ("_runner_file_commands", "cmux-derived-data-tests-1"):
+                    self.assertNotIn(idle + rel, v)
+        # apply: the runner that took a job since the survey keeps its _temp (a fresh ps before each delete)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            items = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+        self.assertEqual(sorted(os.fspath(Path(i.path).relative_to(home)) for i in items),
+                         [idle + "killed-job-scratch", idle + "leftover.tar"])
+        with mock.patch.object(gd, "command_lines",
+                               lambda: f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            # by name: default_families lists runners in HOME.glob's directory order, which the filesystem picks
+            glaeda = next(f for f in fams if gd.runner_temp_runner(f).name == "actions-runner-glaeda")
+            self.assertTrue(gd.runner_job_live(gd.runner_temp_runner(glaeda), gd.command_lines()))
+
+    @twelve_hour_ages
+    def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
+        """Old runner work dirs go by age: a checkout no job used for DEFAULT_AGE_HOURS goes whatever the free space,
+        unless git would lose something (a commit on no remote-tracking ref) or holds a lock; younger ones stay."""
+        stale = gd.RUNNER_STALE_CHECKOUT_HOURS
+        self.assertEqual(stale, 12.0)
+        names = {"actions-runner-glaeda": stale + 1, "actions-runner-glaeda-2": stale + 30,
+                 "actions-runner-glaeda-3": stale - 1, "actions-runner-glaeda-4": stale + 2,
+                 "actions-runner-glaeda-5": stale + 3, "actions-runner-glaeda-6": stale + 3,
+                 "actions-runner-glaeda-7": stale + 3, "actions-runner-glaeda-8": stale + 3}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for floor in (30.0, 0.0):
+            with self.subTest(floor=floor):
+                for name, age in names.items():
+                    self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-4")
+                    if name == "actions-runner-glaeda-5":
+                        (cos[name] / ".git/index.lock").write_text("")
+                    if name == "actions-runner-glaeda-6":
+                        (cos[name] / ".git/FETCH_HEAD.lock").write_text("")
+                    if name == "actions-runner-glaeda-7":
+                        (cos[name] / ".git/rebase-merge").mkdir()
+                    if name == "actions-runner-glaeda-8":  # a linked worktree holds the only copy of a commit
+                        self._git_worktree_commit(cos[name])
+                    self._age(home / name, hours=age)
+                patches, removed = self._floor_disk(400.0)  # far above the floor and its target
+                receipt = self.receipt()
+                with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertGreater(gd.evict_idle_runner_checkouts(receipt, floor, home), 0)
+                self.assertEqual(sorted(removed), sorted([str(cos["actions-runner-glaeda-2"]),
+                                                          str(cos["actions-runner-glaeda"])]))
+                for name in ("actions-runner-glaeda-3", "actions-runner-glaeda-4", "actions-runner-glaeda-5",
+                             "actions-runner-glaeda-6", "actions-runner-glaeda-7", "actions-runner-glaeda-8"):
+                    self.assertTrue((cos[name] / ".git").is_dir(), name)
+                self.assertIn("unused for 12 h", out.getvalue())
+                why = {Path(r["path"]).parts[-4]: (r["outcome"], r["reasons"][0])
+                       for r in map(json.loads, receipt.read_text().splitlines())}
+                self.assertEqual(why["actions-runner-glaeda-4"], ("blocked:git", "a commit here is on no remote-tracking ref"))
+                self.assertEqual(why["actions-runner-glaeda-5"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-6"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-7"], ("blocked:git", "git holds a lock in it"))
+                self.assertEqual(why["actions-runner-glaeda-8"],
+                                 ("blocked:git", "a commit here is on no remote-tracking ref"))
+                self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
+
+    def _packs(self, co: Path, gib: float) -> None:
+        """A sparse .pack of gib GiB in co's object store (no .idx, so git never reads it)."""
+        pack = co / ".git/objects/pack"
+        pack.mkdir(parents=True, exist_ok=True)
+        with (pack / "pack-0000.pack").open("wb") as f:
+            f.truncate(int(gib * gd.GIB))
+        config = co / ".git/config"
+        if "url" not in (config.read_text() if config.exists() else ""):  # the repository it is a checkout of
+            with config.open("a") as f:
+                f.write(f'[remote "origin"]\n\turl = https://github.com/manaflow-ai/{co.name}.git\n')
+
+    @twelve_hour_ages
+    def test_a_bloated_runner_checkout_goes_once_quiet_at_any_free_space(self) -> None:
+        """2026-10-27: one runner per mini held a 6.8 GiB full-history checkout with 22k remote refs while its
+        siblings held about 0.55 GiB. Far above the floor, it goes once its runner is quiet; its siblings stay."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-3": 2,
+                 "actions-runner-glaeda-11": 2, "actions-runner-glaeda-12": 0.05}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name in ("actions-runner-glaeda-11", "actions-runner-glaeda-12") else 0.55)
+            self._age(home / name, hours=age)
+        self.assertEqual(set(gd.bloated_runner_checkouts(list(cos.values()))),
+                         {str(cos["actions-runner-glaeda-11"]), str(cos["actions-runner-glaeda-12"])})
+        patches, removed = self._floor_disk(400.0)  # far above the floor and its target
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda-11"])])
+        self.assertTrue(cos["actions-runner-glaeda-12"].is_dir(), "used minutes ago: its job may be finishing")
+        self.assertIn("bloated: ", out.getvalue())
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0][:9]), ("reclaimed", "bloated: "))
+
+    def test_bloat_is_relative_to_the_same_repositorys_siblings(self) -> None:
+        root = self.root / "bloat"
+        cos = []
+        for i, (repo, size) in enumerate([("cmux", 6.8), ("cmux", 0.55), ("cmux", 0.6), ("big", 9.0), ("big", 8.0),
+                                          ("lone", 9.0), ("cmux", 1.9)]):
+            co = root / f"r{i}/_work/{repo}/{repo}"
+            self._packs(co, size)
+            cos.append(co)
+        # the 6.8 GiB cmux one only: big is big everywhere, lone has no sibling, 1.9 GiB is under the 2 GiB minimum
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(gd.git_pack_bytes(cos[1] / ".git"), int(0.55 * gd.GIB))
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_BLOAT_RATIO", float("inf")):  # a reserved host keeps legacy ages
+            self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
+    @twelve_hour_ages
+    def test_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0]), ("blocked:git", "a commit here is on no remote-tracking ref"))
+
+    def _own_checkout_fixture(self) -> tuple[Path, dict[str, Path]]:
+        """Three runners just used (none quiet): glaeda-11's cmux checkout is bloated, its siblings are not."""
+        names = {"actions-runner-glaeda": 0.01, "actions-runner-glaeda-2": 0.01, "actions-runner-glaeda-11": 0.01}
+        home, cos = self._idle_checkouts(names)
+        for name in names:
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            (home / name / ".runner").write_text('\ufeff{"agentName": "%s"}' % name.replace("actions-runner-", "mini-"))
+            self._age(cos[name] / ".git", hours=1)  # the last job's checkout, an hour ago
+        return home, cos
+
+    def _starting(self, runner: str = "actions-runner-glaeda-11", ago_s: float = 20.0):
+        """This runner's job started ago_s ago; the hook runs with its environment."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(gd, "runner_job_started", return_value=time.time() - ago_s))
+        stack.enter_context(mock.patch.dict(os.environ, {"RUNNER_NAME": runner.replace("actions-runner-", "mini-")}))
+        stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+        # who uses the checkout, from what process_evidence opened (checkout_users has its own test)
+        def users(co):
+            opened, cmds = gd.process_evidence()
+            return next((f"pid 9 ({p})" for p in opened if p == os.fspath(co) or p.startswith(f"{co}/")), ""), cmds
+        stack.enter_context(mock.patch.object(gd, "checkout_users", side_effect=users))
+        return stack
+
+    def test_the_job_start_takes_its_own_bloated_checkouts_git(self) -> None:
+        """A runner that takes job after job is never quiet, so its bloated checkout never went (the tour runner on all
+        11 minis, 2026-10-27). At job-started, before any step, the job's own workspace loses its .git when it is
+        bloated and git loses nothing. The workspace and its files stay; a sibling that is not bloated stays whole."""
+        home, cos = self._own_checkout_fixture()
+        bloated = cos["actions-runner-glaeda-11"]
+        # the runner's Worker is live (it is this job's): that does not keep it; the hook's cwd is checkout_users'
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
+            self.assertEqual(gd.evict_own_runner_checkout(cos["actions-runner-glaeda"], receipt, home), "")
+            note = gd.evict_own_runner_checkout(bloated, receipt, home)
+        self.assertIn("removed", note)
+        self.assertEqual(removed, [str(bloated / ".git")])
+        self.assertTrue((bloated / "build-output.o").is_file(), "only .git goes; steps before checkout run in the dir")
+        self.assertTrue((cos["actions-runner-glaeda"] / ".git").is_dir())
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["family"], rec["outcome"], rec["path"]),
+                         (gd.RUNNER_CHECKOUT_AT_START_FAMILY, "reclaimed", str(bloated / ".git")))
+
+    def test_the_job_start_keeps_the_bloated_checkouts_submodule_stores(self) -> None:
+        """Only the checkout's own store goes: its submodules' stores (.git/modules) stay under an empty repository,
+        so the submodule checkouts' gitfiles still name a store and a warm `git submodule update` reuses it."""
+        home, cos = self._own_checkout_fixture()
+        bloated = cos["actions-runner-glaeda-11"]
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        upstream = self.root / "ghostty-upstream"
+        for args in (["init", "-q", os.fspath(upstream)],
+                     ["-C", os.fspath(upstream), "commit", "-q", "--allow-empty", "-m", "g"]):
+            subprocess.run(["git", *args], check=True, capture_output=True, env=env)
+        store = bloated / ".git/modules/ghostty"
+        # what `git submodule update` leaves: the store in .git/modules, a gitfile in the submodule checkout
+        store.parent.mkdir()
+        subprocess.run(["git", "clone", "-q", f"--separate-git-dir={store}", os.fspath(upstream),
+                        os.fspath(bloated / "ghostty")], check=True, capture_output=True, env=env)
+        self._age(bloated / ".git", hours=1)
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        patches, removed = self._floor_disk(400.0)
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
+            note = gd.evict_own_runner_checkout(bloated, self.receipt(), home)
+        self.assertIn("kept its submodule stores", note)
+        self.assertEqual([(Path(r).name, Path(r).parent.parent) for r in removed], [("old", bloated)])  # old store only
+        self.assertFalse(any(p.name.startswith(".glaeda-") for p in bloated.iterdir()))
+        self.assertTrue((store / "HEAD").is_file())
+        self.assertEqual(gd.git_pack_bytes(bloated / ".git"), 0)  # the bloat is gone
+        run = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True, env=env)  # noqa: E731
+        self.assertEqual(run("-C", os.fspath(bloated), "rev-parse", "--git-dir").returncode, 0)  # a repository still
+        self.assertEqual(run("-C", os.fspath(bloated / "ghostty"), "rev-parse", "--git-dir").returncode, 0)
+
+    def test_a_kept_store_is_refused_before_anything_moves(self) -> None:
+        co = self.root / "ws"
+        (co / ".git/modules/ghostty").mkdir(parents=True)
+        (co / ".git/HEAD").write_text("ref: refs/heads/main\n")
+        with mock.patch.object(gd, "toolchain_held", side_effect=lambda p, fresh=False: p == co / ".git"):
+            with self.assertRaises(OSError):
+                gd.remove_checkout_store(co)
+        self.assertEqual(sorted(p.name for p in (co / ".git").iterdir()), ["HEAD", "modules"])
+        self.assertEqual([p.name for p in co.iterdir()], [".git"])
+
+    def test_the_job_start_keeps_the_whole_store_when_git_cannot_make_a_new_one(self) -> None:
+        home, cos = self._own_checkout_fixture()
+        bloated = cos["actions-runner-glaeda-11"]
+        (bloated / ".git/modules/ghostty").mkdir(parents=True)
+        (bloated / ".git/modules/ghostty/HEAD").write_text("ref: refs/heads/main\n")
+        self._age(bloated / ".git", hours=1)
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        patches, removed = self._floor_disk(400.0)
+        real_run = subprocess.run
+        failing = lambda argv, *a, **k: (subprocess.CompletedProcess(argv, 1) if argv[:2] == ["git", "init"]  # noqa: E731
+                                         else real_run(argv, *a, **k))
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting(), \
+                mock.patch.object(gd.subprocess, "run", side_effect=failing):
+            note = gd.evict_own_runner_checkout(bloated, self.receipt(), home)
+        self.assertIn("could not remove", note)
+        self.assertEqual(removed, [])
+        self.assertTrue((bloated / ".git/modules/ghostty/HEAD").is_file())
+        self.assertGreater(gd.git_pack_bytes(bloated / ".git"), 0)
+        self.assertFalse(any(p.name.startswith(".glaeda-") for p in bloated.iterdir()))
+
+    def test_the_job_start_keeps_its_own_bloated_checkout_on_any_veto(self) -> None:
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed")
+        cases = {  # what is wrong -> (process evidence, unpushed commit, reserved, expected receipt outcome or None)
+            "an open file in its .git": (lambda co: ([os.fspath(co / ".git/objects/pack/pack-0000.pack")], ""), False, "", "changed:in-use"),
+            "a process working in it": (lambda co: ([os.fspath(co)], ""), False, "", "changed:in-use"),
+            "a command names it": (lambda co: ([], f"git -C {co} gc"), False, "", "changed:in-use"),
+            "no process evidence": (lambda co: no_evidence, False, "", "changed:in-use"),
+            "a commit only it has": (lambda co: ([], ""), True, "", "blocked:git"),
+            "a reserved host": (lambda co: ([], ""), False, "reserved by x", None),
+            "a live linked worktree": (lambda co: ([], ""), "worktree", "", "changed:in-use"),
+        }
+        for what, (evidence, unpushed, reserved, outcome) in cases.items():
+            with self.subTest(what):
+                self.root = Path(tempfile.mkdtemp(dir=self.root))
+                home, cos = self._own_checkout_fixture()
+                bloated = cos["actions-runner-glaeda-11"]
+                if unpushed == "worktree":
+                    wt = self.root / "temp/cmux-next-base"
+                    wt.parent.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["git", "-C", os.fspath(bloated), "worktree", "add", "-q", "--detach", os.fspath(wt)],
+                                   check=True, capture_output=True, env={"PATH": "/usr/bin:/bin:/opt/homebrew/bin",
+                                                                          "HOME": os.fspath(self.root)})
+                    self._age(bloated / ".git", hours=1)
+                elif unpushed:
+                    self._git_checkout(bloated, pushed=False)
+                    self._packs(bloated, 6.8)
+                    self._age(bloated / ".git", hours=1)
+                ev = evidence(bloated)
+                gd.process_evidence = ev if callable(ev) else (lambda ev=ev: ev)
+                patches, removed = self._floor_disk(400.0)
+                receipt = self.receipt()
+                with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                        self._starting():
+                    note = gd.evict_own_runner_checkout(bloated, receipt, home)
+                self.assertEqual(removed, [])
+                self.assertTrue((bloated / ".git").is_dir())
+                if outcome is None:
+                    self.assertEqual(note, "")
+                    self.assertFalse(receipt.exists() and receipt.read_text())
+                else:
+                    self.assertIn("kept", note)
+                    (rec,) = map(json.loads, receipt.read_text().splitlines())
+                    self.assertEqual(rec["outcome"], outcome)
+
+    def test_checkout_users_skips_only_this_process_and_its_ancestors(self) -> None:
+        co = self.root / "r/_work/cmux/cmux"
+        me, parent, grand = os.getpid(), os.getppid(), 77001
+        ps = f"{me} {parent} glaeda-disk\n{parent} {grand} hook\n{grand} 1 job-started.sh\n555 1 swift test\n"
+
+        def lsof(rows):
+            return "".join(f"p{pid}\nfcwd\nn{path}\n" for pid, path in rows)
+        cases = [([(grand, os.fspath(co)), (parent, "/")], ""),  # the hook shell's cwd is the workspace
+                 ([(grand, os.fspath(co)), (555, os.fspath(co) + "/Sources")], "pid 555 (swift test)"),
+                 ([(555, os.fspath(co) + "-old/x")], "")]  # a sibling name is not inside it
+        for rows, want in cases:
+            with self.subTest(want=want), mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                    subprocess.CompletedProcess(argv, 0, ps if argv[0] == "ps" else lsof(rows), ""))):
+                self.assertEqual(gd.checkout_users(co)[0], want)
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")), \
+                self.assertRaises(gd.NoEvidence):
+            gd.checkout_users(co)
+        # relative worktree backlinks (git worktree add --relative-paths) resolve from worktrees/<name>
+        wt = self.root / "rel/_work/cmux/cmux/.git/worktrees/base"
+        wt.mkdir(parents=True)
+        (wt / "gitdir").write_text("../../../../elsewhere/.git\n")  # .git/worktrees/base -> _work/cmux/elsewhere
+        self.assertEqual(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux"), [], "its directory is gone")
+        (self.root / "rel/_work/cmux/elsewhere").mkdir()
+        self.assertEqual(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux"),
+                         [os.fspath(self.root / "rel/_work/cmux/elsewhere")])
+        # an absorbed submodule's own linked worktree (git -C cmux/ghostty worktree add ...) counts too
+        sub = self.root / "rel/_work/cmux/cmux/.git/modules/ghostty"
+        (sub / "objects").mkdir(parents=True)
+        (sub / "HEAD").write_text("ref: refs/heads/main\n")
+        (sub / "worktrees/g1").mkdir(parents=True)
+        (self.root / "ghostty-wt").mkdir()
+        (sub / "worktrees/g1/gitdir").write_text(os.fspath(self.root / "ghostty-wt/.git") + "\n")
+        self.assertEqual(sorted(gd.live_linked_worktrees(self.root / "rel/_work/cmux/cmux")),
+                         sorted([os.fspath(self.root / "rel/_work/cmux/elsewhere"), os.fspath(self.root / "ghostty-wt")]))
+
+    def test_the_job_start_judges_only_an_enrolled_runners_checkout_from_its_environment(self) -> None:
+        home, cos = self._own_checkout_fixture()
+        stray = self.root / "elsewhere/_work/cmux/cmux"
+        self._packs(stray, 6.8)
+        bloated = cos["actions-runner-glaeda-11"]
+        with mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd, "process_evidence", side_effect=AssertionError("judged")):
+            with self._starting():
+                self.assertEqual(gd.evict_own_runner_checkout(stray, self.receipt(), home), "")
+                self.assertEqual(gd.evict_own_runner_checkout(bloated.parent, self.receipt(), home), "")
+            with self._starting(runner="actions-runner-glaeda-2"):  # another runner's job: never this workspace
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting(ago_s=gd.RUNNER_JOB_START_WINDOW_S + 60):  # a later step of a long job
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting(), mock.patch.object(gd, "runner_job_started", return_value=None):  # no job here
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+            with self._starting():  # this job already checked out: its index is newer than its start
+                os.utime(bloated / ".git/index")
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+                self._age(bloated / ".git/index", hours=1)
+            with self._starting(), mock.patch.object(gd, "disk_off", return_value="disk-off exists"):
+                self.assertEqual(gd.evict_own_runner_checkout(bloated, self.receipt(), home), "")
+        called = []
+        with mock.patch.object(gd, "evict_own_runner_checkout", side_effect=lambda *a: called.append(a) or ""), \
+                mock.patch.object(gd, "RUN_LOG", self.root / "runs.jsonl"), mock.patch.object(gd, "disk_off", return_value=""):
+            for env in ({}, {"GITHUB_WORKSPACE": "/w"}, {"GITHUB_WORKSPACE": "/w", "RUNNER_NAME": "r"}):
+                with mock.patch.dict(os.environ, env, clear=False):
+                    for key in {"GITHUB_WORKSPACE", "RUNNER_NAME"} - set(env):
+                        os.environ.pop(key, None)
+                    self.assertEqual(gd.main(["--own-runner-checkout", "--receipt", os.fspath(self.receipt())]), 0)
+        self.assertEqual([a[0] for a in called], [Path("/w")])
+        (line,) = map(json.loads, (self.root / "runs.jsonl").read_text().splitlines())
+        self.assertEqual(line["mode"], "own-runner-checkout")
+
+    @twelve_hour_ages
+    def test_past_the_target_under_the_floor_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        """Under the floor the last resort takes quiet checkouts without the git veto only until the target; a
+        bloated one past it goes only when git loses nothing."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(31.0, freed_gib=30.0)  # under the resume mark; one removal reaches 61
+        with mock.patch.object(gd, "runner_checkout_last_use",  # the bloated one was used last, so it sorts last
+                               side_effect=lambda r, c: time.time() - 3600 * (1 if r.name.endswith("-11") else 2)), \
+                patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(len(removed), 1)
+        self.assertNotIn(str(cos["actions-runner-glaeda-11"]), removed)
+        self.assertTrue((cos["actions-runner-glaeda-11"] / ".git").is_dir())
+
+    def test_the_git_veto_keeps_a_commit_only_a_submodule_has(self) -> None:
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> None:
+            subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True)
+        co = self.root / "sub/_work/cmux/cmux"
+        self._git_checkout(co)
+        for gitdir in (co / ".git/modules/ghostty", co / ".git/modules/ghostty/modules/nested"):
+            gitdir.parent.mkdir(parents=True, exist_ok=True)
+            git(gitdir.parent, "init", "-q", "--bare", gitdir.name)
+            git(gitdir, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "base")
+            git(gitdir, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        nested = co / ".git/modules/ghostty/modules/nested"
+        git(nested, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty/modules/nested is on no remote-tracking ref")
+        git(nested, "update-ref", "refs/remotes/origin/main", "HEAD")
+        embedded = co / "vendor/lib"
+        embedded.mkdir(parents=True)
+        git(embedded, "init", "-q")
+        git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
+        sha = subprocess.run(
+            ["git", "-C", os.fspath(embedded), "rev-parse", "HEAD"], env=env, check=True, capture_output=True,
+            text=True).stdout.strip()
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/lib")  # a gitlink in the index
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its own repository in the work tree")
+        shutil.rmtree(embedded / ".git")
+        (embedded / ".git").write_text("gitdir: ../../.git/modules/lib\n")  # absorbed: followed into its work tree
+        inner = embedded / "deeper"
+        inner.mkdir()
+        git(inner, "init", "-q")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
+        (embedded / ".git").unlink()
+        shutil.rmtree(inner)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "", "an uninitialized submodule has no repository here")
+        (co / ".git/index").write_bytes(b"not an index")  # git cannot list it: doubt keeps it
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of cmux")
+        (co / ".git/index").unlink()
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        # refs beyond branches and tags, a locked linked worktree and a symlink inside .git
+        git(co, "commit", "-q", "--allow-empty", "-m", "bisect only")
+        git(co, "update-ref", "refs/bisect/bad", "HEAD")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "update-ref", "-d", "refs/bisect/bad")
+        (co / ".git/worktrees/w").mkdir(parents=True)
+        (co / ".git/worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(co / ".git/worktrees")
+        (co / ".git/modules/elsewhere").symlink_to(self.root)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+        (co / ".git/modules/elsewhere").unlink()
+        # a submodule store named refs is still walked
+        named_refs = co / ".git/modules/refs"
+        git(named_refs.parent, "init", "-q", "--bare", "refs")
+        git(named_refs, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/refs is on no remote-tracking ref")
+        shutil.rmtree(named_refs)
+        # a linked worktree's submodule store, and a detached HEAD in a submodule's own linked worktree
+        store = co / ".git/worktrees/wt/modules/sub"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "sub")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in worktrees/wt/modules/sub is on no remote-tracking ref")
+        shutil.rmtree(co / ".git/worktrees")
+        ghostty = co / ".git/modules/ghostty"
+        wt = self.root / "ghostty-wt"
+        git(ghostty, "worktree", "add", "-q", "--detach", os.fspath(wt), "refs/remotes/origin/main")
+        git(wt, "commit", "-q", "--allow-empty", "-m", "only in the submodule's worktree")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+
+    def test_a_tag_origin_has_at_the_same_object_is_not_only_here(self) -> None:
+        """A full-history fetch brings origin's tags of commits on no branch (cmux-rbh-src-*): they keep nothing.
+        A tag origin lacks, or has at another object, still keeps the checkout; so does an origin git cannot ask."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(where), *args], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "tags/_work/cmux/cmux"
+        self._git_checkout(co)
+        origin = self.root / "tags-origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(origin)], env=env, check=True)
+        git(co, "remote", "add", "origin", os.fspath(origin))
+        git(co, "push", "-q", "origin", "HEAD:refs/heads/main")
+        git(co, "commit", "-q", "--allow-empty", "-m", "staging, on no branch")
+        git(co, "tag", "-a", "-m", "src", "cmux-rbh-src-1")
+        git(co, "push", "-q", "origin", "refs/tags/cmux-rbh-src-1")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "commit", "-q", "--allow-empty", "-m", "tagged here only")
+        git(co, "tag", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "push", "-q", "origin", "refs/tags/local-only")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "tag", "-f", "local-only", "refs/tags/cmux-rbh-src-1^{commit}")  # moved here: origin has it elsewhere
+        git(co, "commit", "-q", "--allow-empty", "-m", "another")
+        git(co, "tag", "-f", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "remote", "set-url", "origin", os.fspath(self.root / "gone.git"))
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
+
+    def test_a_submodule_commit_a_pushed_gitlink_pins_still_keeps_the_checkout(self) -> None:
+        """A job may push a superproject gitlink to a submodule commit it never pushed; the pin proves nothing."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "pins/_work/cmux/cmux"
+        self._git_checkout(co)
+        store = co / ".git/modules/ghostty"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "ghostty")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "made by a job")
+        pin = git(store, "rev-parse", "HEAD")
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{pin},ghostty")
+        git(co, "commit", "-q", "-m", "pin ghostty")
+        git(co, "update-ref", "refs/remotes/origin/main", "HEAD")  # the superproject's gitlink is pushed
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+        git(store, "update-ref", "refs/remotes/origin/main", pin)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        (store / "worktrees/w").mkdir(parents=True)  # a submodule's own locked linked worktree
+        (store / "worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(store / "worktrees")
+        (co / ".git/modules/dangling").symlink_to(self.root / "nowhere")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+
+    def test_the_git_veto_follow_ups(self) -> None:
+        """Codex's P2s on #1661: a submodule store named like a git dir's own folders is walked for locks, a linked
+        worktree's private refs keep the checkout, a gitfile naming a store outside .git keeps it, and a ref name
+        that is not UTF-8 is doubt."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "p2/_work/cmux/cmux"
+        self._git_checkout(co)
+        store = co / ".git/modules/objects"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "objects")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "base")
+        git(store, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        (store / "index.lock").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git holds a lock in it")
+        (store / "index.lock").unlink()
+        private = co / ".git/worktrees/w/refs/worktree"
+        private.mkdir(parents=True)
+        (private / "keep").write_text(git(co, "rev-parse", "HEAD") + "\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it has refs of its own")
+        shutil.rmtree(co / ".git/worktrees")
+        sha = git(store, "rev-parse", "HEAD")
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/lib")
+        (co / "vendor/lib").mkdir(parents=True)
+        elsewhere = co / "vendor/store.git"  # inside the checkout but outside .git: never surveyed
+        git(co / "vendor", "init", "-q", "--bare", "store.git")
+        (co / "vendor/lib/.git").write_text(f"gitdir: {elsewhere}\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/modules/objects\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        hidden = co / ".git/logs/subrepo"  # inside .git, but under a folder the store walk skips
+        hidden.parent.mkdir(parents=True, exist_ok=True)
+        git(hidden.parent, "init", "-q", "--bare", "subrepo")
+        git(hidden, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "unpushed")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/logs/subrepo\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/modules/objects\n")
+        shutil.rmtree(hidden)
+        ref = os.fsencode(co / ".git/refs/heads") + b"/caf\xe9"  # a ref name git accepts that is not UTF-8
+        try:
+            with open(ref, "w") as f:
+                f.write(git(co, "rev-parse", "HEAD") + "\n")
+        except OSError:
+            self.skipTest("this filesystem refuses names that are not UTF-8")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
+
+    @twelve_hour_ages
+    def test_a_job_that_starts_during_the_git_veto_keeps_its_checkout(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        live = f"{home / 'actions-runner-glaeda-11'}/bin/Runner.Worker spawnclient 1 2\n"
+        reads = iter([([], ""), ([], live)])  # idle when first judged, a job by the time the veto returns
+        gd.process_evidence = lambda: next(reads, ([], live))
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertIn("running a job", rec["reasons"][0])
+
+    def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
+        root = self.root / "origin"
+        cos = []
+        for i, (url, size) in enumerate([("https://github.com/a/foo.git", 6.8), ("git@github.com:a/foo", 0.55),
+                                         ("https://github.com/b/foo", 0.5), ("https://github.com/b/foo", 0.6)]):
+            co = root / f"r{i}/_work/foo/foo"
+            self._packs(co, size)
+            (co / ".git/config").write_text(f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {url}\n')
+            cos.append(co)
+        (cos[3] / ".git/included").write_text('[Remote "origin"]\n\tURL = https://GitHub.com/b/foo\n')  # git's spelling
+        (cos[3] / ".git/config").write_text("[include]\n\tpath = included\n")  # through an include
+        # a/foo over https and ssh is one repository; b/foo's checkouts are not its siblings
+        self.assertEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]))
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2], cos[3]])), set(), "no a/foo sibling")
+        self.assertEqual(gd.checkout_origin(cos[3]), "github.com/b/foo")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:A/foo\n')
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]), "a path is case-sensitive")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:a/foo\n')
+        (cos[2] / ".git/config").write_bytes(b'[remote "origin"]\n\turl = https://github.com/b/f\xffoo\n')
+        gd.checkout_origin(cos[2])  # bytes that are not UTF-8 never raise
+        (cos[2] / ".git/config").write_text("[core]\n")  # no origin: never a sibling, never bloated
+        self.assertIsNone(gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2]])), set())
+        shutil.rmtree(cos[1] / ".git/objects/pack")  # a sibling whose packs cannot be read
+        self.assertIsNone(gd.git_pack_bytes(cos[1] / ".git"))
+        self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
+    def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
+        co = self.root / "veto/_work/cmux/cmux"
+        self._git_checkout(co, pushed=False)
+        other = self.root / "other"
+        self._git_checkout(other, pushed=True)
+        with mock.patch.dict(os.environ, {"GIT_DIR": os.fspath(other / ".git"), "GIT_WORK_TREE": os.fspath(other)}):
+            self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        self._git_checkout(co, pushed=True)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        locked = co / ".git/worktrees/hidden"
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        try:  # tearDown removes the tree before any addCleanup runs, so the mode goes back here
+            if os.access(locked, os.R_OK):
+                self.skipTest("running as a user who can read a mode-0 directory")
+            self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether it holds a lock")
+        finally:
+            locked.chmod(0o755)
+
+    def test_every_disposable_age_is_one_hour(self) -> None:
+        """Leo, 2026-11-18: "6 hours may be too hard of a thing to hit. these days, it should be more like 1." Only
+        the newest warm compile cache per builder (the per-host cmux-next root) is exempt by role, and the nightly
+        builders' warm inputs (cmux-nightly-next, the cmux-cua source clone) keep NIGHTLY_WARM_IDLE_HOURS."""
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 1.0)
+        self.assertEqual(gd.NIGHTLY_WARM_IDLE_HOURS, 12.0)
+        for name in ("KEPT_BUILD_IDLE_HOURS", "IDLE_SWEEP_HOURS", "IDLE_SEED_HOURS", "PARKED_NO_LOG_IDLE_HOURS",
+                     "CMUX_NEXT_CI_MIN_IDLE_HOURS", "CANONICAL_ADMISSION_IDLE_HOURS", "CHECKOUT_BUILD_IDLE_HOURS",
+                     "TMP_TEST_RESIDUE_IDLE_HOURS", "RUNNER_STALE_CHECKOUT_HOURS"):
+            with self.subTest(name):
+                self.assertEqual(getattr(gd, name), 1.0)
+        self.assertEqual(gd.RUNTIME_IDLE_DAYS * 24, 1.0)
+        for key in ("soft_idle_hours", "stale_marker_max_hours"):
+            self.assertEqual(gd.POLICY_DEFAULTS[key], 1.0, key)
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], float("inf"))
+        for fam in [*gd.default_families(), *gd.runner_cache_families()]:
+            with self.subTest(fam.id):
+                if fam.id in (gd.TART_VMS, gd.LIMA_VMS):
+                    # a stopped VM's window is Leo's own (2026-11-17, TART_VM_IDLE_HOURS); only hosts with the
+                    # store list the family, so this held only where ~/.tart/vms or ~/.lima was absent
+                    self.assertEqual(fam.min_idle_hours, gd.TART_VM_IDLE_HOURS)
+                    continue
+                self.assertLessEqual(fam.min_idle_hours, gd.NIGHTLY_WARM_IDLE_HOURS)
+        fam = gd.nightly_next_family(Path("/nonexistent/cmux-nightly-next"))
+        self.assertEqual((fam.min_idle_hours, fam.max_idle_hours), (12.0, 12.0))
+
+    def test_cua_source_clone_keeps_the_nightly_window_and_its_build_tree_does_not(self) -> None:
+        """The nightly's Computer Use step clones cmux-cua from GitHub when src-<sha> is gone; run 44232805509 failed
+        on that fetch timing out on cmux15. The source clone keeps 12 h; its build tree (build-src-*) goes at 1 h."""
+        fam = gd.Family("cua-cache", Path("/x/cmux-cua"), True, "rebuilds", min_idle_hours=gd.DEFAULT_AGE_HOURS)
+        src, build = Path("/x/cmux-cua/src-e0f7"), Path("/x/cmux-cua/build-src-e0f7-46b7")
+        self.assertTrue(gd.cua_source_clone(fam, src))
+        self.assertFalse(gd.cua_source_clone(fam, build))
+        self.assertEqual(gd.item_window(fam, src, gd.DEFAULT_AGE_HOURS, frozenset()), 12.0)
+        self.assertEqual(gd.item_window(fam, build, gd.DEFAULT_AGE_HOURS, frozenset()), 1.0)
+
+    def test_registry_images_go_at_any_age_under_pressure_only(self) -> None:
+        fam = gd.Family(gd.TART_IMAGES, Path("/x/OCIs"), True, "pull again", min_idle_hours=gd.TART_IDLE_HOURS)
+        image = Path("/x/OCIs/ghcr.io/cirruslabs/macos-tahoe-base")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), 0.0)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_window(fam, image, gd.DEFAULT_AGE_HOURS, frozenset()), gd.TART_IDLE_HOURS)
+
+    def test_host_saturated_reads_the_one_minute_load_per_core(self) -> None:
+        with mock.patch.object(gd.os, "cpu_count", return_value=14):
+            with mock.patch.object(gd.os, "getloadavg", return_value=(9.4, 14.1, 19.5)):
+                self.assertEqual(gd.host_saturated(), "")
+            with mock.patch.object(gd.os, "getloadavg", return_value=(14.0, 14.1, 19.5)):
+                self.assertIn("saturated", gd.host_saturated())
+            with mock.patch.object(gd.os, "getloadavg", side_effect=OSError):
+                self.assertEqual(gd.host_saturated(), "")
+
+    def test_saturation_never_holds_below_the_emergency_floor(self) -> None:
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset({1})):
+            self.assertIsNone(gd.saturation_halt({}, "10%"))
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
+
+    def test_saturation_never_holds_a_filesystem_past_the_saturated_free_share(self) -> None:
+        total = 100 * gd.GIB
+        full = gd.Fs(1, "/", 10 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        roomy = gd.Fs(1, "/", 40 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIsNone(gd.saturation_halt({1: full}, "5%"))
+            self.assertIs(gd.saturation_halt({1: roomy}, "5%"), gd.host_saturated)
+            with mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "0"}):
+                self.assertIs(gd.saturation_halt({1: full}, "5%"), gd.host_saturated)
+
+    def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
+        """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
+        sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""
+        saturated = mock.patch.object(gd.os, "getloadavg", return_value=(64.0, 64.0, 64.0))
+        cores = mock.patch.object(gd.os, "cpu_count", return_value=16)
+        with saturated, cores:
+            # under pressure, above the emergency floor (50 GiB on this 460 GiB volume): no walk, nothing deleted
+            status, rows, survey, apply = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        survey.assert_not_called()
+        apply.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertIn(gd.HOST_SATURATED, gd.UNSERVED, "a runner hook's trigger stays for a pass that can delete")
+        self.assertIn("skipped before measuring", self.said)
+        with saturated, cores:
+            # below the emergency floor nothing holds: the pass walks and deletes as before
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        survey.assert_called()
+        self.assertNotEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        stamp = self.root / "idle.last"
+        with saturated, cores, mock.patch.object(gd, "IDLE_STAMP", stamp), \
+                mock.patch.object(gd, "host_busy", return_value=""):
+            # no pressure: the idle sweep skips too and leaves its stamp, so the next unsaturated pass sweeps
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_not_called()
+        self.assertEqual(rows[-1]["skipped"], gd.HOST_SATURATED)
+        self.assertFalse(stamp.exists())
+        with cores, mock.patch.object(gd.os, "getloadavg", return_value=(4.0, 4.0, 4.0)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            _, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=300.0)
+        survey.assert_called()
+        self.assertEqual(rows[-1]["mode"], "idle")
+
+    def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
+        # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+        patches, removed = self._floor_disk(31.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+        self.assertTrue(removed)
+
+    @twelve_hour_ages
+    def test_idle_runner_checkouts_go_least_recently_used_first_until_the_target(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 3, "actions-runner-glaeda-2": 9,
+                                          "actions-runner-glaeda-3": 6})
+        patches, removed = self._floor_disk(25.0, freed_gib=15.0)  # floor 30 + target_margin_gib 20 = 50
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            released = gd.evict_idle_runner_checkouts(receipt, 30.0, home)
+        # 25 -> 40 -> 55: two checkouts, oldest use first; the most recently used one stays
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda-2"]), str(cos["actions-runner-glaeda-3"])])
+        self.assertEqual(released, 30 * gd.GIB)
+        self.assertTrue(cos["actions-runner-glaeda"].is_dir())
+        recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual({(r["family"], r["outcome"]) for r in recs}, {(gd.RUNNER_IDLE_CHECKOUT_FAMILY, "reclaimed")})
+        # only the checkout goes: the workspace's .glaeda-state caches and the runner's _tool/_temp stay
+        work = home / "actions-runner-glaeda-2/_work"
+        self.assertTrue((work / "cmux/.glaeda-state/SourcePackages").is_dir())
+        self.assertTrue((work / "_temp/cmux-derived-data-tests-1").is_dir())
+
+    def test_an_idle_runners_workspace_with_no_git_goes_as_its_checkout_would(self) -> None:
+        """cmux18, 2026-11-16: runners glaeda-2 and glaeda-10 each held a 13-14 GiB _work/cmux/cmux with no .git (its
+        store removed, the sources and build output left), idle 6-15 h, at 17 GiB free under the 30 GiB floor. No
+        family listed a tree without .git, so the gate held both listeners for space nothing would free."""
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 9,
+                                          "actions-runner-glaeda-3": 9})
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
+            shutil.rmtree(cos[name] / ".git")
+            make(cos[name] / "Build", age_hours=9)
+            self._age(home / name, hours=9)
+        busy = home / "actions-runner-glaeda-3"
+        gd.process_evidence = lambda: ([], f"{busy}/bin/Runner.Worker spawnclient 1 2\n")
+        patches, removed = self._floor_disk(17.0, freed_gib=14.0)  # floor 30 + target_margin_gib 20 = 50
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertFalse(cos["actions-runner-glaeda-2"].exists(), "no .git, no job: it goes, oldest first")
+        self.assertTrue(cos["actions-runner-glaeda-3"].is_dir(), "its runner has a job")
+        self.assertEqual(removed[0], str(cos["actions-runner-glaeda-2"]))
+        recs = {Path(r["path"]).parts[-4]: r for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertEqual(recs["actions-runner-glaeda-2"]["outcome"], "reclaimed")
+        self.assertIn("running a job", recs["actions-runner-glaeda-3"]["reasons"][0])
+        # a .git that is a file or a link is a checkout of something else's store: never this path's to take
+        work = home / "actions-runner-glaeda-2/_work"
+        make(work / "other/other")
+        (work / "other/other/.git").write_text("gitdir: /elsewhere\n")
+        make(work / "_temp/_temp")  # the runner's own folders are never a workspace
+        # a checkout one or two levels down (actions/checkout `path:`) keeps the tree for git to judge
+        (work / "cmux/cmux/trusted/.git").mkdir(parents=True)
+        (work / "hq/hq/a/tools/.git").mkdir(parents=True)
+        make(work / "gone/gone/Build")
+        self.assertEqual(gd.runner_gitless_workspaces(work), [work / "gone/gone"])
+
+    def test_idle_runner_checkouts_of_busy_runners_go_between_jobs(self) -> None:
+        """cmuxs-mac-mini-6, 2026-10-21: light jobs kept every runner busy at least hourly, so under the floor
+        no checkout was ever an hour quiet; runners with no job, last used 23-32 minutes before, held 20 GiB."""
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 0.54, "actions-runner-glaeda-2": 0.39,
+                                          "actions-runner-glaeda-3": 0.06})
+        gd.process_evidence = lambda: ([], "")
+        patches, removed = self._floor_disk(10.0, freed_gib=6.5)
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"]), str(cos["actions-runner-glaeda-2"])])
+        self.assertTrue(cos["actions-runner-glaeda-3"].is_dir(), "used minutes ago: its job may be finishing")
+
+    def test_idle_runner_checkout_vetoes(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
+                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.1})
+        live = home / "actions-runner-glaeda"
+        opened = cos["actions-runner-glaeda-2"] / "Sources/x.swift"
+        named = cos["actions-runner-glaeda-3"]
+        cmds = (f"{live.resolve()}/bin/Runner.Worker spawnclient 1 2\n"  # a job, by the resolved spelling
+                f"/usr/bin/xcodebuild -project {named}/cmux.xcodeproj\n")
+        gd.process_evidence = lambda: ([str(opened)], cmds)
+        patches, removed = self._floor_disk(10.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])  # the runner used within the quiet window is not even a candidate
+        why = {Path(r["path"]).parts[-4]: r["reasons"][0] for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertIn("running a job", why["actions-runner-glaeda"])
+        self.assertIn("open or a working directory", why["actions-runner-glaeda-2"])
+        self.assertIn("named by a running command", why["actions-runner-glaeda-3"])
+        self.assertNotIn("actions-runner-glaeda-4", why)
+        self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def test_idle_runner_checkout_rechecks_before_each_delete_and_refuses_without_evidence(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 4})
+        calls = []
+
+        def evidence():
+            calls.append(1)
+            if len(calls) == 1:
+                return [], ""
+            # a job started on runner 2 after the first deletion
+            return [], f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = evidence
+        patches, removed = self._floor_disk(10.0, freed_gib=5.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])])
+        self.assertTrue(cos["actions-runner-glaeda-2"].is_dir())
+
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed")
+        gd.process_evidence = no_evidence
+        patches, removed = self._floor_disk(10.0)
+        with patches[0], patches[1], contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+        self.assertEqual(removed, [])
+
+    def test_idle_runner_checkout_never_follows_symlinks_or_leaves_the_checkout(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
+                                          "actions-runner-glaeda-3": 5})
+        outside = self.root / "main-clone"
+        (outside / ".git").mkdir(parents=True)
+        linked = cos["actions-runner-glaeda-2"]
+        shutil.rmtree(linked)
+        linked.symlink_to(outside)  # a checkout that is a symlink to a clone outside _work
+        work3 = home / "actions-runner-glaeda-3/_work"
+        shutil.rmtree(work3)
+        work3.symlink_to(self.root / "main-clone")  # a symlinked _work
+        other = home / "actions-runner-glaeda/_work/cmux/other"  # a checkout outside the default layout
+        (other / ".git").mkdir(parents=True)
+        for keep in ("_tool/node", "_actions/actions/checkout"):
+            make(home / "actions-runner-glaeda/_work" / keep)
+        self._age(home / "actions-runner-glaeda", hours=5)
+        patches, removed = self._floor_disk(10.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])])
+        self.assertTrue((outside / ".git").is_dir())
+        self.assertTrue(other.is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_tool/node").is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_actions/actions/checkout").is_dir())
+
+    def test_idle_runner_checkout_used_since_the_survey_stays(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+
+        def evidence():  # a job's checkout step rewrites the index between the survey and the delete
+            for co in cos.values():
+                os.utime(co / ".git")
+            return [], ""
+        gd.process_evidence = evidence
+        patches, removed = self._floor_disk(10.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            gd.evict_idle_runner_checkouts(receipt, 30.0, home)
+        self.assertEqual(removed, [])
+        self.assertEqual({json.loads(line)["outcome"] for line in receipt.read_text().splitlines()},
+                         {"changed:modified"})
+
+    def test_idle_runner_checkout_pass_runs_only_in_a_pressure_apply(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
+                mock.patch.object(gd, "filesystems", return_value=under), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0) as last, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
+            last.assert_not_called()
+            gd.main(["--pressure", "--no-snapshot", "--top", "0", *receipt])  # a report
+            last.assert_not_called()
+            gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
+            last.assert_called_once()
+            self.assertEqual(last.call_args.args[1], 30.0)
+
+    def _web_archive(self, number: int, member: str | None = None, age: float = 48) -> Path:
+        path = self.root / f"cmux-web-update-AAAAAAAA-1111-2222-3333-{number:012X}.tar.gz"
+        with gd.tarfile.open(path, "w:gz") as bundle:
+            header = gd.tarfile.TarInfo(member or gd.WEB_UPDATE_FIRST_MEMBER)
+            payload = b"<html/>"
+            header.size = len(payload)
+            bundle.addfile(header, io.BytesIO(payload))
+        os.utime(path, (time.time() - age * 3600,) * 2)
+        return path
+
+    def test_web_update_pressure_removes_only_proven_downloads(self) -> None:
+        for name in ("ACTIVITY_MODE", "ROLE", "EMERGENCY_DEVS", "FLOOR_HOLD", "CMUX_NEXT_HOST_FLOOR",
+                     "OUT_OF_BAND_RUN", "RUNNER_CACHE_PROFILE", "BUILD_CACHES_UNWINDOWED", "FLEET_CLAIMS_EXPIRE"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        old = self._web_archive(1)
+        keep = [self._web_archive(2, "index.html"), self._web_archive(3, age=2), self._web_archive(4)]
+        os.link(keep[-1], self.root / "linked")
+        wrong_case = self._web_archive(5)
+        wrong_case = wrong_case.rename(wrong_case.with_name(wrong_case.name.lower()))
+        link = self.root / "cmux-web-update-AAAAAAAA-1111-2222-3333-000000000006.tar.gz"
+        link.symlink_to(old)
+        junk = self._web_archive(7)
+        junk.write_bytes(b"not a gzip archive")
+        os.utime(junk, (time.time() - 48 * 3600,) * 2)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "darwin_user_tmp", return_value=self.root):
+            fam = next(f for f in gd.default_families("devbox") if f.id == gd.WEB_UPDATE_ARCHIVES)
+            items = gd.survey([fam], 1, 50 * 1024**2)
+            self.assertEqual([(i.path, i.verdict) for i in items], [(str(old), "reclaimable")])
+            dev = self.root.stat().st_dev
+            fss = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+            other_query = gd._owned_query_split
+
+            def query(argv, timeout, apart=True):
+                if argv == ["ps", "-axww", "-o", "command="] and apart:
+                    return 0, "idle\n", ""
+                return other_query(argv, timeout, apart)
+
+            with mock.patch.object(gd, "default_families", return_value=[fam]), \
+                    mock.patch.object(gd, "filesystems", return_value=fss), \
+                    mock.patch.object(gd, "free_bytes", return_value=(10 * gd.GIB, 460 * gd.GIB)), \
+                    mock.patch.object(gd, "runner_floor_gib", return_value=0), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "EVICT_OWNER", self.root / "owner.json"), \
+                    mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                    mock.patch.object(gd, "clear_stale_build_markers", return_value=0), \
+                    mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                    mock.patch.object(gd, "notify_disk"), \
+                    mock.patch.object(gd, "descriptor_holder_status", return_value="clear"), \
+                    mock.patch.object(gd, "_owned_query_split", side_effect=query), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                gd.main(["--pressure", "--apply", "--role", "devbox", "--family", fam.id,
+                         "--no-snapshot", "--receipt", str(self.receipt())])
+        self.assertFalse(old.exists())
+        self.assertTrue(all(p.exists() for p in [*keep, wrong_case, junk]))
+        self.assertTrue(link.is_symlink())
+        rows = [json.loads(s) for s in self.receipt().read_text().splitlines()]
+        self.assertEqual([r["outcome"] for r in rows if r.get("family") == fam.id], ["reclaimed"])
+
+    def test_web_update_checks_each_holder_inode_and_protected_path_at_unlink(self) -> None:
+        path = self._web_archive(1)
+        item = gd.WebUpdateArchiveItem(gd.WEB_UPDATE_ARCHIVES, str(path), 1, 48, "reclaimable",
+                                       identity=gd.web_update_identity(path.stat()))
+        idle = (0, "idle\n", "")
+        cases = [((0, str(path), ""), "clear", "changed:in-use"),
+                 (idle, "changed:in-use", "changed:in-use"),
+                 (idle, "blocked:lsof-incomplete", "blocked:lsof-incomplete"),
+                 ((1, "", ""), "clear", "blocked:ps-incomplete")]
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "darwin_user_tmp", return_value=self.root):
+            for ps, holder, outcome in cases:
+                with self.subTest(outcome=outcome, ps=ps), mock.patch.object(gd, "_owned_query_split", return_value=ps), \
+                        mock.patch.object(gd, "descriptor_holder_status", return_value=holder):
+                    self.assertEqual(gd.remove_web_update_archive(self.root, item), outcome)
+                    self.assertTrue(path.is_file())
+            with mock.patch.object(gd, "never_delete", return_value=True):
+                self.assertIsNone(gd.web_update_archive(self.root, path))
+            def replace_during_lsof(fd):
+                self._web_archive(10).replace(path)
+                return "clear"
+            with mock.patch.object(gd, "_owned_query_split", return_value=idle), \
+                    mock.patch.object(gd, "descriptor_holder_status", side_effect=replace_during_lsof):
+                self.assertEqual(gd.remove_web_update_archive(self.root, item), "changed:identity")
+                self.assertTrue(path.is_file())
+
+    def test_archive_pressure_page_requires_a_complete_scan_and_holder_queries(self) -> None:
+        tmp = self.root / "downloads"
+        tmp.mkdir()
+        source = self._web_archive(1)
+        path = source.rename(tmp / source.name)
+        argv = ["--pressure", "--apply", "--role", "devbox"]
+        notify = mock.Mock()
+        survey, apply, original_query = gd.survey, gd.apply, gd._owned_query_split
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "darwin_user_tmp", return_value=tmp):
+            family = next(f for f in gd.default_families("devbox") if f.id == gd.WEB_UPDATE_ARCHIVES)
+            run = dict(families=[family], survey_effect=survey, apply_effect=apply, notify=notify)
+            for outcome in ("blocked:ps-incomplete", "blocked:lsof-incomplete", "blocked:query-timeout", "changed:in-use"):
+                def query(args, timeout, apart=True):
+                    if args == ["ps", "-axww", "-o", "command="] and apart:
+                        return (1, "", "") if outcome == "blocked:ps-incomplete" else (0, "idle", "")
+                    return original_query(args, timeout, apart)
+                with self.subTest(outcome=outcome), mock.patch.object(gd, "_owned_query_split", side_effect=query), \
+                        mock.patch.object(gd, "descriptor_holder_status", return_value=outcome):
+                    self._main_run(argv, **run)
+                    rows = [json.loads(line) for line in self.receipt().read_text().splitlines()]
+                    row = next(r for r in reversed(rows) if r.get("family") == family.id)
+                    self.assertEqual(row["outcome"], outcome)
+                    self.assertIn(outcome, row["hold"]["by"])
+                    self.assertTrue(path.exists())
+                    if outcome == "changed:in-use":
+                        notify.assert_called_once()
+                        self.assertIn("another process has this archive open", notify.call_args.args[1])
+                    else:
+                        notify.assert_not_called()
+            notify.reset_mock()
+            scandir = os.scandir
+            def denied(directory):
+                if directory == tmp:
+                    raise PermissionError(directory)
+                return scandir(directory)
+            with mock.patch.object(os, "scandir", side_effect=denied):
+                self._main_run(argv, **run)
+            self.assertTrue(gd.RUN.get("survey_incomplete"))
+            notify.assert_not_called()
+
+    def _tmp_residue(self) -> tuple[Path, dict[str, Path]]:
+        """A fake $TMPDIR: named test scratch, old and new, beside entries the reaper must never take."""
+        tmp = self.root / "T"
+        e: dict[str, Path] = {}
+        e["socket"] = tmp / "cmux-cli-socket-00D670AE-52D1-4CCE-88A3-08D9A0C1851D"
+        (e["socket"] / "cmux DEV.app/Contents/MacOS").mkdir(parents=True)
+        (e["socket"] / "cmux DEV.app/Contents/MacOS/cmux").write_bytes(b"\0" * 4096)
+        e["git"] = tmp / "git-pr-003CE1E9-4204-4B78-8FB7-87EFC23D81A3"
+        (e["git"] / "repo/.git").mkdir(parents=True)
+        e["foundation"] = tmp / "TemporaryDirectory.000X0T"
+        e["foundation"].mkdir()
+        (e["foundation"] / ".keep-directory").write_text("")
+        e["file"] = tmp / "cmux-shortcut-routing-0008E778-433F-46C4-89E2-78F8075D2C08.json"
+        e["file"].write_text("{}")
+        e["recent"] = tmp / "cmux-cli-socket-0171FEFD-85E4-43A4-B516-55787B935041"
+        e["recent"].mkdir()
+        e["inner-recent"] = tmp / "git-stage-00560C4B-4E10-4993-BE64-00845DEB616F"
+        (e["inner-recent"] / "a/b").mkdir(parents=True)
+        e["unknown"] = tmp / "notes-from-an-agent"
+        e["unknown"].mkdir()
+        e["apple"] = tmp / "com.apple.WebKit.Networking"
+        e["apple"].mkdir()
+        e["dash"] = tmp / "--git-pr-0358FC19-C6D4-4553"
+        e["dash"].mkdir()
+        outside = self.root / "outside-clone"
+        (outside / ".git").mkdir(parents=True)
+        e["link"] = tmp / "git-hunk-04049B5D-F71E-44B9-B596-0356BB38F98B"
+        e["link"].symlink_to(outside)
+        for name, path in e.items():
+            if name != "recent":
+                self._age(path if not path.is_symlink() else outside, hours=72)
+        (e["inner-recent"] / "a/b/fresh").write_text("still in use")  # an old top with a fresh file inside
+        os.utime(e["inner-recent"], (time.time() - 72 * 3600,) * 2)
+        os.utime(e["recent"], None)
+        os.utime(e["link"], (time.time() - 72 * 3600,) * 2, follow_symlinks=False)
+        return tmp, e
+
+    def test_tmpdir_test_residue_reaps_only_old_named_test_scratch(self) -> None:
+        tmp, e = self._tmp_residue()
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            released = gd.reap_tmpdir_test_residue(receipt, tmp)
+        gone = {n for n, p in e.items() if not os.path.lexists(p)}
+        self.assertEqual(gone, {"socket", "git", "foundation", "file"})
+        self.assertGreater(released, 0)
+        self.assertTrue((self.root / "outside-clone/.git").is_dir())  # a symlinked entry is never followed
+        self.assertTrue(tmp.is_dir())
+        self.assertEqual(sorted(p.name for p in tmp.iterdir() if p.name.startswith(gd.DELETING_PREFIX)), [])
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.TMP_TEST_RESIDUE_FAMILY, "reclaimed", 4))
+        self.assertEqual(rec["by_prefix"], {"cmux-cli-socket": 1, "git-pr": 1, "TemporaryDirectory": 1,
+                                            "cmux-shortcut-routing": 1})
+        self.assertEqual(rec["kept"], {"a symlink": 1, f"changed within {gd.TMP_TEST_RESIDUE_IDLE_HOURS:g}h": 1})  # recent tops are never walked
+
+    def test_tmpdir_test_residue_vetoes_open_and_named_entries(self) -> None:
+        tmp, e = self._tmp_residue()
+        opened = e["socket"] / "cmux DEV.app/Contents/MacOS/cmux"
+        gd.process_evidence = lambda: ([str(opened)], f"/usr/bin/git -C {e['git']}/repo status\n")
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp)
+        self.assertTrue(e["socket"].is_dir())
+        self.assertTrue(e["git"].is_dir())
+        self.assertFalse(e["foundation"].exists())
+        kept = json.loads(receipt.read_text())["kept"]
+        self.assertEqual(kept["open or a working directory of a process"], 1)
+        self.assertEqual(kept["named by a running command"], 1)
+
+    def test_tmpdir_test_residue_fails_closed(self) -> None:
+        tmp, e = self._tmp_residue()
+
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed (exit 1)")
+        gd.process_evidence = no_evidence
+        receipt = self.receipt()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(receipt, tmp), 0)
+        self.assertTrue(all(os.path.lexists(p) for p in e.values()))
+        self.assertIn("no process evidence", json.loads(receipt.read_text())["stopped"])
+        # a tree too big to walk within the budget is not proven idle
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "TMP_TEST_RESIDUE_WALK_BUDGET", 1), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(gd.tree_newest(e["socket"], 1))
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertTrue(e["socket"].is_dir())  # 4 entries below it, budget 1
+        self.assertFalse(e["file"].exists())  # a plain file needs no walk
+        # a busy host halts the sweep before anything goes
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(self.receipt(), tmp, halt=lambda: "a CI job runs"), 0)
+        self.assertTrue(e["socket"].is_dir())
+
+    def test_tmpdir_test_residue_stops_at_the_callers_deadline(self) -> None:
+        """The $TMPDIR pass's own 600 s budget ends inside the caller's deadline (HYGIENE_RUN_DEADLINE) too."""
+        tmp, e = self._tmp_residue()
+        receipt = self.receipt()
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + gd.RUN_DEADLINE_MARGIN_S - 5:.0f}"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(receipt, tmp), 0)
+        self.assertTrue(all(os.path.lexists(p) for p in e.values()))
+        self.assertIn(gd.RUN_DEADLINE_ENV, json.loads(receipt.read_text())["stopped"])
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: f"{time.time() + 3600:.0f}"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.reap_tmpdir_test_residue(self.receipt(), tmp), 0)
+
+    def test_tmpdir_test_residue_rereads_evidence_during_a_pass(self) -> None:
+        tmp, e = self._tmp_residue()
+        calls = []
+
+        def evidence():
+            calls.append(1)  # after the first deletion, a test starts in the git scratch
+            return ([], "") if len(calls) == 1 else ([str(e["git"] / "repo")], "")
+        gd.process_evidence = evidence
+        with mock.patch.object(gd, "TMP_TEST_RESIDUE_EVIDENCE_S", -1.0), contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(e["git"].is_dir())
+        self.assertFalse(e["socket"].exists())  # sorted first: TemporaryDirectory, cmux-cli-socket, ...
+
+    def test_tmpdir_test_residue_runs_on_every_apply_but_not_a_report(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        fss = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", return_value=0) as reap, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
+            reap.assert_not_called()
+            gd.main(["--apply", "--no-snapshot", "--top", "0", "--family", "user-tmp", *receipt])
+            reap.assert_not_called()
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # not under pressure: still runs
+            reap.assert_called_once()
+
+    def test_tmpdir_test_residue_walk_stops_at_the_deadline_and_at_mounts(self) -> None:
+        tmp, e = self._tmp_residue()
+        self.assertIsNotNone(gd.tree_newest(e["socket"]))
+        self.assertIsNone(gd.tree_newest(e["socket"], deadline=time.time() - 1))
+        real_scandir = os.scandir
+
+        class Other:  # an entry below the scratch that reports another device
+            def __init__(self, entry):
+                self.entry, self.name, self.path = entry, entry.name, entry.path
+
+            def stat(self, follow_symlinks=True):
+                st = self.entry.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:]))
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Other(x) for x in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertIsNone(gd.tree_newest(e["socket"]))
+
+    def _guarded_scandir(self, tmp: Path):
+        """os.scandir as macOS behaves: $TMPDIR/<entry>/TemporaryItems cannot be listed (a CI mini blocks, then fails)."""
+        real_scandir = os.scandir
+
+        def scandir(path):
+            p = Path(os.fspath(path)) if isinstance(path, (str, os.PathLike)) else None
+            if p is not None and p.name == gd.TMP_GUARDED_CHILD and p.parent.parent == tmp:
+                raise InterruptedError(errno.EINTR, "guarded")
+            return real_scandir(path)
+        return mock.patch.object(gd.os, "scandir", scandir)
+
+    def test_tmpdir_test_residue_reaps_screenshots_scratch_with_a_guarded_temporary_items(self) -> None:
+        """An entry with a guarded TemporaryItems is walked from one level down, then deleted there."""
+        tmp, e = self._tmp_residue()
+        shot = tmp / "cmux-screenshots-tests-00303B44-B4A7-458D-9A15-8674711569DB"
+        (shot / "TemporaryItems").mkdir(parents=True)
+        self._age(shot, hours=72)
+        fresh = tmp / "cmux-screenshots-tests-012B59EA-CD57-4ADE-86DF-CB2F2196EA54"
+        (fresh / "TemporaryItems").mkdir(parents=True)
+        (fresh / "TemporaryItems/shot.png").write_bytes(b"png")
+        self._age(fresh, hours=72)
+        os.utime(fresh / "TemporaryItems/shot.png", None)  # written just now: no ancestor mtime shows it
+        receipt = self.receipt()
+        with self._guarded_scandir(tmp), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(gd.tree_newest(shot))  # in place it cannot be walked: not proven idle
+            gd.reap_tmpdir_test_residue(receipt, tmp)
+        self.assertFalse(shot.exists())
+        self.assertTrue((fresh / "TemporaryItems/shot.png").is_file())  # judged in the hold, then moved back
+        self.assertEqual([p.name for p in tmp.iterdir() if p.name.startswith(gd.TMP_HOLD_PREFIX)], [])
+        rec = json.loads(receipt.read_text())
+        self.assertEqual(rec["by_prefix"]["cmux-screenshots-tests"], 1)
+        self.assertEqual(rec["kept"][f"changed within {gd.TMP_TEST_RESIDUE_IDLE_HOURS:g}h"], 2)  # fresh, inner-recent
+
+    def test_tmpdir_test_residue_guarded_entry_is_vetoed_by_name_before_it_moves(self) -> None:
+        tmp, e = self._tmp_residue()
+        shot = tmp / "cmux-screenshots-tests-00303B44-B4A7-458D-9A15-8674711569DB"
+        (shot / "TemporaryItems").mkdir(parents=True)
+        self._age(shot, hours=72)
+        gd.process_evidence = lambda: ([str(shot)], "")
+        renames = []
+        real_rename = os.rename
+        with self._guarded_scandir(tmp), mock.patch.object(gd.os, "rename",
+                                                           lambda a, b: (renames.append(a), real_rename(a, b))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertTrue((shot / "TemporaryItems").is_dir())
+        self.assertNotIn(shot, [Path(os.fspath(r)) for r in renames])
+
+    def _bind(self, folder: Path, name: str) -> socket.socket:
+        """A listening unix socket at folder/name (a short relative bind: AF_UNIX paths are limited to ~104 bytes)."""
+        cwd, sock = os.getcwd(), socket.socket(socket.AF_UNIX)
+        try:
+            os.chdir(folder)
+            sock.bind(name)
+        finally:
+            os.chdir(cwd)
+        return sock
+
+    def test_tmpdir_test_residue_keeps_a_top_level_socket(self) -> None:
+        tmp, e = self._tmp_residue()
+        name = "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"
+        sock = self._bind(tmp, name)
+        os.utime(tmp / name, (time.time() - 72 * 3600,) * 2, follow_symlinks=False)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
+        finally:
+            sock.close()
+        self.assertTrue(stat.S_ISSOCK((tmp / name).lstat().st_mode))
+
+    def test_tmpdir_test_residue_never_takes_an_unknown_name(self) -> None:
+        """Age alone does not prove an entry disposable: on a runner host too, only test names go."""
+        tmp, e = self._tmp_residue()
+        unknown = {name: tmp / name for name in ("signing.Xk3a9Q", "project-7", "downloads",
+                                                  "signing-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                                                  "build-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.keychain",
+                                                  "release-export-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.zip")}
+        for path in unknown.values():
+            path.mkdir()
+            self._age(path, hours=72)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
+        self.assertTrue(e["unknown"].is_dir())
+        self.assertTrue(e["dash"].is_dir())
+        self.assertTrue(e["apple"].is_dir())
+        self.assertEqual([n for n, p in unknown.items() if not p.is_dir()], [])
+        self.assertFalse(e["socket"].exists())  # the measured prefixes still go
+
+    def test_tmpdir_test_residue_an_unmeasured_guarded_entry_stays_in_place(self) -> None:
+        tmp, e = self._tmp_residue()
+        guarded = tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"
+        (guarded / "TemporaryItems").mkdir(parents=True)
+        self._age(guarded, hours=72)
+        renames = []
+        real_rename = os.rename
+        receipt = self.receipt()
+        with self._guarded_scandir(tmp), mock.patch.object(gd.os, "rename",
+                                                           lambda a, b: (renames.append(a), real_rename(a, b))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp, runner_host=True)
+        self.assertTrue((guarded / "TemporaryItems").is_dir())
+        self.assertNotIn(guarded, [Path(os.fspath(r)) for r in renames])
+        self.assertEqual(json.loads(receipt.read_text())["kept"]["a guarded TemporaryItems in a name no measured test"
+                                                                 " prefix lists"], 1)
+
+    def test_tmpdir_test_residue_census_counts_without_walking(self) -> None:
+        tmp, e = self._tmp_residue()
+        fixture = tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        fixture.write_bytes(b"sqlite")
+        os.utime(fixture, (time.time() - 72 * 3600,) * 2)
+        walked = []
+        with mock.patch.object(gd, "tree_newest", side_effect=lambda *a, **k: walked.append(a)):
+            named = gd.tmp_test_residue_census(tmp)
+            runner = gd.tmp_test_residue_census(tmp, runner_host=True)
+        self.assertEqual(walked, [])
+        total = len(list(tmp.iterdir()))
+        # named: socket, git, foundation, file, recent, inner-recent, link; all but recent are old at the top
+        self.assertEqual(named, {"entries": total, "test_residue": 7, "idle": 6,
+                                 "idle_hours": gd.TMP_TEST_RESIDUE_IDLE_HOURS, "runner_host": False})
+        self.assertEqual((runner["test_residue"], runner["idle"], runner["runner_host"]), (8, 7, True))
+        self.assertIsNone(gd.tmp_test_residue_census(self.root / "missing"))
+
+    def test_tmpdir_test_residue_takes_words_uuid_names_on_a_runner_host(self) -> None:
+        tmp = self.root / "T3"
+        reaped = [tmp / "cmux-screenshots-tests-FA6A171A-766D-46D5-8D5D-6035A5A74F9D",
+                  tmp / "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"]
+        kept = [tmp / "com.apple.CoreSimulator.SimDevice.F1D60153-D8F6-4573-BE5E-7EBEC850026F",
+                tmp / "F1D60153-D8F6-4573-BE5E-7EBEC850026F",
+                tmp / "downloads-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.tar.gz"]  # two extensions: not a fixture name
+        reaped[0].mkdir(parents=True)
+        reaped[1].write_bytes(b"sqlite")
+        kept[0].mkdir()
+        kept[1].mkdir()
+        kept[2].write_bytes(b"gz")
+        for p in [*reaped, *kept]:
+            self._age(p, hours=72) if p.is_dir() else os.utime(p, (time.time() - 72 * 3600,) * 2)
+        # elsewhere only the measured prefix goes
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=False)
+        self.assertFalse(reaped[0].exists())
+        self.assertTrue(reaped[1].is_file())
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp, runner_host=True)
+        self.assertEqual([p.name for p in reaped if os.path.lexists(p)], [])
+        self.assertEqual([p.name for p in kept if not os.path.lexists(p)], [])
+        self.assertEqual(json.loads(receipt.read_text().splitlines()[-1])["by_prefix"], {"phone-tests": 1})
+        # the same vetoes hold: an open fixture stays
+        live = tmp / "phone-tests-1157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        live.write_bytes(b"sqlite")
+        os.utime(live, (time.time() - 72 * 3600,) * 2)
+        gd.process_evidence = lambda: ([str(live)], "")
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp, runner_host=True)
+        self.assertTrue(live.is_file())
+
+    def test_tmpdir_test_residue_kept_names_and_sockets_win_over_the_uuid_rule(self) -> None:
+        for name in ("ssh-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6", "tmux-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                     "launchd-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6", "codesign-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6",
+                     "ci-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.p12"):
+            for runner in (False, True):
+                self.assertIsNone(gd.tmp_test_residue_prefix(name, runner), name)
+        self.assertTrue(gd.tmp_socket_veto("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
+        self.assertFalse(gd.tmp_socket_veto("cmux-cli-socket-00D670AE-52D1-4CCE-88A3-08D9A0C1851D"))
+        self.assertTrue(gd.tmp_socket_veto(f"{gd.TMP_HOLD_PREFIX}4242"))
+        self.assertFalse(gd.tmp_hold_movable(f"{gd.TMP_HOLD_PREFIX}4242"))
+        self.assertFalse(gd.tmp_hold_movable("phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
+        self.assertTrue(gd.tmp_hold_movable("cmux-screenshots-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6"))
+
+    def test_tmpdir_test_residue_a_leftover_hold_keeps_its_socket_veto(self) -> None:
+        """A pass killed after the move leaves glaeda-tmp-hold-<pid>; the next pass still keeps a live socket in it."""
+        tmp, e = self._tmp_residue()
+        hold = tmp / f"{gd.TMP_HOLD_PREFIX}4242"
+        moved = hold / "cmux-screenshots-tests-x"
+        moved.mkdir(parents=True)
+        sock = self._bind(moved, "s")
+        self._age(hold, hours=72)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        finally:
+            sock.close()
+        self.assertTrue((moved / "s").exists())
+        # without the socket the leftover hold is idle scratch and goes
+        (moved / "s").unlink()
+        self._age(hold, hours=72)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertFalse(hold.exists())
+
+    def test_tmpdir_test_residue_prefix(self) -> None:
+        self.assertEqual(gd.tmp_test_residue_prefix("cmux-screenshots-tests-0A1B", False), "cmux-screenshots-tests")
+        self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", False))
+        self.assertIsNone(gd.tmp_test_residue_prefix("downloads-0A1B2C", True))
+        uuid_name = "phone-tests-0157d868-1a4f-4a4c-b017-9a3bb1b51aa6.sqlite"
+        self.assertIsNone(gd.tmp_test_residue_prefix(uuid_name, False))
+        self.assertEqual(gd.tmp_test_residue_prefix(uuid_name, True), "phone-tests")
+        self.assertIsNone(gd.tmp_test_residue_prefix("F1D60153-D8F6-4573-BE5E-7EBEC850026F", True))
+        for keep in ("com.apple.WebKit", ".X", "TemporaryItems", "tmux-501", "ssh-abc", "xcrun_db"):
+            self.assertIsNone(gd.tmp_test_residue_prefix(keep, True), keep)
+
+    def test_tmpdir_test_residue_main_apply_reaps_the_user_tmp(self) -> None:
+        tmp, e = self._tmp_residue()
+        dev = gd.HOME.stat().st_dev
+        fss = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd, "darwin_user_tmp", return_value=tmp), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", _reap_tmpdir_test_residue), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.assertFalse(e["socket"].exists())
+        self.assertTrue(e["recent"].is_dir())
+
+    def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
+        home, fams = self._runner_checkouts()
+        target = home / "actions-runner-glaeda/_work/cmux/cmux/cmux-tui/target"
+        build = next(f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY)
+        with mock.patch.object(gd, "cmux_active", return_value=True):
+            self.assertFalse(gd.job_busy(build, target))
+
+    def _home_clone(self, packs: int = 3) -> tuple[Path, Path, Path]:
+        """A fake runner home with ~/cmux (packs packs) and a linked work tree ~/cmux-wt beside it."""
+        home = self.root / "home"
+        clone = home / "cmux"
+        clone.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(clone))
+        for n in range(packs):  # each repack without -a writes the new loose objects to a pack of their own
+            (clone / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(clone), "add", f"f{n}")
+            self._git("-C", os.fspath(clone), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(clone), "repack", "-q")
+        wt = home / "cmux-wt"
+        self._git("-C", os.fspath(clone), "worktree", "add", "-q", "-b", "wt", os.fspath(wt))
+        runner = home / "actions-runner-glaeda"  # a CI runner account's home
+        (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        (runner / ".runner").write_text("{}")
+        self._age(home, hours=5)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), packs)
+        return home, clone, wt
+
+    @contextlib.contextmanager
+    def _gc_log(self):
+        with mock.patch.object(gd, "HOME_CLONE_GC_LOG", self.root / "gc.log"), \
+                mock.patch.object(gd, "HOME_CLONE_GC_FAILED", self.root / "gc-failed.json"):
+            yield
+
+    def _runner_checkout_packs(self, packs: int = 3) -> tuple[Path, Path, Path]:
+        """A fake runner home whose actions-runner-glaeda-2 has _work/cmux/cmux with packs packs."""
+        home = self.root / "home"
+        runner = home / "actions-runner-glaeda-2"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        tree = runner / "_work/cmux/cmux"
+        tree.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(tree))
+        self._git("-C", os.fspath(tree), "config", "gc.auto", "0")  # as cmux's nightly.yml leaves it
+        for n in range(packs):
+            (tree / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(tree), "add", f"f{n}")
+            self._git("-C", os.fspath(tree), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(tree), "repack", "-q")
+        self._age(home, hours=5)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), packs)
+        return home, runner, tree
+
+    def test_runner_checkout_repack_folds_a_checkout_with_many_packs_and_loses_nothing(self) -> None:
+        # 2026-10-21: gc.auto=0 from nightly.yml left 3935 packs in one runner's checkout; no pass repacked it
+        home, _, tree = self._runner_checkout_packs(3)
+        heads = self._git("-C", os.fspath(tree), "rev-list", "--all").split()
+        # a fetch's objects are unreachable until it moves its refs: a packed object no ref names must stay
+        (self.root / "in-flight").write_text("in flight\n")
+        loose = self._git("-C", os.fspath(tree), "hash-object", "-w", os.fspath(self.root / "in-flight")).strip()
+        subprocess.run(["git", "-C", os.fspath(tree), "pack-objects", "-q", ".git/objects/pack/pack"],
+                       input=loose + "\n", text=True, check=True, capture_output=True)
+        (tree / ".git/objects" / loose[:2] / loose[2:]).unlink()  # only in that pack now, as a fetch leaves it
+        self._age(home, hours=5)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 4), self._gc_log(), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.repack_runner_checkouts(receipt, home)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 1)
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
+                         (gd.RUNNER_CHECKOUT_REPACK_FAMILY, "reclaimed", 4, 1))
+        self.assertEqual(self._git("-C", os.fspath(tree), "cat-file", "-t", loose).strip(), "blob")
+        self.assertEqual(self._git("-C", os.fspath(tree), "rev-list", "--all").split(), heads)
+        self._git("-C", os.fspath(tree), "fsck", "--no-progress")
+
+    def test_runner_checkout_repack_waits_for_the_runners_job_and_the_threshold(self) -> None:
+        home, runner, tree = self._runner_checkout_packs(3)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], f"{runner}/bin/Runner.Worker spawnclient 107 110\n")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 3), self._gc_log():
+            self.assertEqual(gd.repack_runner_checkouts(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 3)
+        self.assertIn("is running a job", json.loads(receipt.read_text())["reasons"][0])
+        receipt.unlink()
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 4), self._gc_log():
+            self.assertEqual(gd.repack_runner_checkouts(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 3)
+        self.assertFalse(receipt.exists())
+
+    def test_home_clones_are_clones_directly_under_home(self) -> None:
+        home, clone, wt = self._home_clone(1)
+        (home / "plain").mkdir()
+        (home / "link-to-clone").symlink_to(clone)
+        runner = home / "actions-runner-glaeda/_work/cmux/cmux"
+        runner.mkdir(parents=True)
+        self._git("init", "-q", os.fspath(runner))
+        self._git("-C", os.fspath(runner), "commit", "-q", "--allow-empty", "-m", "x")
+        self._git("-C", os.fspath(runner), "worktree", "add", "-q", "-b", "o", os.fspath(home / "runner-wt"))
+        # ~/cmux once, also through its linked work tree; never the symlink or a runner checkout's tree
+        self.assertEqual(gd.home_clones(home), [(clone, clone / ".git")])
+        self.assertEqual(gd.linked_work_trees(clone / ".git"), [wt])
+
+    def test_home_clone_gc_repacks_the_clone_with_many_packs(self) -> None:
+        home, clone, wt = self._home_clone(3)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.gc_home_clones(receipt, home)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 1)
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["verdict"], rec["packs"], rec["packs_after"]),
+                         (gd.HOME_CLONE_GC_FAMILY, "reclaimed", "reclaimable", 3, 1))
+        self.assertEqual(self._git("-C", os.fspath(wt), "rev-parse", "--abbrev-ref", "HEAD").strip(), "wt")
+        self._git("-C", os.fspath(clone), "fsck", "--no-progress")  # nothing reachable was lost
+
+    def test_home_clone_gc_below_the_pack_threshold_or_without_runners_does_nothing(self) -> None:
+        home, clone, _ = self._home_clone(2)
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log():
+            self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 2)
+        self.assertFalse(receipt.exists())
+        shutil.rmtree(home / "actions-runner-glaeda")  # a person's or a dev box's home: never
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 2), self._gc_log():
+            self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 2)
+        self.assertFalse(receipt.exists())
+
+    def test_home_clone_gc_vetoes(self) -> None:
+        cases = {
+            "a git operation holds gc.pid": lambda c, w: (c / ".git/gc.pid").write_text("1 host"),
+            "a git operation holds index.lock": lambda c, w: (c / ".git/worktrees/cmux-wt/index.lock").write_text(""),
+            "git activity within 1h": lambda c, w: (c / ".git/FETCH_HEAD").write_text("x"),
+            "holds refs/heads/feat/x.lock": lambda c, w: (
+                (c / ".git/refs/heads/feat").mkdir(parents=True), (c / ".git/refs/heads/feat/x.lock").write_text(""),
+                os.utime(c / ".git/refs/heads/feat/x.lock", (time.time() - 7200,) * 2),
+                os.utime(c / ".git/refs/heads/feat", (time.time() - 7200,) * 2)),
+            "writing a pack": lambda c, w: (c / ".git/objects/pack/tmp_pack_abc123").write_text(""),
+            "a linked work tree is missing": lambda c, w: shutil.rmtree(w),
+            "holds MERGE_HEAD": lambda c, w: (c / ".git/MERGE_HEAD").write_text("0" * 40),
+            "holds rebase-merge": lambda c, w: (c / ".git/worktrees/cmux-wt/rebase-merge").mkdir(),
+            "open or a working directory": lambda c, w: setattr(
+                gd, "process_evidence", lambda: ([os.fspath(w / "f0")], "")),
+            "named by a running command": lambda c, w: setattr(
+                gd, "process_evidence", lambda: ([], f"git -C {c} fetch origin\n")),
+        }
+        for reason, make_busy in cases.items():
+            with self.subTest(reason):
+                shutil.rmtree(self.root / "home", ignore_errors=True)
+                gd.process_evidence = lambda: ([], "")
+                home, clone, wt = self._home_clone(3)
+                make_busy(clone, wt)
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log():
+                    self.assertEqual(gd.gc_home_clones(receipt, home), 0)
+                self.assertEqual(gd.git_pack_count(clone / ".git"), 3)
+                self.assertIn(reason, json.loads(receipt.read_text())["reasons"][0])
+
+    def test_home_clone_gc_fails_closed_and_never_kills_a_slow_gc(self) -> None:
+        home, clone, _ = self._home_clone(3)
+
+        def no_evidence():
+            raise gd.NoEvidence("ps failed (exit 1)")
+        gd.process_evidence = no_evidence
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.gc_home_clones(self.receipt(), home), 0)
+            gd.process_evidence = lambda: ([], "")
+            self.assertEqual(gd.gc_home_clones(self.receipt(), home, halt=lambda: "a CI job runs"), 0)
+        self.assertEqual(gd.git_pack_count(clone / ".git"), 3)
+        # a gc.pid git itself would ignore (12 h old) does not veto
+        (clone / ".git/gc.pid").write_text("1 elsewhere")
+        os.utime(clone / ".git/gc.pid", (time.time() - 13 * 3600,) * 2)
+        self.assertEqual(gd.home_clone_gc_veto(clone, clone / ".git", frozenset(), "", time.time()), "")
+
+        class SlowGc:
+            pid = 4242
+            killed = False
+
+            def __init__(self, argv, **kw):
+                SlowGc.argv, self.kw = argv, kw
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("git gc", timeout)
+
+            def kill(self):
+                SlowGc.killed = True
+            terminate = kill
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                mock.patch.object(gd, "git_object_bytes", return_value=0), \
+                mock.patch.object(gd.subprocess, "Popen", SlowGc), mock.patch.object(gd.os, "killpg") as killpg:
+            gd.gc_home_clones(receipt, home)
+        self.assertFalse(SlowGc.killed)
+        killpg.assert_not_called()
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["outcome"], rec["verdict"], rec["pid"]), ("running", "running", 4242))
+        self.assertIn("--prune=1.day.ago", SlowGc.argv)
+        self.assertIn("gc.worktreePruneExpire=never", SlowGc.argv)
+
+    def test_home_clone_gc_failure_backs_off_for_a_day(self) -> None:
+        home, clone, _ = self._home_clone(3)
+
+        class FailingGc:
+            pid = 99
+            calls = 0
+
+            def __init__(self, argv, **kw):
+                FailingGc.calls += 1
+
+            def wait(self, timeout=None):
+                return 128
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), self._gc_log(), \
+                mock.patch.object(gd, "git_object_bytes", return_value=0), \
+                mock.patch.object(gd.subprocess, "Popen", FailingGc):
+            gd.gc_home_clones(receipt, home)
+            gd.gc_home_clones(receipt, home)
+        self.assertEqual(FailingGc.calls, 1)
+        first, second = (json.loads(line) for line in receipt.read_text().splitlines())
+        self.assertEqual((first["outcome"], first["verdict"], first["reasons"][-1]),
+                         ("failed:exit-128", "failed", "gc failed:exit-128"))
+        self.assertIn("its last gc failed within 24h", second["reasons"][0])
+
+    def _shared_mirror(self, packs: int = 4) -> tuple[Path, Path, str]:
+        """A home whose tools/wt mirror ~/Projects/.wt-mirrors/o/r.git holds packs packs, one of them an object
+        no ref names (a worktree's commit before its ref moves); returns home, the mirror and that object."""
+        home = self.root / "home"
+        src = self.root / "src"
+        src.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(src))
+        mirror = home / "Projects/.wt-mirrors/o/r.git"
+        mirror.parent.mkdir(parents=True)
+        self._git("init", "-q", "--bare", os.fspath(mirror))
+        for n in range(packs - 1):  # each fetch leaves a pack of its own
+            (src / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(src), "add", f"f{n}")
+            self._git("-C", os.fspath(src), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(mirror), "-c", "fetch.unpackLimit=1", "fetch", "-q", os.fspath(src),
+                      "+main:refs/heads/main")
+        (self.root / "in-flight").write_text("in flight\n")
+        loose = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w",
+                          os.fspath(self.root / "in-flight")).strip()
+        subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                        os.fspath(mirror / "objects/pack/pack")], input=loose + "\n", text=True, check=True,
+                       capture_output=True)
+        (mirror / "objects" / loose[:2] / loose[2:]).unlink()
+        self.assertEqual(gd.git_pack_count(mirror), packs)
+        return home, mirror, loose
+
+    def test_shared_mirror_compact_folds_a_wt_mirror_and_loses_nothing(self) -> None:
+        # an agent lane host, 2026-11-09: the cmuxterm-hq mirror's 42 packs, 5.4 GiB, were 3.5 GiB as one pack
+        home, mirror, loose = self._shared_mirror(4)
+        (home / "Projects/.wt-mirrors/o/link.git").symlink_to(mirror)  # never through a symlink
+        self.assertEqual(gd.shared_mirrors(home), [mirror])
+        heads = self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split()
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        self.assertFalse(os.path.lexists(mirror / "objects/maintenance.lock"))  # held only while git ran
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
+                         (gd.SHARED_MIRROR_COMPACT_FAMILY, "reclaimed", 4, 1))
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "cat-file", "-t", loose).strip(), "blob")
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split(), heads)
+        self._git("--git-dir", os.fspath(mirror), "fsck", "--no-progress")
+
+    def test_shared_mirror_compact_records_its_packs_for_the_pack_rate(self) -> None:
+        # a dev host, 2026-11-09: the fold's output has a .promisor like a blobless fetch's, and repo_mirrors'
+        # pack_rate read three 8 GiB folds an hour as a 22.8 GiB fetch storm; it leaves out clone-care-repacked's packs
+        home, mirror, _ = self._shared_mirror(4)
+        record = mirror / gd.SHARED_MIRROR_REPACKED_FILE
+        now = time.time()
+        record.write_text(f"pack-old.pack {now - 3 * 3600:.0f}\npack-recent.pack {now - 600:.0f}\ngarbage\n")
+        before = {p.name for p in (mirror / "objects/pack").glob("*.pack")}
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(self.receipt(), home)
+        made = {p.name for p in (mirror / "objects/pack").glob("*.pack")}
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made & before)
+        rows = dict(line.split(" ") for line in record.read_text().splitlines())
+        # host_baseline_clones.repacked's format: "<name>.pack <epoch>"; stale and malformed lines are dropped
+        self.assertEqual(set(rows), made | {"pack-recent.pack"})
+        self.assertLess(abs(float(rows[made.pop()]) - time.time()), 120)
+        self.assertEqual([p.name for p in mirror.iterdir() if "glaeda-disk." in p.name], [])
+
+    def test_shared_mirror_compact_leaves_a_mirror_one_pack_dominates(self) -> None:
+        # a dev host's blobless cmux mirror, 2026-11-09: one ~8 GiB pack plus a lazy fetch's tiny pack every few
+        # seconds; each fold rewrote 8 GiB, about three times an hour, and freed next to nothing
+        home, mirror, _ = self._shared_mirror(4)
+        self.assertFalse(gd.one_pack_dominates(mirror))
+        big = self.root / "big"
+        big.write_bytes(os.urandom(256 * 1024))  # incompressible: the pack stays this big
+        oid = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(big)).strip()
+        subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                        os.fspath(mirror / "objects/pack/pack")], input=oid + "\n", text=True, check=True,
+                       capture_output=True)
+        (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        self.assertTrue(gd.one_pack_dominates(mirror))
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log():
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(mirror), 5)
+        self.assertFalse(receipt.exists())
+        self.assertFalse((mirror / gd.SHARED_MIRROR_REPACKED_FILE).exists())
+        # once the small packs add up to more than a fifth of the bytes, a fold is worth its write again
+        for n in range(2):
+            extra = self.root / f"extra{n}"
+            extra.write_bytes(os.urandom(64 * 1024))
+            oid = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(extra)).strip()
+            subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                            os.fspath(mirror / "objects/pack/pack")], input=oid + "\n", text=True, check=True,
+                           capture_output=True)
+            (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        self.assertFalse(gd.one_pack_dominates(mirror))
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+
+    def _seed_fold(self, post, put=None) -> tuple[Path, list[str], dict]:
+        """Fold a 4-pack wt mirror with seed_release_url set and post/put standing in for the controller; returns
+        the mirror, the packs it held before and the receipt row."""
+        home, mirror, loose = self._shared_mirror(4)
+        before = gd.mirror_fold_packs(mirror)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.dict(gd.POLICY, {"seed_release_url": "http://controller.test:8080/"}), \
+                mock.patch.object(gd, "_seed_post", post), \
+                mock.patch.object(gd, "_seed_put", put or (lambda url, path: self.fail("no upload expected"))):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "cat-file", "-t", loose).strip(), "blob")
+        return mirror, before, json.loads(receipt.read_text().splitlines()[-1])
+
+    def test_seed_release_is_off_by_default_and_the_fold_runs_as_before(self) -> None:
+        self.assertEqual(gd.POLICY_DEFAULTS["seed_release_url"], "")
+        home, mirror, _ = self._shared_mirror(4)
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "_seed_post", lambda url, doc: self.fail("no call while unset")):
+            gd.compact_shared_mirrors(self.receipt(), home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        policy = self.root / "disk-policy.json"
+        policy.write_text('{"seed_release_url": "http://controller.test:8080"}')
+        self.assertEqual(gd.policy_overrides(policy), {"seed_release_url": "http://controller.test:8080"})
+        policy.write_text('{"seed_release_url": ""}')
+        self.assertEqual(gd.policy_overrides(policy), {"seed_release_url": ""})
+
+    def test_seed_release_names_the_mirror_and_every_pack_the_fold_deletes(self) -> None:
+        # RFD 0008 "Eviction and glaeda-disk": "before glaeda-disk drops a pack ... it asks the controller
+        # `POST /v1/seeds/release` with the pack names"
+        asked = []
+
+        def post(url, doc):
+            asked.append((url, doc))
+            return {"packs": [{"pack": p, "answer": "ok", "why": "another live holder has it"} for p in doc["packs"]]}
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(len(before), 4)
+        self.assertEqual(asked, [("http://controller.test:8080/v1/seeds/release",
+                                  {"host": gd.platform.node(), "repo": "o/r", "packs": before})])
+        self.assertEqual((rec["outcome"], gd.git_pack_count(mirror)), ("reclaimed", 1))
+
+    def test_seed_release_unreachable_controller_keeps_the_packs(self) -> None:
+        # "a host that cannot reach the controller keeps the pack and evicts something else"
+        def post(url, doc):
+            raise OSError("connection refused")
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("did not answer", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_keep_answer_keeps_the_packs(self) -> None:
+        def post(url, doc):
+            return {"packs": [{"pack": p, "answer": "ok" if i else "keep",
+                               "why": "no other live holder and the artifact store is not configured"}
+                              for i, p in enumerate(doc["packs"])]}
+        mirror, before, rec = self._seed_fold(post)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("1 of 4 packs answered keep", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_uploads_sole_packs_then_asks_again(self) -> None:
+        # the controller answers upload with a signed PUT for a sole pack, then ok once R2 has it
+        stored: set[str] = set()
+        put_bytes: dict[str, int] = {}
+
+        def post(url, doc):
+            return {"packs": [{"pack": p, "answer": "ok" if p in stored or p.endswith(("0", "2", "4", "6", "8"))
+                               else "upload", "put_url": f"https://r2.test/git-packs/o/r/{p}.pack"}
+                              for p in doc["packs"]]}
+
+        def put(url, path):
+            put_bytes[path.stem] = path.stat().st_size
+            stored.add(path.stem)
+            self.assertEqual(url, f"https://r2.test/git-packs/o/r/{path.stem}.pack")
+        mirror, before, rec = self._seed_fold(post, put)
+        sole = [p for p in before if not p.endswith(("0", "2", "4", "6", "8"))]
+        self.assertEqual(sorted(put_bytes), sole)
+        self.assertTrue(all(n > 0 for n in put_bytes.values()))
+        self.assertEqual((rec["outcome"], gd.git_pack_count(mirror)), ("reclaimed", 1))
+
+    def test_seed_release_failed_upload_or_still_sole_keeps_the_packs(self) -> None:
+        def always_upload(url, doc):
+            return {"packs": [{"pack": p, "answer": "upload", "put_url": "https://r2.test/x"} for p in doc["packs"]]}
+        _, before, rec = self._seed_fold(always_upload, lambda url, path: None)
+        self.assertEqual(rec["outcome"], "blocked:seed-release")
+        self.assertIn("still sole after their upload", rec["reasons"][0])
+
+        def failing_put(url, path):
+            raise OSError("403")
+        self.root = self.root / "again"
+        mirror, before, rec = self._seed_fold(always_upload, failing_put)
+        self.assertIn("failed (OSError: 403)", rec["reasons"][0])
+        self.assertEqual(gd.mirror_fold_packs(mirror), before)
+
+    def test_seed_release_asks_at_most_256_packs_at_once_and_checks_every_answer(self) -> None:
+        packs = [f"pack-{n:040x}" for n in range(300)]
+        sizes = []
+
+        def post(url, doc):
+            sizes.append(len(doc["packs"]))
+            return {"packs": [{"pack": p, "answer": "ok"} for p in doc["packs"]]}
+        self.assertEqual(gd.seed_release("http://c", "h", "o/r", self.root, packs, post=post), "")
+        self.assertEqual(sizes, [256, 44])
+        short = gd.seed_release("http://c", "h", "o/r", self.root, packs[:2],
+                                post=lambda url, doc: {"packs": [{"pack": packs[0], "answer": "ok"}]})
+        self.assertIn("does not name every pack", short)
+        self.assertIn("did not answer", gd.seed_release("http://c", "h", "o/r", self.root, packs[:1],
+                                                         post=lambda url, doc: {"no": "packs"}))
+        self.assertEqual(gd.mirror_repo(Path("/h/Projects/.wt-mirrors/manaflow-ai/cmux.git")), "manaflow-ai/cmux")
+        self.assertEqual(gd.mirror_repo(Path("/h/cmux/.git")), "")
+
+    def test_shared_mirror_compact_waits_for_room_for_its_peak(self) -> None:
+        # an agent lane host, 2026-11-12: a pressure repack of the 49 GB shared cmux mirror on a 97% full disk took free
+        # space to 113 MB and the host's review service refused a review; a repack starts only with room for its peak
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
+        home, mirror, _ = self._shared_mirror(4)
+        peak = gd.git_relief_peak(mirror)
+        # whole bytes of every object file, never count-objects' KiB (review F2): the packs and their indexes, and a
+        # loose object counts once a write adds it
+        files = [f for f in (mirror / "objects").rglob("*") if f.is_file()]
+        self.assertEqual(peak, sum(f.stat().st_size for f in files))
+        self.assertGreater(peak, sum(f.stat().st_size for f in files if f.suffix == ".pack"))
+        (self.root / "loose").write_text("loose\n")
+        self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(self.root / "loose"))
+        loose = gd.git_relief_peak(mirror)
+        self.assertGreater(loose, peak)
+        peak = loose
+        # a bundle takes objects from the stores objects/info/alternates names, so its bound adds them (review F1)
+        borrower = self.root / "borrower.git"
+        self._git("init", "-q", "--bare", os.fspath(borrower))
+        (borrower / "objects/info/alternates").write_text(f"{mirror / 'objects'}\n")
+        self.assertLess(gd.git_relief_peak(borrower), peak)
+        self.assertGreaterEqual(gd.git_relief_peak(borrower, alternates=True), peak)
+        # a chain (a --shared clone of a --shared clone) counts every store git follows, and a cycle ends (F1)
+        second = self.root / "second.git"
+        self._git("init", "-q", "--bare", os.fspath(second))
+        (second / "objects/info/alternates").write_text(f"{borrower / 'objects'}\n")
+        self.assertGreaterEqual(gd.git_relief_peak(second, alternates=True), peak)
+        (mirror / "objects/info").mkdir(exist_ok=True)
+        (mirror / "objects/info/alternates").write_text(f"{second / 'objects'}\n")
+        self.assertGreaterEqual(gd.git_relief_peak(second, alternates=True), peak)
+        (mirror / "objects/info/alternates").unlink()
+        shutil.rmtree(borrower)
+        shutil.rmtree(second)
+        real = gd.free_bytes
+        gd.process_evidence = lambda: ([], "")
+        for free, total in ((113 * 1024**2, 495 * gd.GIB), (peak + gd.RELIEF_SLOW_FLOOR - 1, 100 * gd.GIB),
+                            (peak + gd.RELIEF_SLOW_FLOOR, 1000 * gd.GIB)):  # 1000 GiB: the 2% share, 20 GiB, wins
+            with self.subTest(free=free, total=total):
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with self._gc_log(), mock.patch.object(gd, "free_bytes", lambda p: (free, total)):
+                    self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+                    self.assertFalse((self.root / "gc-failed.json").exists())  # no room is no failure: retried
+                self.assertEqual(gd.git_pack_count(mirror), 4)
+                self.assertFalse(os.path.lexists(mirror / "objects/maintenance.lock"))
+                rec = json.loads(receipt.read_text())
+                self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:no-room", "blocked"))
+                self.assertTrue(rec["reasons"][0].startswith("no room: its peak needs"), rec["reasons"])
+        with self._gc_log(), mock.patch.object(gd, "free_bytes", lambda p: (peak + gd.RELIEF_SLOW_FLOOR, 100 * gd.GIB)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(self.receipt(), home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "eio")):  # unreadable: no room
+            self.assertTrue(gd.relief_room(mirror, 0, slow=True).startswith("no room: cannot read"))
+        self.assertEqual(gd.free_bytes, real)
+
+    def test_a_bundle_needs_room_for_its_unpushed_objects_not_the_whole_store(self) -> None:
+        # cmux17's ~/m2l-viewer: 13 unpushed commits (2 MB) in a 2.6 GB store needed 5.6 GB free to bundle
+        repo = self.root / "repo"
+        self._git("init", "-q", "-b", "main", os.fspath(repo))
+        (repo / "big.bin").write_bytes(os.urandom(4 * 1024**2))  # pushed history: incompressible, 4 MiB
+        self._git("-C", os.fspath(repo), "add", "big.bin")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "pushed")
+        self._git("-C", os.fspath(repo), "update-ref", "refs/remotes/origin/main", "HEAD")
+        (repo / "small.txt").write_text("unpushed\n")
+        self._git("-C", os.fspath(repo), "add", "small.txt")
+        self._git("-C", os.fspath(repo), "commit", "-qm", "unpushed")
+        gitdir = repo / ".git"
+        whole = gd.git_relief_peak(gitdir, alternates=True)
+        self.assertGreater(whole, 4 * 1024**2)
+        with mock.patch.object(gd, "BUNDLE_PEAK_SLACK", 0):
+            unpushed = gd.bundle_peak(gitdir, ["refs/heads/main", "--not", "refs/remotes/origin/main"])
+            self.assertLess(unpushed, 64 * 1024)  # a commit, a tree and a blob, not the 4 MiB blob
+            self.assertGreater(unpushed, 0)
+            # everything unpushed: the bound is the whole history, never more than the store
+            self.assertLessEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+            self.assertGreater(gd.bundle_peak(gitdir, ["refs/heads/main"]), 4 * 1024**2)
+            # a git that cannot count (too old for --disk-usage, a broken store): the whole store
+            with mock.patch.object(gd, "_git_dir_run", return_value=None):
+                self.assertEqual(gd.bundle_peak(gitdir, ["refs/heads/main"]), whole)
+
+    def test_a_sparse_checkouts_absent_paths_are_not_hidden_work(self) -> None:
+        root = self.root / "tree"
+        (root / "kept").mkdir(parents=True)
+        (root / "kept/here.txt").write_text("x")
+        # cmux17's ~/m2l-viewer: 41,592 skip-worktree entries for paths a sparse checkout left out
+        self.assertFalse(gd.hidden_from_status("H kept/here.txt\0S gone/a.txt\0S gone/dir/b.txt\0", root))
+        self.assertFalse(gd.hidden_from_status("", root))
+        # a skip-worktree file in the tree may hold edits status does not show
+        self.assertTrue(gd.hidden_from_status("S kept/here.txt\0", root))
+        # assume-unchanged (lowercase), with or without skip-worktree, always may
+        self.assertTrue(gd.hidden_from_status("h kept/here.txt\0", root))
+        self.assertTrue(gd.hidden_from_status("s gone/a.txt\0", root))
+        # a name with a newline or spaces is one entry under -z
+        (root / "kept/odd\nname x").write_text("y")
+        self.assertTrue(gd.hidden_from_status("S kept/odd\nname x\0", root))
+        self.assertFalse(gd.hidden_from_status("S kept/odd\nname y\0", root))
+
+    def test_a_failed_git_call_says_why_when_asked(self) -> None:
+        said: list[str] = []
+        self.assertIsNone(gd._git_dir_run(self.root / "no-such.git", "rev-parse", "HEAD", errors=said))
+        self.assertEqual(len(said), 1)
+        self.assertTrue(said[0])
+
+    def test_every_git_relief_waits_for_room_for_its_peak(self) -> None:
+        # the class: home clone gc and runner checkout repack go through the same gate as the mirror compact
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
+        gd.process_evidence = lambda: ([], "")
+        for name, make, run in (
+                ("home-clone-gc", lambda: self._home_clone(3)[:2], lambda r, h: gd.gc_home_clones(r, h)),
+                ("runner-checkout-repack", lambda: (lambda h, _, t: (h, t))(*self._runner_checkout_packs(3)),
+                 lambda r, h: gd.repack_runner_checkouts(r, h))):
+            with self.subTest(name):
+                shutil.rmtree(self.root / "home", ignore_errors=True)
+                home, tree = make()
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with self._gc_log(), mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 3), \
+                        mock.patch.object(gd, "HOME_CLONE_GC_PACKS", 3), \
+                        mock.patch.object(gd, "free_bytes", lambda p: (gd.GIB, 495 * gd.GIB)):
+                    self.assertEqual(run(receipt, home), 0)
+                gitdir = tree / ".git"
+                self.assertEqual(gd.git_pack_count(gitdir), 3)
+                rows = [json.loads(ln) for ln in receipt.read_text().splitlines()]
+                self.assertIn("blocked:no-room", [r["outcome"] for r in rows], rows)
+
+    def test_git_writers_all_go_through_the_relief_peak_gate(self) -> None:
+        """Detector for the class "a disk relief whose own peak can exceed free space": every git subcommand that
+        writes a new pack (repack, gc, maintenance, pack-objects) or a bundle starts only in _gc_clones or
+        _write_bundle, which call relief_room first. A new writer elsewhere fails here until it is gated too."""
+        src = (ROOT / "scripts" / "glaeda-disk").read_text()
+        allowed = {"gc_home_clones", "repack_runner_checkouts", "SHARED_MIRROR_REPACK_ARGS", "_write_bundle"}
+        writer = re.compile(r"""["'](repack|gc|maintenance|pack-objects)["']\s*,|["']bundle["'],\s*["']create["']""")
+        owner, found = "", []
+        for line in src.splitlines():
+            if m := re.match(r"(?:def\s+(\w+)|([A-Z_]+)\s*=)", line):
+                owner = m.group(1) or m.group(2)
+            if writer.search(line) and not line.lstrip().startswith("#"):
+                found.append(owner)
+        self.assertTrue(found)
+        self.assertEqual(sorted(set(found) - allowed), [], "a git writer outside the relief gate (relief_room)")
+        for fn in ("_gc_clones", "_write_bundle", "archive_work_tree", "archive_git_dir"):
+            body = src.split(f"\ndef {fn}(", 1)[1].split("\ndef ", 1)[0]
+            self.assertIn("relief_room(", body, fn)
+
+    def test_shared_mirrors_never_lie_beneath_a_symlinked_folder(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        outside = self.root / "outside"
+        shutil.move(os.fspath(home / "Projects"), os.fspath(outside))
+        (home / "Projects").symlink_to(outside)  # ~/Projects leads outside home (review F2)
+        self.assertEqual(gd.shared_mirrors(home), [])
+
+    def test_shared_mirror_compact_lock_is_freed_when_its_holder_is_gone(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        lock = mirror / "objects/maintenance.lock"
+        # stopped with SIGTERM: the wrapper's trap removes the lock (review F1)
+        argv = gd.compact_wrapper(lock, mirror / gd.SHARED_MIRROR_REPACKED_FILE, ["sleep", "2"])
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        proc = subprocess.Popen(argv)
+        for _ in range(200):
+            if lock.read_text().strip() != gd.SHARED_MIRROR_LOCK_MARK:
+                break
+            time.sleep(0.01)
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))  # its holder runs
+        proc.terminate()
+        proc.wait(timeout=10)  # sh runs the trap once its child (git) exits
+        self.assertFalse(lock.exists())
+        # killed outright, or a reboot: the pid it names is gone, so the next pass frees it
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # git's own lock, and ours before the wrapper started (under an hour), stay
+        lock.write_text("")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        os.utime(lock, (time.time() - 2 * 3600,) * 2)
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # a pass after a SIGKILL compacts again
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        gd.process_evidence = lambda: ([], "")
+        receipt = self.receipt()
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        self.assertFalse(lock.exists())
+
+    def test_shared_mirror_compact_below_the_pack_threshold_does_nothing(self) -> None:
+        home, mirror, _ = self._shared_mirror(3)
+        receipt = self.receipt()
+        with self._gc_log():
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(mirror), 3)
+        self.assertFalse(receipt.exists())
+
+    def test_shared_mirror_compact_vetoes(self) -> None:
+        cases = {
+            "holds gc.pid": lambda m: (m / "gc.pid").write_text("1 host"),
+            "holds objects/maintenance.lock": lambda m: (m / "objects/maintenance.lock").write_text(""),
+            "a repack is writing a pack": lambda m: (m / "objects/pack/.tmp-77-pack-abc").write_text(""),
+            "a repack, gc or maintenance command": lambda m: setattr(
+                gd, "process_evidence", lambda: ([], f"git -C {m} repack -d --geometric=2\n")),
+        }
+        for reason, make_busy in cases.items():
+            with self.subTest(reason):
+                shutil.rmtree(self.root / "home", ignore_errors=True)
+                shutil.rmtree(self.root / "src", ignore_errors=True)
+                gd.process_evidence = lambda: ([], "")
+                home, mirror, _ = self._shared_mirror(4)
+                make_busy(mirror)
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with self._gc_log():
+                    self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+                self.assertEqual(gd.git_pack_count(mirror), 4)
+                self.assertIn(reason, json.loads(receipt.read_text())["reasons"][0])
+        # a fetch loop never holds it off (cmux16, 2026-11-08: ~700 packs an hour): its command, its cwd, its
+        # temporary pack; nor does a repack's temporary pack a killed run left two hours ago
+        shutil.rmtree(self.root / "home", ignore_errors=True)
+        shutil.rmtree(self.root / "src", ignore_errors=True)
+        home, mirror, _ = self._shared_mirror(4)
+        (mirror / "objects/pack/tmp_pack_abc123").write_text("")
+        stale = mirror / "objects/pack/.tmp-1-pack-old"
+        stale.write_text("")
+        os.utime(stale, (time.time() - 2 * 3600,) * 2)
+        fetch = f"git -C {mirror} fetch --prune origin\n"
+        self.assertEqual(gd.shared_mirror_veto(mirror, frozenset([os.fspath(mirror)]), fetch, time.time()), "")
+        gd.process_evidence = lambda: ([os.fspath(mirror)], fetch)
+        receipt = self.receipt()
+        receipt.unlink(missing_ok=True)
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(json.loads(receipt.read_text())["outcome"], "reclaimed")
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+
+    def test_shared_mirror_compact_runs_under_the_floor_on_every_role_only(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        room = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        fss = {"value": room}
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "IDLE_STAMP", self.root / "idle.stamp"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", side_effect=lambda *a, **k: fss["value"]), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "gc_home_clones", return_value=0), \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "compact_shared_mirrors", return_value=0) as compact, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            gd.main(["--pressure", "--idle", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_not_called()  # room to spare: neither the pressure pass nor the idle sweep
+            fss["value"] = under
+            gd.main(["--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_not_called()  # a plain --apply is not the floor's pass
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_called_once()
+
+    def test_home_clone_gc_runs_on_pressure_and_sweeps_of_fleet_minis_only(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        order: list[str] = []
+        real_release = gd.release_evict_lock
+
+        def release(handle):
+            if handle is not None:
+                order.append("release")
+            real_release(handle)
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=under), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "release_evict_lock", side_effect=release), \
+                mock.patch.object(gd, "gc_home_clones", side_effect=lambda *a, **k: order.append("gc") or 0) as gc, \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0) as repack, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # neither a sweep nor pressure
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            gc.assert_not_called()
+            repack.assert_not_called()
+            gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
+            gc.assert_called_once()
+            repack.assert_called_once()
+        self.assertEqual(order[-2:], ["release", "gc"])  # a long gc never holds the eviction lock
+
+    @twelve_hour_ages
     def test_idle_sweep_windows_follow_reuse(self) -> None:
         ci = self.root / "ci"
         (ci / "seeds").mkdir(parents=True)
@@ -2086,7 +8843,8 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / "derived-data", age_hours=30)
         fams = gd.idle_families(gd.fleet_families(ci))
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable",
+        # SEED_KEEP 1: only the newest stays whatever its age; p-b, used 2 h ago, waits out the 12 h window
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "recent", "seeds/p-c": "reclaimable",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
                                "pr-builds/pr-2": "recent", "derived-data": "reclaimable"})
         # DerivedData and caches use the 12 h idle window for disposable output.
@@ -2133,6 +8891,178 @@ class GlaedaDiskTest(unittest.TestCase):
         with ps(""):
             self.assertIn("cannot list", gd.host_busy(fleet))
 
+    def test_host_busy_marks_its_no_answer_reasons(self) -> None:
+        """glaeda-mini-health tells host_busy's could-not-read reasons (no restart is coming) from a busy host (a short
+        wait) by host_busy_unreadable, not by matching text of its own."""
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        ps = lambda out: mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, ""))
+        unreadable, busy = [], []
+        with ps(""):
+            unreadable.append(gd.host_busy(fleet))
+        with ps("/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            busy.append(gd.host_busy(fleet))
+        with ps("/sbin/launchd\n"):
+            (fleet / "jobs").write_text("")  # not a directory: scandir fails
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "jobs").unlink()
+            (fleet / "jobs").mkdir()
+            (fleet / "jobs/abc").mkdir()
+            busy.append(gd.host_busy(fleet))
+            (fleet / "jobs/abc").rmdir()
+            (fleet / "reservation.json").write_text("{")
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").write_text(json.dumps({"until": 1}))
+            busy.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").unlink()
+            os.symlink(fleet / "elsewhere", fleet / "host.lock")  # O_NOFOLLOW refuses it
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "host.lock").unlink()
+            (fleet / "host.lock").touch()
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                busy.append(gd.host_busy(fleet))
+        self.assertEqual(len(set(unreadable)), 4, unreadable)
+        for reason in unreadable:
+            self.assertTrue(reason and gd.host_busy_unreadable(reason), reason)
+        for reason in busy:
+            self.assertTrue(reason and not gd.host_busy_unreadable(reason), reason)
+        self.assertFalse(gd.host_busy_unreadable(""))
+
+    def test_the_repo_runner_hook_is_allowlisted_for_drain(self) -> None:
+        """Every change to scripts/glaeda-cmux-runner-hook must pin its sha256 in CMUX_NEXT_DRAIN_HOOK_SHA256, or
+        drain refuses every runner that installed it ("runner hook enrollment is not proven"). #1561 missed it
+        and the three drain tests below went red on main with a message that did not say why (#1553 before it).
+        On a checkout this pins it (scripts/glaeda_hook_pin.py); under CI it only checks."""
+        self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
+        self.assertIn(glaeda_hook_pin.hook_sha(), gd.CMUX_NEXT_DRAIN_HOOK_SHA256)
+
+    def test_cmux_next_drain_requires_enrollment_and_holds_host_lock(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "host.lock").touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text(
+            "exec /usr/bin/python3 glaeda-cmux-runner-hook job-started --allowed-owner manaflow-ai\n"
+        )
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        try:
+            ps = mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            )
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNotNone(handle, reason)
+            self.assertEqual(reason, "")
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="another-owner")
+            self.assertIsNone(handle)
+            self.assertIn("owner", reason)
+            (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_text(
+                "# def take_host_lock(x): pass; def release_host_lock(x): pass\n"
+            )
+            with ps:
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNone(handle)
+            self.assertIn("enrollment", reason)
+        finally:
+            gd.HOME, gd.FLEET_DIR = saved
+
+    def test_cmux_next_drain_defers_when_host_lock_is_held(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        lock = fleet / "host.lock"
+        lock.touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text("glaeda-cmux-runner-hook job-started\n")
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        with lock.open("a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            try:
+                with mock.patch.object(
+                    gd.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+                ):
+                    handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+                self.assertIsNone(handle)
+                self.assertIn("host.lock", reason)
+            finally:
+                gd.HOME, gd.FLEET_DIR = saved
+
+    def test_cmux_next_drain_defers_for_a_live_runner_worker(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "host.lock").touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text("glaeda-cmux-runner-hook job-started\n")
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        try:
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "/Users/actions-runner-glaeda/bin/Runner.Worker --job\n", ""
+                ),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNone(handle)
+            self.assertIn("live job/build", reason)
+        finally:
+            gd.HOME, gd.FLEET_DIR = saved
+
     def test_idle_apply_stops_once_the_host_turns_busy(self) -> None:
         for name in ("a", "b", "c"):
             make(self.root / name)
@@ -2168,15 +9098,167 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse((self.root / "day").exists())
             self.assertTrue(stamp.exists())
             make(self.root / "old", age_hours=50)
-            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
-                gd.main(args)  # within the hour: no second sweep
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out, \
+                    mock.patch.dict(gd.POLICY, build_caches_unwindowed=False):
+                gd.main(args)  # within the hour: no second sweep (where build caches keep their windows)
             self.assertIn("within", out.getvalue())
             self.assertTrue((self.root / "old").exists())
+            with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args)  # a fleet mini sweeps on every pass: a build's caches go when it ends
+            self.assertNotIn("within", out.getvalue())
+            self.assertFalse((self.root / "old").exists())
 
+    def test_a_finished_builds_cache_goes_on_the_next_pass_with_no_pressure(self) -> None:
+        """Leo, 2026-11-18: "these build caches, if they're not being used, they're not useful. So stop holding
+        on to [junk]." A fleet mini's pass after a job (--pressure --apply, plenty free) sweeps, and a build cache
+        minutes old goes: no age window, no hourly sweep stamp. What a process holds stays."""
+        make(self.root / "finished", age_hours=0.05)
+        make(self.root / "live", age_hours=0.05)
+        stamp = self.root.parent / f"{self.root.name}-idle.last"
+        self.addCleanup(stamp.unlink, missing_ok=True)
+        stamp.touch()  # a sweep "ran within the hour"
+        summary = self.root.parent / f"{self.root.name}-summary.json"
+        self.addCleanup(summary.unlink, missing_ok=True)
+        gd.process_evidence = lambda: ([], f"xcodebuild -derivedDataPath {self.root / 'live'} build\n")
+        args = ["--pressure", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1",
+                "--target", "2", "--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "IDLE_STAMP", stamp), mock.patch.object(gd, "HEALTH_SUMMARY", summary), \
+                mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+                mock.patch.object(gd, "command_lines", return_value=f"xcodebuild -derivedDataPath {self.root / 'live'}\n"), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]), contextlib.redirect_stdout(io.StringIO()):
+            gd.main(args)
+        self.assertFalse((self.root / "finished").exists())
+        self.assertTrue((self.root / "live").exists(), "a running build's cache stays")
+        self.assertEqual(json.loads(summary.read_text())["outlived_build_caches"]["count"], 0)
+
+    def test_build_caches_keep_their_windows_off_a_fleet_mini_or_when_turned_off(self) -> None:
+        make(self.root / "finished", age_hours=0.05)
+        args = ["--pressure", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "1",
+                "--target", "2", "--receipt", os.fspath(self.receipt())]
+        for extra, policy in ((["--role", "devbox"], {}), ([], {"build_caches_unwindowed": False})):
+            with mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                    mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root.parent / f"{self.root.name}.lock"), \
+                    mock.patch.dict(gd.POLICY, policy), contextlib.redirect_stdout(io.StringIO()) as out:
+                gd.main(args + extra)
+            self.assertIn("no pressure", out.getvalue(), extra or policy)
+            self.assertTrue((self.root / "finished").exists(), extra or policy)
+            self.assertFalse(gd.BUILD_CACHES_UNWINDOWED)
+
+    def test_a_build_cache_has_no_age_window_but_one_per_kind_stays_by_role(self) -> None:
+        dd = gd.Family("ci-derived-data", self.root, True, "rebuild", min_idle_hours=1.0)
+        hot = gd.Family("cmux-pr-builds", self.root, True, "rebuild", max_idle_hours=float("inf"))
+        runner = gd.Family(gd.RUNNER_BUILD_FAMILY, self.root, True, "rebuild", build_output=True, pressure_only=True)
+        scratch = gd.Family("tmp", self.root, True, "rebuild", min_idle_hours=1.0)
+        nightly = gd.Family(gd.NIGHTLY_NEXT_FAMILY, self.root, True, "rebuild", build_output=True,
+                            min_idle_hours=12.0, max_idle_hours=12.0)
+        path = self.root / "x"
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True), mock.patch.object(gd, "job_starts",
+                                                                                     return_value=[time.time()]):
+            for mode in ("pressure", "sweep", None):
+                with mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                    for fam in (dd, hot, runner):
+                        self.assertEqual(gd.item_window(fam, path, 1.0), 0.0, (fam.id, mode))
+                        self.assertTrue(gd.item_due(fam, 0.01, 0.0)[0], (fam.id, mode))  # one job since: still due
+            self.assertEqual(gd.item_window(scratch, path, 1.0), 1.0)  # not a build cache: its window stands
+            self.assertEqual(gd.item_window(nightly, path, 1.0), 12.0)  # the queued nightly's warm inputs
+            with mock.patch.object(gd, "cmux_next_ci_host_root", return_value=True):
+                self.assertNotEqual(gd.item_window(dd, path, 1.0), 0.0)  # one working cache per builder, by role
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+            self.assertEqual(gd.item_window(dd, path, 1.0), 1.0)
+
+    def test_a_devbox_spares_a_fresh_xcode_build_under_pressure_a_fleet_mini_does_not(self) -> None:
+        # 2026-11-23: a devbox pressure pass deleted a live check's 14.5 GB DerivedData 0.1 h after its build
+        path = self.root / "cmux-try48231"
+        home = self.root / "home"
+        (home / "Library/Developer/Xcode/DerivedData").mkdir(parents=True)
+        with mock.patch.object(gd, "HOME", home):
+            devbox = next(f for f in gd.default_families("devbox") if f.id == "xcode-derived-data")
+            mini = next(f for f in gd.default_families("fleet-mini") if f.id == "xcode-derived-data")
+        pressure_idle = gd.POLICY["pressure_idle_hours"]
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False):
+                window = gd.item_window(devbox, path, pressure_idle)
+                self.assertEqual(window, gd.FRESH_BUILD_HOURS)
+                self.assertFalse(gd.item_due(devbox, 1.0, window)[0])
+                self.assertTrue(gd.item_due(devbox, gd.FRESH_BUILD_HOURS + 0.5, window)[0])
+            with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):  # Leo's no-window rule stands on a mini
+                self.assertTrue(gd.item_due(mini, 0.1, gd.item_window(mini, path, pressure_idle))[0])
+
+    def test_outlived_build_caches_counts_only_unheld_build_caches_still_on_disk(self) -> None:
+        dd = gd.Family("ci-derived-data", self.root, True, "rebuild")
+        scratch = gd.Family("tmp", self.root, True, "rebuild")
+        left, gone, held = make(self.root / "left", mib=2), self.root / "gone", make(self.root / "held")
+        loose = make(self.root / "loose")
+        items = [gd.Item("ci-derived-data", os.fspath(left), 2 * 1024**2, 0.1, "reclaimable"),
+                 gd.Item("ci-derived-data", os.fspath(gone), 1024**2, 0.1, "reclaimable"),
+                 gd.Item("ci-derived-data", os.fspath(held), 1024**2, 0.1, "in-use", ["open by a process"]),
+                 gd.Item("tmp", os.fspath(loose), 1024**2, 0.1, "reclaimable")]
+        fams = {"ci-derived-data": dd, "tmp": scratch}
+        with mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", True):
+            out = gd.outlived_build_caches(items, fams)
+        self.assertEqual((out["count"], out["bytes"]), (1, 2 * 1024**2))
+        self.assertEqual(out["top"][0]["path"], os.fspath(left))
+
+    def test_an_idle_sweep_reuses_recent_sizes_of_what_it_cannot_delete(self) -> None:
+        """Leo: "typing under load is not good enough". idle-repair's hourly `--role devbox --refresh --pressure --idle
+        --apply` re-walked every candidate with du, ~/Library/Caches' children and the report-only checkouts too, on a
+        loaded desktop (a devbox Mac, 2026-11-17: load 19, 6 min in du). A sweep deletes neither a pressure-only cache nor
+        a report-only item, so it reuses their sizes while they are recent and walks only what it may delete."""
+        caches = gd.Family("library-caches", self.root / "Caches", True, "rebuild", pressure_only=True)
+        report = gd.Family("devbox-checkouts", self.root / "Projects", False, "a person's checkout")
+        scratch = gd.Family("test-scratch", self.root / "scratch", True, "rebuild")
+        for i in range(4):
+            make(caches.root / f"cache{i}", age_hours=100)
+        for i in range(3):
+            make(report.root / f"checkout{i}", age_hours=100)
+        make(scratch.root / "fresh", age_hours=0)
+        side = self.root.parent / f"{self.root.name}-sweep"
+        side.mkdir()
+        self.addCleanup(shutil.rmtree, side, ignore_errors=True)
+        snap, stamp = side / "sizes.json", side / "idle.last"
+        args = ["--role", "devbox", "--refresh", "--pressure", "--idle", "--apply", "--top", "0", "--min-mib", "0",
+                "--receipt", os.fspath(side / "receipt.jsonl")]
+        walked_du = gd.du_bytes
+
+        def walked(argv: list[str]) -> list[str]:
+            stamp.unlink(missing_ok=True)
+            with mock.patch.object(gd, "du_bytes", side_effect=walked_du) as du, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                gd.main(argv)
+            return sorted(Path(c.args[0]).name for c in du.call_args_list if self.root in Path(c.args[0]).parents)
+
+        with mock.patch.object(gd, "default_families", return_value=[caches, report, scratch]), \
+                mock.patch.object(gd, "free_bytes", return_value=(300 * gd.GIB, 400 * gd.GIB)), \
+                mock.patch.object(gd, "SNAPSHOT", snap), mock.patch.object(gd, "IDLE_STAMP", stamp), \
+                mock.patch.object(gd, "EVICT_LOCK", side / "evict.lock"), \
+                mock.patch.object(gd, "MEASURE_LOCK", side / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", side / "summary.json"), \
+                mock.patch.object(gd, "RUN_LOG", side / "runs.jsonl"), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "simulator_runtimes", return_value=[]):
+            everything = [*(f"cache{i}" for i in range(4)), *(f"checkout{i}" for i in range(3)), "fresh"]
+            self.assertEqual(walked(args), sorted(everything), "a cold snapshot walks every candidate once")
+            self.assertEqual(walked(args), ["fresh"], "the next sweep walks only what it may delete")
+            self.assertTrue(all((caches.root / f"cache{i}").exists() for i in range(4)), "pressure-only: kept")
+            _, sizes, times = gd.load_snapshot_meta(snap)
+            self.assertEqual(set(sizes), {os.fspath(p) for f in (caches, report, scratch) for p in f.root.iterdir()})
+            cache0 = os.fspath(caches.root / "cache0")
+            self.assertLess(time.time() - times[cache0], gd.SWEEP_SIZE_REUSE_S,
+                            "a reused size keeps the time it was measured, so it ages out")
+            # past its reuse window a size is walked again, and only that one
+            gd.save_snapshot(sizes, snap, measured_at={**times, cache0: time.time() - gd.SWEEP_SIZE_REUSE_S})
+            self.assertEqual(walked(args), ["cache0", "fresh"])
+            # a report's --refresh still re-measures every size
+            self.assertEqual(walked(["--refresh", "--top", "0", "--min-mib", "0"]), sorted(everything))
+
+    @twelve_hour_ages
     def test_simulator_runtimes_go_only_when_nothing_uses_them(self) -> None:
         now = time.time()
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
-        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
+        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 6 * 3600))  # inside RUNTIME_IDLE_DAYS
 
         def rt(version, used, deletable=True):
             return {"runtimeIdentifier": f"ios-{version}", "platformIdentifier": "iphonesimulator",
@@ -2206,6 +9288,1390 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn(os.path.realpath("/Applications/Xcode_26.6.app"), gd.xcode_pins(home))
 
 
+# A replay of cmux11s-mac-mini's `xcrun simctl list devices -j` on 2026-10-27 (trimmed to the fields judged): 30 of
+# its 32 devices had not booted in over 80 h and held 35 GB, one was booted.
+SIM_REPLAY = {"devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+        {"udid": "11592F6E-1A41-4215-BF7D-8BE182D2922E", "name": "kit-kit-composer-files", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 4062547968, "lastBootedAt": "2026-10-15T04:17:52Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/11592F6E-1A41-4215-BF7D-8BE182D2922E/data"},
+        {"udid": "E6E55520-3F79-455A-A632-2DA6E48E8184", "name": "iPhone Air", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 2871279616, "lastBootedAt": "2026-10-27T03:56:01Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/E6E55520-3F79-455A-A632-2DA6E48E8184/data"},
+        {"udid": "354B816F-7981-4034-91FB-003E5B665460", "name": "termq-phone", "state": "Booted",
+         "isAvailable": True, "dataPathSize": 3991470080, "lastBootedAt": "2026-10-24T01:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/354B816F-7981-4034-91FB-003E5B665460/data"},
+        {"udid": "7154399E-F98A-481C-A999-0DBA6BD39A68", "name": "kit-kit-composer-red", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 18337792, "lastBootedAt": "2026-10-20T00:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/7154399E-F98A-481C-A999-0DBA6BD39A68/data"},
+        {"udid": "7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5", "name": "iPhone 17", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 3848327168,
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5/data"},
+        {"udid": "8F5818EA-A6C4-4222-8F67-8399C0AA3DC6", "name": "pushopen-kit", "state": "Shutdown",
+         "isAvailable": False, "dataPathSize": 3269836800, "lastBootedAt": "2026-10-15T00:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/8F5818EA-A6C4-4222-8F67-8399C0AA3DC6/data"},
+    ]}}
+SIM_NOW = 1793110000.0  # 2026-10-27T05:26:40Z
+
+
+class SimDeviceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.receipt = Path(self.tmp.name) / "receipt.jsonl"
+        token = mock.patch.object(gd, "SIM_TOKEN", Path(self.tmp.name) / "simulator.token")  # never the fleet's
+        token.start()
+        self.addCleanup(token.stop)
+
+    def verdicts(self, cmds: str = "", opened: frozenset[str] = frozenset(), leases: str | None = "") -> dict:
+        return {i.reasons[0].split(" (")[0]: (i.verdict, i.reasons[1:])
+                for i in gd.sim_device_items(SIM_REPLAY, cmds, opened, SIM_NOW, leases)}
+
+    @twelve_hour_ages
+    def test_the_cmux11s_replay(self) -> None:
+        v = self.verdicts()
+        self.assertEqual(v["kit-kit-composer-files"][0], "reclaimable", "shutdown, 12 days since its last boot")
+        self.assertEqual(v["iPhone Air"][0], "recent", "booted 1.5 h ago")
+        self.assertEqual(v["termq-phone"], ("kept", ["it is Booted"]))
+        self.assertEqual(v["kit-kit-composer-red"], ("kept", ["its data is already small"]))
+        self.assertEqual(v["iPhone 17"], ("kept", ["no last-boot time"]))
+        self.assertEqual(v["pushopen-kit"], ("kept", ["simctl lists it unavailable"]))
+
+    def test_a_job_or_lease_that_names_a_device_keeps_it(self) -> None:
+        udid = "11592F6E-1A41-4215-BF7D-8BE182D2922E"
+        home = f"/Users/cmux/Library/Developer/CoreSimulator/Devices/{udid}"
+        for cmds, opened, leases, why in (
+                (f"xcodebuild test -destination platform=iOS Simulator,id={udid.lower()}\n", frozenset(), "",
+                 "a running command names it"),
+                ("xcodebuild test -destination 'platform=iOS Simulator,name=kit-kit-composer-files'\n", frozenset(),
+                 "", "a running command names it"),
+                ("", gd.open_index([home + "/data/Library/x.db"]), "", "a process has a file open in it"),
+                ("", frozenset(), f"udid={udid}\n", "a capture lease names it"),
+                ("", frozenset(), None, "the capture leases cannot be read")):
+            with self.subTest(why=why):
+                with mock.patch.object(gd, "capture_lease_text", return_value=leases):
+                    self.assertEqual(self.verdicts(cmds, opened, None)["kit-kit-composer-files"], ("kept", [why]))
+        # a short name counts too: keeping a device too often is safe
+        self.assertEqual(self.verdicts("xcodebuild -destination 'platform=iOS Simulator,name=QA'\n",
+                                       leases="")["kit-kit-composer-files"][0], "reclaimable")
+        short = json.loads(json.dumps(SIM_REPLAY))
+        short["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"] = "QA"
+        (item,) = [i for i in gd.sim_device_items(short, "xcodebuild -destination name=QA\n", frozenset(), SIM_NOW, "")
+                   if i.path == "11592F6E-1A41-4215-BF7D-8BE182D2922E"]
+        self.assertEqual((item.verdict, item.reasons[1:]), ("kept", ["a running command names it"]))
+        nameless = json.loads(json.dumps(SIM_REPLAY))
+        del nameless["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"]
+        self.assertIn("its name cannot be read", {i.path: i.reasons for i in gd.sim_device_items(
+            nameless, "", frozenset(), SIM_NOW, "")}["11592F6E-1A41-4215-BF7D-8BE182D2922E"])
+        unsized = json.loads(json.dumps(SIM_REPLAY))
+        unsized["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = "big"
+        self.assertEqual({i.path: i.reasons[1:] for i in gd.sim_device_items(unsized, "", frozenset(), SIM_NOW, "")}
+                         ["11592F6E-1A41-4215-BF7D-8BE182D2922E"], ["its size cannot be read"])
+        # a name that is only part of another word or path is no use of it
+        self.assertEqual(self.verdicts("/tmp/kit-kit-composer-files-old/build\n")["kit-kit-composer-files"][0],
+                         "reclaimable")
+
+    def test_capture_lease_text_reads_lease_files_and_fails_closed(self) -> None:
+        root = Path(self.tmp.name) / "leases"
+        self.assertEqual(gd.capture_lease_text(root), "", "no lease root: nothing is leased")
+        (root / "lease-1").mkdir(parents=True)
+        (root / "lease-1/alias").write_text("sim 11592F6E-1A41-4215-BF7D-8BE182D2922E")
+        self.assertIn("11592F6E", gd.capture_lease_text(root))
+        (root / "lease-1/huge").write_bytes(b"x" * 70000)  # not a lease record: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/huge").unlink()
+        (root / "lease-1/state").write_bytes(b"\xff\xfe")  # being written or not text: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/state").unlink()
+        root.chmod(0)
+        try:
+            if os.access(root, os.R_OK):
+                self.skipTest("running as a user who can read a mode-0 directory")
+            self.assertIsNone(gd.capture_lease_text(root))
+        finally:
+            root.chmod(0o755)
+
+    @twelve_hour_ages
+    def test_erase_judges_again_and_erases_only_what_is_still_idle(self) -> None:
+        """The first reading finds two idle devices; by the second, a job booted one. Only the other is erased, with
+        `simctl erase` (never delete), largest first, and both get a receipt line."""
+        second = json.loads(json.dumps(SIM_REPLAY))
+        devs = second["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"]
+        devs.append({**devs[0], "udid": "AAAAAAAA-0000-0000-0000-000000000001", "name": "kit-other",
+                     "dataPathSize": 5 * gd.GIB})
+        first = json.loads(json.dumps(second))
+        booted = json.loads(json.dumps(second))
+        booted["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][-1]["state"] = "Booted"
+        erased = json.loads(json.dumps(booted))
+        erased["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = 1024
+        readings = iter([first, booted, booted, erased])
+        runs = []
+
+        def run(argv, **kw):
+            if argv[0] != "ps":
+                runs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            released = gd.erase_idle_sim_devices(self.receipt, simctl=lambda: next(readings))
+        self.assertEqual(runs, [["xcrun", "simctl", "erase", "11592F6E-1A41-4215-BF7D-8BE182D2922E"]])
+        self.assertEqual(released, 4062547968 - 1024)
+        recs = [json.loads(line) for line in self.receipt.read_text().splitlines()]
+        self.assertEqual([(r["path"][:8], r["outcome"]) for r in recs],
+                         [("AAAAAAAA", "changed:in-use"), ("11592F6E", "reclaimed")])
+
+    def test_a_halt_evidence_failure_reservation_or_reached_target_erases_nothing(self) -> None:
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed")
+        ok = mock.patch.object(gd, "process_evidence", return_value=([], ""))
+        for name, patch, halt, reserved, short in (
+                ("evidence", mock.patch.object(gd, "process_evidence", side_effect=no_evidence), None, "", None),
+                ("halt", ok, lambda: "a CI job", "", None),
+                ("reserved mid-pass", ok, None, "reserved for someone (r1)", None),
+                ("reserved under the token", ok, None, iter(["", "reserved for someone (r1)"]), None),
+                ("target reached", ok, None, "", lambda: False)):
+            with self.subTest(name), patch, mock.patch.object(gd, "DARWIN", True), \
+                    mock.patch.object(gd, "host_reservation", **(
+                        {"side_effect": reserved} if not isinstance(reserved, str) else {"return_value": reserved})), \
+                    mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                    mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                    mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                    mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                        subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps"
+                        else self.fail("simctl ran"))), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
+                                                           below_target=short), 0)
+
+    def test_the_eraser_holds_the_gate_and_every_simulator_token_copy(self) -> None:
+        """SIM_DYNAMIC: a job may hold simulator-N while simulator is free, as many copies as headroom admits. The
+        eraser holds SIM_GATE (which the hook takes shared for every copy past the first, so no new copy can appear)
+        and every copy that exists, and none while any one is held, so no simulator job starts between its reading
+        and the erase."""
+        for c in (1, 2, 11):
+            gd.SIM_TOKEN.with_name(f"simulator-{c}.token").touch()
+        fds = gd.sim_tokens()
+        self.assertIsNotNone(fds)
+        try:
+            self.assertEqual(len(fds), 5, "the gate, copy 0 and the three copies that exist")
+            self.assertIsNone(gd.sim_token(gd.SIM_TOKEN.with_name("simulator-11.token")), "every copy is held")
+            gate = os.open(gd.SIM_TOKEN.with_name(gd.SIM_GATE), os.O_RDONLY)
+            try:
+                with self.assertRaises(OSError, msg="a copy past the first waits for the eraser"):
+                    fcntl.flock(gate, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            finally:
+                os.close(gate)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        job = os.open(gd.SIM_TOKEN.with_name("simulator-2.token"), os.O_RDONLY)
+        fcntl.flock(job, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            self.assertIsNone(gd.sim_tokens(), "a job on copy 2 stops it")
+            mine = gd.sim_token()
+            self.assertIsNotNone(mine, "and it let copy 0 go again")
+            os.close(mine)
+        finally:
+            os.close(job)
+        later = os.open(gd.SIM_TOKEN.with_name(gd.SIM_GATE), os.O_RDONLY)
+        fcntl.flock(later, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        try:
+            self.assertIsNone(gd.sim_tokens(), "a later copy's shared gate stops it")
+        finally:
+            os.close(later)
+
+    def test_a_simulator_job_holding_the_token_stops_the_erase(self) -> None:
+        """A simulator-class job holds capacity/simulator.token for its whole run; while it does, nothing is erased,
+        and the eraser releases the token after each erase so the job it held back is admitted."""
+        held = os.open(gd.SIM_TOKEN, os.O_RDONLY | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        common = (mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"),
+                  mock.patch.object(gd, "capture_lease_text", return_value=""),
+                  mock.patch.object(gd, "process_evidence", return_value=([], "")),
+                  mock.patch.object(gd, "host_reservation", return_value=""),
+                  mock.patch.object(gd.time, "time", return_value=SIM_NOW))
+        try:
+            with contextlib.ExitStack() as stack:
+                for c in common:
+                    stack.enter_context(c)
+                stack.enter_context(mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                    subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps" else self.fail("simctl ran"))))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY), 0)
+        finally:
+            os.close(held)
+        self.assertFalse(self.receipt.exists())
+        with contextlib.ExitStack() as stack:
+            for c in common:
+                stack.enter_context(c)
+            stack.enter_context(mock.patch.object(gd.subprocess, "run",
+                                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY)
+        mine = os.open(gd.SIM_TOKEN, os.O_RDONLY)
+        try:
+            fcntl.flock(mine, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released after the erase
+        finally:
+            os.close(mine)
+
+    @twelve_hour_ages
+    def test_an_unreadable_size_after_the_erase_counts_zero(self) -> None:
+        readings = iter([SIM_REPLAY, SIM_REPLAY, None])
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                mock.patch.object(gd.subprocess, "run",
+                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: next(readings, None)), 0)
+        (rec,) = map(json.loads, self.receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["bytes"]), ("reclaimed", 0))
+        self.assertIn("could not be read", rec["reasons"][-1])
+
+    @twelve_hour_ages
+    def test_a_reserved_host_keeps_its_devices(self) -> None:
+        self.assertEqual(gd.LEGACY_AGES["SIM_DEVICE_IDLE_HOURS"], float("inf"))
+        self.assertEqual(gd.SIM_DEVICE_IDLE_HOURS, 12.0)
+        with mock.patch.object(gd, "SIM_DEVICE_IDLE_HOURS", float("inf")), mock.patch.object(gd, "DARWIN", True):
+            self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY), 0)
+
+
+class VolumeCensusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name)) / "vol"
+        self.root.mkdir()
+        self.state = Path(self.tmp.name) / "census.json"
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE)
+        gd.DARWIN, gd.ACCOUNTING, gd.CENSUS_STATE = False, Path(self.tmp.name) / "accounting.json", self.state
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "CENSUS_STATE", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+
+    def write(self, rel: str, size: int = 8192) -> Path:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(os.urandom(size))  # random bytes: no sparse or compressed blocks
+        return path
+
+    def fs(self, used: int) -> "gd.Fs":
+        return gd.Fs(self.root.stat().st_dev, str(self.root), 100 * gd.GIB - used, 100 * gd.GIB, 0, 0)
+
+    @staticmethod
+    def du(path: Path) -> int:
+        return int(subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True,
+                                  check=True).stdout.split()[0]) * 1024
+
+    def test_nested_sized_paths_are_counted_once(self) -> None:
+        parent, child = self.root / "parent", self.root / "parent/child"
+        child.mkdir(parents=True)
+        for name in ("small", "loose", "parent/inside"):  # census rows count only trees that still exist
+            (self.root / name).mkdir()
+        items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
+                 gd.Item("checkout-build", str(child), 3 * gd.GIB, 2.0, "reclaimable")]
+        sizes = {str(parent): 7 * gd.GIB, str(child): 3 * gd.GIB,  # the items themselves
+                 str(self.root / "small"): 2 * gd.GIB}  # below the report floor, still sized
+        census = {"complete": True, "at": 1.0, "rows": {
+            str(self.root / "loose"): [4 * gd.GIB, "unclassified", True],
+            str(parent / "inside"): [5 * gd.GIB, "unclassified", True]}}  # nested in a sized item
+        with mock.patch.object(gd, "census_for", return_value=census):
+            got = gd.filesystem_accounting([self.fs(13 * gd.GIB)], items, sizes)[0]
+        self.assertEqual(got["measured"], 13 * gd.GIB)
+        self.assertEqual(got["reclaimable"], 3 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
+
+    def test_a_linux_gap_is_measured_not_named_open_deleted(self) -> None:
+        # a lane VM said 55.9G open-deleted while /proc held 2 KB: the bytes sat under overlay mounts
+        info = self.root / "mountinfo"
+        info.write_text(
+            "20 1 259:1 / / rw - ext4 /dev/root rw\n"
+            "31 20 0:40 / /home/u/.wt/checkouts/a rw - overlay overlay rw\n"
+            "32 20 0:41 / /home/u/.wt/checkouts/b rw - overlay overlay rw\n"
+            "33 20 0:42 / /home/u/mnt rw - fuse.cmux-projection p rw\n"
+            "34 31 0:43 / /home/u/.wt/checkouts/a/x rw - tmpfs t rw\n")
+        fs = gd.Fs(1, "/", 0, 100 * gd.GIB, 0, 0)
+        real = gd.mounts_over
+        with mock.patch.object(gd, "open_deleted_held", return_value=({"7": 2 * gd.GIB, "9": 2048}, 0)), \
+                mock.patch.object(gd, "mounts_over", lambda m: real(m, str(info))):
+            label = gd.linux_gap_residual(fs, 50 * gd.GIB)
+        self.assertTrue(label.startswith("open-deleted 2.0G measured in /proc (top holders: pid 7 2.0G)"), label)
+        self.assertIn("48.0G under mount points or unmeasured (3 mounts on this fs: 2 overlay, 1 fuse.cmux-projection)",
+                      label)
+        self.assertNotIn("pid 9", label)  # a few KB is no holder worth naming
+        self.assertEqual(gd.linux_gap_residual(fs, 0), gd.OPEN_DELETED)
+
+    def test_open_deleted_counts_a_held_file_once(self) -> None:
+        held = self.write("held", 4096 * 8)
+        with open(held, "rb") as one, open(held, "rb") as two:
+            held.unlink()
+            got, _ = gd.open_deleted_local(self.root.stat().st_dev)
+        self.assertEqual(got.get(str(os.getpid())), 4096 * 8)
+
+    def test_a_complete_walk_leaves_no_gap(self) -> None:
+        sized = self.write("sized/a").parent
+        self.write("sized/b", 16384)
+        item = self.write("holder/item/blob").parent
+        self.write("holder/loose")
+        sized_file = self.write("holder/sized-file", 4096 * 5)  # sized on its own: not in the files row too
+        self.write("holder/other/deep/blob", 12288)
+        self.write("plain/x/y", 4096)
+        self.write("rootfile")
+        covered = {str(sized), str(item), str(sized_file)}
+        state = gd.census_pass([self.root], covered, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertIn(str(self.root / "plain"), state["rows"])
+        self.assertIn(str(self.root / "holder/other"), state["rows"])
+        self.assertNotIn(str(sized), state["rows"])
+        sizes = {p: (Path(p).stat().st_blocks * 512 if Path(p).is_file() else self.du(Path(p)))
+                 for p in covered}
+        got = gd.filesystem_accounting([self.fs(self.du(self.root))], [], sizes)[0]
+        self.assertEqual(got["accounting_gap"], 0)
+        self.assertEqual(got["measured"], got["used"])
+        self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unclassified:{self.root / 'plain'}", [c["category"] for c in row["children"]])
+
+    def test_an_unreadable_dir_is_reported_not_raised(self) -> None:
+        self.write("readable/x")
+        locked = self.write("locked/inner/blob").parents[1]
+        held = self.write("held/item/blob").parent
+        real_listdir, real_du = os.listdir, gd._census_du
+
+        def listdir(path):
+            if Path(path) == self.root / "held":
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_listdir(path)
+
+        def census_du(path, timeout):
+            if path == locked:
+                return 0, False  # du printed "Permission denied" and nothing it could read
+            return real_du(path, timeout)
+
+        with mock.patch.object(gd.os, "listdir", side_effect=listdir), \
+                mock.patch.object(gd, "_census_du", side_effect=census_du):
+            state = gd.census_pass([self.root], {str(held)}, path=self.state)
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["rows"][str(locked)][1:], ["unreadable", False])
+        self.assertEqual(state["rows"][str(self.root / "held")][1], "unreadable")
+        got = gd.filesystem_accounting([self.fs(gd.GIB)], [])[0]
+        row = next(r for r in got["coverage"] if r["scope"] == gd.CENSUS_SCOPE)
+        self.assertIn(f"unreadable:{locked}", [c["category"] for c in row["children"]])
+        self.assertIn("unreadable", got["residual"]["category"])
+
+    def test_sibling_apfs_volumes_are_attributed_and_the_gap_names_what_it_sits_under(self) -> None:
+        """cmux16, 2026-11-08: a 71.8G gap called "apfs-invisible" held 32G of the container's System, Preboot, VM
+        and Recovery volumes, and named none of the root-only trees the rest sits under."""
+        locked = self.root / "locked"
+        locked.mkdir()
+        census = {"complete": True, "at": 1.0, "rows": {
+            "/System/Volumes/Data/System": [3 * gd.GIB, "unreadable", False],
+            str(locked): [gd.GIB, "unreadable", False],
+            str(self.root / "gone"): [5 * gd.GIB, "unclassified", True]}}  # no longer on disk: not counted
+        volumes = [{"role": "System", "name": "Macintosh HD", "bytes": 12 * gd.GIB, "owner": "macOS"},
+                   {"role": "VM", "name": "VM", "bytes": 7 * gd.GIB, "owner": "macOS"}]
+        with mock.patch.object(gd, "census_for", return_value=census), \
+                mock.patch.object(gd, "census_catalogue", return_value=[(locked, gd.GIB, "census")]), \
+                mock.patch.object(gd, "apfs_sibling_volumes", return_value=volumes):
+            got = gd.filesystem_accounting([self.fs(30 * gd.GIB)], [])[0]
+        self.assertEqual(got["measured"], 20 * gd.GIB)  # 1G walked + 19G of sibling volumes
+        self.assertEqual(got["accounting_gap"], 10 * gd.GIB)
+        self.assertEqual(got["apfs_volumes"], volumes)
+        self.assertTrue(got["residual"]["category"].startswith(gd.APFS_INVISIBLE))  # mini-health keys on it
+        self.assertIn("largest: /System/Volumes/Data/System >=3.0G (macOS assets, the iOS simulator runtime",
+                      got["residual"]["category"])
+        row = next(r for r in got["coverage"] if r["scope"] == gd.APFS_VOLUMES_SCOPE)
+        self.assertEqual([(c["category"], c["owner"]) for c in row["children"]],
+                         [("volume:System (Macintosh HD)", "macOS"), ("volume:VM (VM)", "macOS")])
+        named = gd.gap_named([got])
+        self.assertIn("APFS volumes System 12.0G, VM 7.0G", named)
+        self.assertIn("largest: /System/Volumes/Data/System", named)
+        self.assertEqual(gd.gap_named([{"accounting_gap": 0}]), "")
+
+    def test_apfs_sibling_volumes_reads_the_boot_container_once(self) -> None:
+        gd.DARWIN = True
+        gd._APFS_VOLUMES_MEM.clear()
+        self.addCleanup(gd._APFS_VOLUMES_MEM.clear)
+        info = plistlib.dumps({"APFSContainerReference": "disk3"})
+        listed = plistlib.dumps({"Containers": [
+            {"ContainerReference": "disk5", "Volumes": [{"Roles": [], "Name": "Cryptex", "CapacityInUse": 2 * gd.GIB}]},
+            {"ContainerReference": "disk3", "Volumes": [
+                {"Roles": ["System"], "Name": "Macintosh HD", "CapacityInUse": 12 * gd.GIB},
+                {"Roles": ["Data"], "Name": "Data", "CapacityInUse": 170 * gd.GIB},
+                {"Roles": ["Preboot"], "Name": "Preboot", "CapacityInUse": 10 * gd.GIB},
+                {"Roles": ["Update"], "Name": "Update", "CapacityInUse": 0}]}]})
+        outs = [subprocess.CompletedProcess([], 0, info, b""), subprocess.CompletedProcess([], 0, listed, b"")]
+        with mock.patch.object(gd.subprocess, "run", side_effect=outs) as run:
+            got = gd.apfs_sibling_volumes("/", now=100.0)
+            again = gd.apfs_sibling_volumes("/", now=200.0)
+        self.assertEqual([(v["role"], v["bytes"]) for v in got], [("System", 12 * gd.GIB), ("Preboot", 10 * gd.GIB)])
+        self.assertEqual(got[0]["owner"], gd.APFS_VOLUME_OWNERS["System"])
+        self.assertIs(again, got)
+        self.assertEqual(run.call_count, 2)
+        gd._APFS_VOLUMES_MEM.clear()
+        with mock.patch.object(gd.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "diskutil")):
+            self.assertIsNone(gd.apfs_sibling_volumes("/", now=300.0))
+        gd.DARWIN = False
+        self.assertIsNone(gd.apfs_sibling_volumes("/x", now=300.0))
+
+    def test_census_rows_name_an_owner_by_longest_prefix(self) -> None:
+        self.assertIn("simulator", gd.census_owner("/Library/Developer/CoreSimulator/Volumes/iOS_23F77"))
+        self.assertIn("Xcode command line", gd.census_owner("/Library/Developer/CommandLineTools"))
+        self.assertIn("installed apps", gd.census_owner("/Applications"))
+        self.assertEqual(gd.census_owner("/Applicationsx"), "")
+        self.assertIn("~/.acpmux-supervised", gd.census_owner(str(gd.HOME / ".acpmux")))
+        self.assertIn("acpmux_store_reclaim", gd.census_owner(str(gd.HOME / ".acpmux-supervised")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "lanes/pool/cmux")))
+        self.assertIn("worktree_reclaim", gd.census_owner(str(gd.HOME / "out/.work/tag")))
+        self.assertEqual(gd.census_owner(str(gd.HOME / "out/tag")), "")
+        census = {"complete": True, "at": 1.0, "rows": {"/opt": [gd.GIB, "unclassified", True]}}
+        child = gd.census_coverage_row(census)["children"][0]
+        self.assertEqual((child["category"], child["owner"]), ("unclassified:/opt", gd.census_owner("/opt")))
+
+    def test_the_simulator_runtime_and_personal_builds_are_kept_with_an_owner(self) -> None:
+        real = gd.Path.is_dir
+        with mock.patch.object(gd.Path, "is_dir", lambda p: p == gd.HOME / "Projects" or real(p)):
+            fams = {f.id: f for f in gd.default_families()}
+        personal = fams[gd.PERSONAL_BUILD_FAMILY]
+        self.assertFalse(personal.reclaimable)
+        self.assertTrue(personal.owner)
+        self.assertEqual(personal.include, ("cmux-personal-build",))
+        self.assertIn("cmux-personal-build", fams["projects"].skip)  # listed once, under its own family
+        image = self.write("AssetsV2/rt/AssetData/Restore/runtime.dmg", 16384)
+        with mock.patch.object(gd, "SIM_RUNTIME_IMAGES", str(self.root / "AssetsV2/*/AssetData/Restore/*.dmg")):
+            row = gd.sim_runtime_row(1.0)
+            self.assertEqual(row["children"][0]["bytes"], image.stat().st_blocks * 512)
+            self.assertEqual(row["children"][0]["owner"], gd.SIM_RUNTIME_OWNER)
+            image.unlink()
+            self.assertIsNone(gd.sim_runtime_row(1.0))
+
+    def test_paths_share_one_namespace_and_other_homes_stay_private(self) -> None:
+        gd._CENSUS_FIRMLINK_MEM.clear()
+        self.addCleanup(gd._CENSUS_FIRMLINK_MEM.clear)
+        with mock.patch.object(gd, "_firmlinked", return_value=True), \
+                mock.patch.object(gd, "_private_link", return_value=True):
+            self.assertEqual(gd.census_canon("/System/Volumes/Data/Users/x/y"), "/Users/x/y")
+            self.assertEqual(gd.census_canon("/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd.census_canon("/private/var/folders/ab"), "/private/var/folders/ab")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else/Library", "unreadable"),
+                             "unreadable:private-user-data")
+        with mock.patch.object(gd, "_firmlinked", return_value=False), \
+                mock.patch.object(gd, "_private_link", return_value=False):
+            self.assertEqual(gd.census_canon("/var/lib/x"), "/var/lib/x")
+            self.assertEqual(gd._census_label("/System/Volumes/Data/Users/someone-else", "unreadable"),
+                             "unreadable:private-user-data")
+
+    def test_shared_coverage_is_not_subtracted_twice_before_a_census(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=6 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users/Shared/cmux-build-fleet/cache" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["measured"], 6 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 4 * gd.GIB)
+        self.assertTrue(got["residual"]["category"].startswith("unwalked"))
+
+    def test_a_finished_apply_pass_starts_the_census(self) -> None:
+        # CI minis run only --apply passes, so the census never ran there (cmux15, 2026-11-02: 258 GiB "unwalked")
+        def run(**fields):
+            def impl(args):
+                gd.RUN.update(apply=True, **fields)
+                return 0
+            with mock.patch.object(gd, "_main_impl", impl), mock.patch.object(gd, "release_hook_pass"), \
+                    mock.patch.object(gd, "write_run_line"), \
+                    mock.patch.object(gd, "launch_background_census") as launch:
+                self.assertEqual(gd._logged_main(["--pressure", "--apply"]), 0)
+            return launch.called
+        self.assertTrue(run())
+        self.assertTrue(run(skipped="no pressure"))
+        self.assertFalse(run(skipped="coalesced into the running pass (runner hook)"))
+        self.assertFalse(run(skipped="eviction_busy"))
+        self.assertFalse(run(off=True, skipped="off"))
+
+    def test_a_census_state_with_bad_times_is_due(self) -> None:
+        self.assertTrue(gd.census_due({"complete": True, "started_at": "x"}, 0.0))
+        self.assertTrue(gd.census_due({"slice_at": None}, 0.0))
+        self.assertTrue(gd.census_due({"slice_at": [1]}, 0.0))
+
+    def test_a_running_slice_blocks_another_launch(self) -> None:
+        saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots)
+        gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH = Path(self.tmp.name) / "census.lock", True
+        gd.census_roots = lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "CENSUS_AUTOLAUNCH", saved[1]),
+                                  setattr(gd, "census_roots", saved[2])))
+        held = gd._census_lock()
+        self.addCleanup(held.close)
+        with mock.patch.object(gd.subprocess, "Popen", side_effect=AssertionError("spawned")):
+            self.assertFalse(gd.launch_background_census())
+        held.close()
+        with mock.patch.object(gd.subprocess, "Popen") as popen:
+            self.assertTrue(gd.launch_background_census())
+        self.assertIn("--census-lock-fd", popen.call_args.args[0])
+
+    def scoped_launch(self, env: dict[str, str], wait) -> list[list[str]]:
+        saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots, gd.DARWIN)
+        gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.DARWIN = Path(self.tmp.name) / "census.lock", True, False
+        gd.census_roots = lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "CENSUS_AUTOLAUNCH", saved[1]),
+                                  setattr(gd, "census_roots", saved[2]), setattr(gd, "DARWIN", saved[3])))
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd.shutil, "which", side_effect=lambda n: f"/usr/bin/{n}"), \
+                mock.patch.object(gd.subprocess, "Popen") as popen:
+            if "INVOCATION_ID" not in env:
+                os.environ.pop("INVOCATION_ID", None)
+            popen.return_value.wait.side_effect = wait
+            self.assertTrue(gd.launch_background_census())
+        return [c.args[0] for c in popen.call_args_list]
+
+    def test_a_census_started_by_a_systemd_unit_runs_in_its_own_scope(self) -> None:
+        # a oneshot unit's KillMode=control-group killed the slice with the pass that started it (fs-agent-lane-2)
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, subprocess.TimeoutExpired("systemd-run", 1))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "/usr/bin/systemd-run")
+        self.assertIn("--scope", calls[0])
+        self.assertIn("--census-lock-fd", calls[0])
+        if os.getuid():
+            self.assertIn("--user", calls[0])
+
+    def test_a_scoped_census_has_a_hard_runtime_bound(self) -> None:
+        # outliving the unit must not mean running forever: systemd kills a slice past its budget and last du
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, subprocess.TimeoutExpired("systemd-run", 1))
+        bound = [a for a in calls[0][:calls[0].index("--")] if a.startswith("--property=RuntimeMaxSec=")]
+        self.assertEqual(len(bound), 1, calls[0])
+        seconds = int(bound[0].rsplit("=", 1)[1])
+        self.assertGreater(seconds, gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S)
+        self.assertLessEqual(seconds, 2 * (gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S))
+
+    def test_a_scope_that_cannot_start_falls_back_to_the_plain_launch(self) -> None:
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, lambda timeout=None: 1)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("/usr/bin/systemd-run", calls[1])
+        self.assertIn("--census-lock-fd", calls[1])
+
+    def test_a_census_outside_systemd_is_launched_plainly(self) -> None:
+        calls = self.scoped_launch({}, AssertionError("waited"))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("/usr/bin/systemd-run", calls[0])
+
+    def test_a_large_opened_dir_resumes_at_its_cursor(self) -> None:
+        for n in range(30):
+            self.write(f"held/f{n:02d}", 4096)
+        held = self.root / "held"
+        self.write("held/item/blob")
+        ticks = itertools.count(step=1.0)
+        state = None
+        rounds = 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 20)
+            with mock.patch.object(gd, "_census_du", return_value=(8192, True)):
+                state = gd.census_pass([self.root], {str(held / "item")}, state, budget_s=12,
+                                       now=1.0, clock=lambda: next(ticks), path=self.state)
+        self.assertGreater(rounds, 2)  # the 31-entry directory took several slices
+        files = state["rows"][str(held / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, sum((held / f"f{n:02d}").stat().st_blocks * 512 for n in range(30))
+                         + held.lstat().st_blocks * 512)  # each file counted once across the slices
+
+    def test_a_child_opened_while_its_parent_is_paused_keeps_the_parent_cursor(self) -> None:
+        for n in range(12):
+            self.write(f"p/c{n:02d}/item/blob")  # each child holds a sized path, so each is opened too
+            self.write(f"p/c{n:02d}/loose")
+        covered = {str(self.root / f"p/c{n:02d}/item") for n in range(12)}
+        ticks = itertools.count(step=1.0)
+        state, rounds = None, 0
+        while not (state or {}).get("complete"):
+            rounds += 1
+            self.assertLess(rounds, 40, "the paused parent kept restarting")
+            state = gd.census_pass([self.root], covered, state, budget_s=6, now=1.0,
+                                   clock=lambda: next(ticks), path=self.state)
+        for n in range(12):
+            self.assertIn(str(self.root / f"p/c{n:02d}" / gd.CENSUS_FILES), state["rows"])
+        self.assertEqual(state["cursors"], {})
+
+    def test_a_measured_ancestor_of_the_shared_tree_leaves_coverage_out(self) -> None:
+        fs = self.fs(10 * gd.GIB)
+        gd.DARWIN = True
+        coverage = [{"scope": "shared-fleet", "complete": True,
+                     "children": [{"category": "cache", "bytes": 6 * gd.GIB}]}]
+        canon = gd.census_canon
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                mock.patch.object(gd, "census_canon", side_effect=lambda p: (
+                    "/Users" if p == str(self.root) else canon(p))):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["known_coverage"], 0)
+        self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
+    def test_a_sized_file_whose_size_goes_is_counted_and_deleted_trees_drop_out(self) -> None:
+        f = self.write("d/sized", 4096 * 3)
+        self.write("e/blob")
+        state = gd.census_pass([self.root], {str(f)}, budget_s=1000, clock=itertools.count().__next__,
+                               path=self.state)
+        files = state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0]
+        self.assertEqual(files, (self.root / "d").lstat().st_blocks * 512)  # the sized file is not in it
+        state = {**state, "complete": False, "pending": [str(self.root / "e")]}
+        state = gd.census_pass([self.root], set(), state, path=self.state)  # its size has gone meanwhile
+        self.assertEqual(state["rows"][str(self.root / "d" / gd.CENSUS_FILES)][0],
+                         files + f.stat().st_blocks * 512)
+        shutil.rmtree(self.root / "e")
+        census = gd.census_for(self.root.stat().st_dev, state)
+        self.assertNotIn(self.root / "e", [p for p, _, _ in gd.census_catalogue(census)])
+        self.assertIn(self.root / "d" / gd.CENSUS_FILES, [p for p, _, _ in gd.census_catalogue(census)])
+
+    def test_an_unfinished_census_of_another_volume_starts_over(self) -> None:
+        self.write("a/blob")
+        stale = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": -1, "complete": False,
+                 "pending": ["/gone"], "rows": {"/gone/x": [5, "unclassified", True]}}
+        got = gd.census_pass([self.root], set(), stale, now=50.0, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertEqual(got["dev"], self.root.stat().st_dev)
+        self.assertNotIn("/gone/x", got["rows"])
+        self.assertIn(str(self.root / "a"), got["rows"])
+
+    def test_linux_census_walks_the_volume_holding_home(self) -> None:
+        # a lane VM, 2026-11-18 (huge-blue 2026-11-16, glaeda#2021): census_roots() was [] off macOS, so 340G of a
+        # full root stayed "unwalked (no volume census yet)"
+        saved = (gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN)
+        self.addCleanup(lambda: (setattr(gd, "HOME", saved[0]), setattr(gd, "RUNNER_CACHE_PROFILE", saved[1]),
+                                 setattr(gd, "DARWIN", saved[2])))
+        gd.HOME, gd.RUNNER_CACHE_PROFILE, gd.DARWIN = self.root, False, False
+        self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        for role in ("devbox", "fleet-mini"):  # whatever role the lane VM's timer runs
+            with mock.patch.object(gd, "ROLE", role):
+                self.assertEqual(gd.census_roots(), [gd.mount_point(self.root)])
+        gd.RUNNER_CACHE_PROFILE = True
+        self.assertEqual(gd.census_roots(), [])
+
+    def test_a_linux_census_opens_home_and_names_each_folder_beside_an_unreadable_one(self) -> None:
+        """A lane VM, 2026-11-18: "/home >=150.4G unreadable" named nothing; home's own folders are rows now."""
+        home = self.root / "home/cmux"
+        self.write("home/cmux/Projects/big", 256 * 1024)
+        self.write("home/cmux/.cache/x", 64 * 1024)
+        other = self.root / "home/someone-else"
+        other.mkdir(parents=True)
+        os.chmod(other, 0)
+        self.addCleanup(os.chmod, other, 0o755)
+        with mock.patch.object(gd, "DARWIN", False):
+            opened = gd.census_open_home(home)
+        self.assertIn(str(self.root / "home"), opened)
+        self.assertIn(str(home), opened)
+        self.assertNotIn("/", opened)
+        census = gd.census_pass([self.root], set(), None, now=50.0, path=self.state, open_also=opened)
+        self.assertTrue(census["complete"])
+        rows = census["rows"]
+        self.assertGreaterEqual(rows[str(home / "Projects")][0], 256 * 1024)
+        self.assertIn(str(home / ".cache"), rows)
+        if os.geteuid() != 0:  # root reads everything
+            self.assertEqual(rows[str(other)][1], "unreadable")
+        self.assertNotIn(str(self.root / "home"), rows)  # opened, never one lower bound
+        with mock.patch.object(gd, "DARWIN", True):
+            self.assertEqual(gd.census_open_home(home), frozenset())
+
+    def test_census_du_never_enters_file_provider_trees(self) -> None:
+        argv = gd._census_du_argv(self.root)
+        for name in gd.MEASURE_SKIP_COMPONENTS:
+            self.assertTrue(name in argv or f"--exclude={name}" in argv, name)
+        self.assertEqual(argv[-1], str(self.root))
+
+    def test_no_du_walk_on_macos_enters_a_privacy_guarded_folder(self) -> None:
+        # du opening ~/Pictures or ~/Music put "worker-<sha> wants your photo library / media library" on
+        # unattended fleet Macs (dialog-alarm, 2026-11-17): every walk names them in -I, at any depth.
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {self.root}\n"
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_du_output", side_effect=fake):
+            gd.du_bytes(self.root, record_timeout=False)
+            gd.du_children(self.root, record_timeout=False)
+            gd.du_children_with_status(self.root, record_timeout=False)
+            seen.append(gd._census_du_argv(self.root))
+        self.assertEqual(len(seen), 4)
+        for argv in seen:
+            # BSD du's -I on a Mac, GNU du's --exclude when the suite runs on Linux
+            ignored = ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                       | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+            for name in ("Pictures", "Music", "Movies", "Desktop", "Documents", "Downloads",
+                         "*.photoslibrary", "*.musiclibrary", "Mobile Documents"):
+                self.assertIn(name, ignored, argv)
+            self.assertEqual(argv[-1], str(self.root))
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertFalse({"Pictures", "--exclude=Pictures"} & set(gd.du_skip_args()))
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.sys, "platform", "linux"):
+            self.assertIn("--exclude=Pictures", gd.du_skip_args())  # GNU du never gets BSD's -I
+            self.assertNotIn("-I", gd.du_skip_args())
+
+    def test_a_du_walk_that_reaches_a_home_library_skips_its_guarded_folders(self) -> None:
+        # cmux19, 2026-11-17 09:52, with #2088 installed: the worker's lent eviction ran glaeda-disk, whose
+        # accounting `du -xk -d 1 /System/Volumes/Data/Users` walked into ~/Library/Photos (Photos-guarded)
+        # after 113 checks on other apps' data (~/Library/Containers, Group Containers), and macOS asked
+        # "Allow worker-ad02c96c... to access your photo library?". Every walk whose root reaches a home's
+        # Library names its guarded folders in -I; a walk of the shared build tree does not, so a build
+        # folder that happens to be called Photos or Messages is still sized there.
+        def ignored(argv: list[str]) -> set[str]:
+            return ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                    | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+
+        home = self.root / "home"
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {argv[-1]}\n"
+
+        guarded = ("Photos", "Containers", "Group Containers", "Mail", "Messages", "Safari", "Calendars",
+                   "Reminders", "HomeKit", "Cookies", "AddressBook", "com.apple.TCC")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "_measurement_path_allowed", return_value=True), \
+                mock.patch.object(gd, "_measurement_on_timeout_cooldown", return_value=False), \
+                mock.patch.object(gd, "_du_output", side_effect=fake):
+            for root in (Path("/"), Path("/System/Volumes/Data"), Path("/System/Volumes/Data/Users"),
+                         Path("/Users"), Path("/Users/cmux"), Path("/Users/cmux/Library"),
+                         Path("/Users/cmux/Library/Application Support"), home, home / "Library"):
+                seen.clear()
+                gd.du_bytes(root, record_timeout=False)
+                gd.du_children(root, record_timeout=False)
+                gd.du_children_with_status(root, record_timeout=False)
+                seen.append(gd._census_du_argv(root))
+                self.assertEqual(len(seen), 4, root)
+                for argv in seen:
+                    for name in guarded:
+                        self.assertIn(name, ignored(argv), (root, argv))
+                    self.assertEqual(argv[-1], str(root))
+            # below a Library only its own guarded parents: a simulator's data/Containers stays sized
+            for root in (Path("/Users/Shared/cmux-build-fleet/cache"), Path("/Users/Shared"),
+                         Path("/System/Volumes/Data/Users/Shared"), Path("/Users/cmux/Projects/cmux"),
+                         Path("/Users/cmux/Library/Caches"), Path("/Users/cmux/Library/Developer/CoreSimulator"),
+                         home / "Projects", home / "Library" / "Caches"):
+                self.assertNotIn("Photos", ignored(gd._census_du_argv(root)), root)
+                self.assertNotIn("Messages", ignored(["du", *gd.du_skip_args(root), str(root)]), root)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertNotIn("Photos", ignored(["du", *gd.du_skip_args(Path("/home/runner")), "/home/runner"]))
+
+    def test_the_census_never_opens_a_privacy_guarded_folder(self) -> None:
+        # The census lists the Data volume a directory at a time; opening ~/Pictures or ~/Library/Photos asks a
+        # person (cmux19, 2026-11-17). Those are named as skipped, never listed; a build folder that happens to be
+        # called Photos outside a Library, or a simulator's data/Containers, is still walked. _census_du answers
+        # None (as for a timed-out du), so the census opens every directory it does not skip.
+        home = self.root / "Users" / "cmux"
+        sim = "Users/cmux/Library/Developer/CoreSimulator/Devices/u/data/Containers"
+        for rel in ("Users/cmux/Pictures/Photos Library.photoslibrary/db", "Users/cmux/Library/Photos/x",
+                    "Users/cmux/Library/Containers/c/y", "Users/cmux/Library/Group Containers/g/y",
+                    "Users/cmux/Library/Application Support/AddressBook/z", "Users/cmux/Library/Caches/z",
+                    "Users/cmux/Projects/app/Photos/p", "Users/cmux/Projects/app/Desktop/d", f"{sim}/app/s"):
+            self.write(rel)
+        opened: list[str] = []
+        listdir = os.listdir
+
+        def spy(path):
+            opened.append(str(path))
+            return listdir(path)
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd.os, "listdir", side_effect=spy), \
+                mock.patch.object(gd, "_census_du", return_value=None):
+            state = gd.census_pass([self.root], set(), budget_s=1000, path=self.state)
+        self.assertTrue(state["complete"])
+        for rel in ("Users/cmux/Pictures", "Users/cmux/Library/Photos", "Users/cmux/Library/Containers",
+                    "Users/cmux/Library/Group Containers", "Users/cmux/Library/Application Support/AddressBook",
+                    "Users/cmux/Projects/app/Desktop"):
+            self.assertFalse([p for p in opened if p == str(self.root / rel) or p.startswith(f"{self.root / rel}/")],
+                             rel)
+            self.assertEqual(state["rows"][str(self.root / rel)][1], "skipped", rel)
+        for rel in ("Users/cmux/Library/Caches", "Users/cmux/Projects/app/Photos", sim):
+            self.assertIn(str(self.root / rel), opened, rel)
+        with mock.patch.object(gd, "DARWIN", False), mock.patch.object(gd, "HOME", home):
+            self.assertFalse(gd.privacy_guarded(home, "Pictures"))  # Linux has no TCC
+
+    def test_no_walk_lists_a_folder_where_removable_volumes_mount(self) -> None:
+        # cmux13s, 2026-11-18 07:33: tccd AUTHREQ_PROMPTING service=kTCCServiceSystemPolicyRemovableVolumes for the
+        # runner listener gate's python3.14 while its glaeda-disk pass ran. diskutil calls each CoreSimulator
+        # runtime image "Removable Media: Removable"; listing /Library/Developer/CoreSimulator/Volumes (or /Volumes,
+        # where hdiutil attaches a DMG) lstat()s every volume mounted there, and du -x only stops after that. Every
+        # du whose root reaches a mount holder names it in -I, as root too; one below or beside them does not.
+        def ignored(argv: list[str]) -> set[str]:
+            return ({argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "-I"}
+                    | {a.removeprefix("--exclude=") for a in argv if a.startswith("--exclude=")})
+
+        seen: list[list[str]] = []
+
+        def fake(argv, *args, **kwargs):
+            seen.append(list(argv))
+            return f"4 {argv[-1]}\n"
+
+        with mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd, "_measurement_path_allowed", return_value=True), \
+                mock.patch.object(gd, "_measurement_on_timeout_cooldown", return_value=False), \
+                mock.patch.object(gd, "_du_output", side_effect=fake):
+            for census_mode in (False, True):
+                with mock.patch.object(gd, "ROOT_CENSUS_MODE", census_mode):
+                    for root, names in ((Path("/"), {"Volumes", "com.apple.security.cryptexd"}),
+                                        (Path("/System/Volumes/Data"), {"Volumes", "com.apple.security.cryptexd"}),
+                                        (Path("/Library"), {"Volumes"}),
+                                        (Path("/System/Volumes/Data/Library/Developer"), {"Volumes"}),
+                                        (Path("/Library/Developer/CoreSimulator"), {"Volumes"}),
+                                        (Path("/private/var"), {"com.apple.security.cryptexd"})):
+                        seen.clear()
+                        gd.du_bytes(root, record_timeout=False)
+                        gd.du_children(root, record_timeout=False)
+                        gd.du_children_with_status(root, record_timeout=False)
+                        seen.append(gd._census_du_argv(root))
+                        self.assertEqual(len(seen), 4, root)
+                        for argv in seen:
+                            self.assertLessEqual(names, ignored(argv), (root, census_mode, argv))
+            for root in (Path("/Users/cmux/Projects/cmux"), Path("/Users/Shared/cmux-build-fleet/cache"),
+                         Path("/Library/Developer/CoreSimulator/Devices"), Path("/Users/cmux/Library/Caches")):
+                self.assertNotIn("Volumes", ignored(gd._census_du_argv(root)), root)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertEqual(gd.walk_reaches_volume_mounts(Path("/")), [])
+            self.assertFalse(gd.volume_mount_holder("/Volumes"))
+
+    def test_the_census_never_lists_a_folder_where_removable_volumes_mount(self) -> None:
+        # The census opens the Data volume a folder at a time and lstat()s each entry; in a mount holder each entry
+        # is a removable volume's root (cmux13s, 2026-11-18). The holder is named as skipped and never listed.
+        for rel in ("Volumes/iOS_24A434/System/x", "Library/Developer/CoreSimulator/Volumes/iOS_23F77/x",
+                    "Library/Developer/CoreSimulator/Devices/u/x", "Users/cmux/Volumes/kept"):
+            self.write(rel)
+        holders = (gd._data_parts(self.root / "Volumes"),
+                   gd._data_parts(self.root / "Library/Developer/CoreSimulator/Volumes"))
+        opened: list[str] = []
+        listdir = os.listdir
+
+        def spy(path):
+            opened.append(str(path))
+            return listdir(path)
+
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "VOLUME_MOUNT_HOLDERS", holders), \
+                mock.patch.object(gd.os, "listdir", side_effect=spy), \
+                mock.patch.object(gd, "_census_du", return_value=None):
+            state = gd.census_pass([self.root], set(), budget_s=1000, path=self.state)
+        self.assertTrue(state["complete"])
+        for rel in ("Volumes", "Library/Developer/CoreSimulator/Volumes"):
+            self.assertFalse([p for p in opened if p == str(self.root / rel) or p.startswith(f"{self.root / rel}/")],
+                             rel)
+            self.assertEqual(state["rows"][str(self.root / rel)][1], "skipped", rel)
+        for rel in ("Library/Developer/CoreSimulator/Devices", "Users/cmux/Volumes"):
+            self.assertIn(str(self.root / rel), opened, rel)  # only the holders themselves, not every "Volumes"
+
+    def test_every_fleet_lsof_skips_the_mount_point_stats(self) -> None:
+        # lsof without -b stat()s and readlink()s every mount point, the removable disk images among them, and macOS
+        # asks a person for that in the caller's name (cmux13s, 2026-11-18 07:33, the listener gate's python3.14).
+        # Every lsof a glaeda script runs passes -b (with -w for its per-mount warning), and none names a file
+        # argument (lsof -- PATH), which needs that stat: a holder of one file comes from the full listing by name.
+        call = re.compile(r"\[\s*(LSOF|lsof|shutil\.which\(\"lsof\"\)[^,]*)\s*,([^\]]*)\]")
+        found = 0
+        for script in sorted((ROOT / "scripts").glob("glaeda-*")):
+            if not script.is_file() or script.suffix not in ("", ".py"):
+                continue
+            text = script.read_text(errors="replace")
+            for m in call.finditer(text):
+                args = m.group(2)
+                found += 1
+                where = f"{script.name}: {m.group(0)}"
+                self.assertTrue("LSOF_NO_MOUNT_STAT" in args or ('"-b"' in args and '"-w"' in args), where)
+                self.assertNotIn('"--"', args, where)
+                self.assertNotIn('"-t"', args, where)
+        self.assertGreaterEqual(found, 10)
+        self.assertEqual(gd.LSOF_NO_MOUNT_STAT, ("-b", "-w"))
+
+    def test_a_sized_dir_whose_size_goes_is_walked_before_completion(self) -> None:
+        a, b = self.write("a/blob").parent, self.write("b/blob").parent
+        state = {"schema": "glaeda-disk-census/v1", "started_at": 1.0, "dev": self.root.stat().st_dev,
+                 "complete": False, "pending": [str(b)], "rows": {}, "covered_skips": [str(a)]}
+        got = gd.census_pass([self.root], set(), state, path=self.state)
+        self.assertTrue(got["complete"])
+        self.assertIn(str(a), got["rows"])
+        self.assertIn(str(b), got["rows"])
+
+    def test_cadence_is_daily_and_a_slice_stops_at_its_budget_then_resumes(self) -> None:
+        now = 1_000_000.0
+        self.assertTrue(gd.census_due({}, now))
+        self.assertFalse(gd.census_due({"complete": True, "started_at": now - 23 * 3600}, now))
+        self.assertTrue(gd.census_due({"complete": True, "started_at": now - 24 * 3600}, now))
+        self.assertFalse(gd.census_due({"complete": False, "slice_at": now - 600}, now))
+        self.assertTrue(gd.census_due({"complete": False, "slice_at": now - 3600}, now))
+        for name in ("a", "b", "c", "d", "e", "f"):
+            self.write(f"{name}/blob")
+        ticks = itertools.count(step=10.0)
+        walked: list[Path] = []
+
+        def census_du(path, timeout):
+            walked.append(path)
+            self.assertLessEqual(timeout, gd.CENSUS_DU_TIMEOUT_S)
+            return 8192, True
+
+        with mock.patch.object(gd, "_census_du", side_effect=census_du):
+            first = gd.census_pass([self.root], set(), budget_s=75, now=now,
+                                   clock=lambda: next(ticks), path=self.state)
+            self.assertFalse(first["complete"])
+            self.assertTrue(first["pending"])
+            self.assertFalse(gd.census_due(gd.load_census(self.state), now + 60))
+            done = len(walked)
+            second = gd.census_pass([self.root], set(), gd.load_census(self.state), budget_s=1000,
+                                    now=now + 3600, clock=lambda: next(ticks), path=self.state)
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["started_at"], now)  # resumed, not restarted
+        self.assertEqual(len(walked), 6)
+        self.assertEqual(len(set(walked)), 6, "a resumed slice re-walked a finished directory")
+        self.assertLess(done, 6)
+        # a complete census is not due again the same day, so the CLI does not walk
+        saved = (gd.CENSUS_LOCK, gd.census_roots)
+        gd.CENSUS_LOCK, gd.census_roots = Path(self.tmp.name) / "census.lock", lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "census_roots", saved[1])))
+        with mock.patch.object(gd, "census_pass", side_effect=AssertionError("walked")), \
+                mock.patch.object(gd.time, "time", return_value=now + 7200), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.main(["--census"]), 0)
+        self.assertIn("not due", out.getvalue())
+
+
+class RootCensusTest(unittest.TestCase):
+    """CI minis: the root census walks every folder of every account and the accounting merges it (Leo,
+    2026-11-17: "why is it always unaccounted? ... these are ci machines")."""
+
+    write, fs, du = VolumeCensusTest.write, VolumeCensusTest.fs, staticmethod(VolumeCensusTest.du)
+
+    def setUp(self) -> None:
+        VolumeCensusTest.setUp(self)
+        self.root_state = Path(self.tmp.name) / "root-census.json"
+        saved = gd.ROOT_CENSUS_STATE
+        gd.ROOT_CENSUS_STATE = self.root_state
+        self.addCleanup(setattr, gd, "ROOT_CENSUS_STATE", saved)
+
+    def tree(self) -> None:
+        for rel in ("Users/runner2/actions-runner/_work/blob", "Users/runner2/Library/Containers/c/data",
+                    "Users/runner2/Library/Photos/p", "Users/runner2/Pictures/x.photoslibrary/db",
+                    "Users/runner2/Library/Developer/CoreSimulator/Devices/u/data/blob",
+                    "Users/Shared/cmux-build-fleet/cache/blob", "private/var/folders/xy/blob",
+                    "Library/Caches/blob"):
+            self.write(rel)
+
+    def test_the_root_census_walks_every_guarded_folder_and_names_its_account(self) -> None:
+        self.tree()
+        home = self.root / "Users" / "runner2"
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "apfs_local_snapshots", return_value=["com.apple.TimeMachine.x.local"]), \
+                mock.patch.object(gd, "_census_du", return_value=None):  # every directory is opened
+            state = gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+            self.assertFalse(gd.ROOT_CENSUS_MODE, "the root mode ends with its slice")
+            self.assertTrue(gd.privacy_guarded(home, "Pictures"), "the unprivileged walks keep their guards")
+        self.assertTrue(state["complete"])
+        rows = state["rows"]
+        self.assertFalse([k for k, r in rows.items() if r[1] in ("skipped", "unreadable")], rows)
+        for rel in ("Users/runner2/Library/Containers/c", "Users/runner2/Library/Photos",
+                    "Users/runner2/Pictures/x.photoslibrary"):
+            self.assertIn(str(self.root / rel / gd.CENSUS_FILES), rows, rel)
+        me = pwd.getpwuid(os.getuid()).pw_name
+        self.assertTrue(all(r[3] == me for r in rows.values()))
+        self.assertEqual(state["meta"]["by_owner"], {me: sum(r[0] for r in rows.values())})
+        self.assertEqual(state["meta"]["snapshots"], ["com.apple.TimeMachine.x.local"])
+
+    def test_a_ci_mini_gap_is_never_attributed_to_unreadable_folders(self) -> None:
+        # The fleet user's own census can read none of another account's home: its rows say "unreadable" and the
+        # gap kept everything past du's lower bound. With a root census on the host none of that is left.
+        self.tree()
+        other = self.root / "Users" / "runner2"
+        user_census = {"complete": True, "at": 1.0, "rows": {
+            str(other): [0, "unreadable", False],
+            str(other / "Library" / "Containers"): [0, "skipped", False],
+            str(self.root / "Library"): [4096, "unreadable", False]}}
+        with mock.patch.object(gd, "apfs_local_snapshots", return_value=[]):
+            gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+        total = self.du(self.root)
+        for used, snapshots in ((total, []), (total + 3 * gd.GIB, ["com.apple.os.update-1"])):
+            doc = json.loads(self.root_state.read_text())
+            doc["meta"]["snapshots"] = snapshots
+            self.root_state.write_text(json.dumps(doc))
+            gd._ACCOUNTING_MEM.clear()
+            gd._ACCOUNTING_COVERAGE_MEM.clear()
+            real = gd.census_for
+            # the fleet user's census (no state passed) is the unprivileged one; the root census passes its doc
+            with mock.patch.object(gd, "census_for", side_effect=lambda dev, state=None: (
+                    user_census if state is None else real(dev, state))):
+                got = gd.filesystem_accounting([self.fs(used)], [])[0]
+            self.assertEqual(got["accounting_gap"], used - total)
+            self.assertNotIn("unreadable", got["residual"]["category"])
+            self.assertTrue(got["residual"]["category"].startswith(gd.APFS_INVISIBLE))  # mini-health keys on it
+            for row in got["coverage"]:
+                for child in row["children"]:
+                    self.assertNotIn("unreadable", f"{child['category']} {child['classification']}", row["scope"])
+            self.assertNotIn(gd.CENSUS_SCOPE, [r["scope"] for r in got["coverage"]])
+            owners = next(r for r in got["coverage"] if r["scope"] == gd.ROOT_CENSUS_OWNERS_SCOPE)
+            self.assertEqual(sum(c["bytes"] for c in owners["children"]), total)
+        self.assertIn("1 local APFS snapshots", got["residual"]["category"])
+
+    def test_rows_root_could_not_read_are_named_protected_and_another_accounts_tree_still_counts(self) -> None:
+        self.write("System/blob")
+        locked = self.write("Users/runner2/blob").parent  # /Users is opened: each home is its own row
+        real = gd._census_du
+
+        def census_du(path, timeout):
+            return (gd.GIB, False) if path == self.root / "System" else real(path, timeout)
+
+        with mock.patch.object(gd, "_census_du", side_effect=census_du), \
+                mock.patch.object(gd, "apfs_local_snapshots", return_value=[]):
+            state = gd.root_census_slice([self.root], self.root_state, budget_s=1000)
+        self.assertEqual(state["rows"][str(self.root / "System")][1], gd.ROOT_PROTECTED)
+        census = gd.root_census_for(self.root.stat().st_dev, time.time())
+        self.assertIsNotNone(census)
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **k):  # the fleet user cannot stat into another account's home
+            if str(path).startswith(str(locked)):
+                raise PermissionError(errno.EACCES, "Permission denied", str(path))
+            return real_lstat(path, *a, **k)
+
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            paths = [p for p, _, _ in gd.root_census_catalogue(census)]
+        self.assertIn(Path(gd.census_canon(str(locked / gd.CENSUS_FILES))), paths)  # its home, opened
+        residual = gd.root_census_residual(census)
+        self.assertNotIn("unreadable", residual)
+        self.assertIn(f"{self.root / 'System'} >=1.0G", residual)
+        # stale, or of another volume: not used
+        self.assertIsNone(gd.root_census_for(self.root.stat().st_dev, time.time() + gd.ROOT_CENSUS_MAX_AGE_S + 60))
+        self.assertIsNone(gd.root_census_for(-1, time.time()))
+
+    def test_only_root_runs_the_root_census(self) -> None:
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.os, "geteuid", return_value=501), \
+                mock.patch.object(gd, "census_pass", side_effect=AssertionError("walked")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.main(["--root-census"]), 2)
+
+
+class MediaTourDerivedDataTest(unittest.TestCase):
+    """cmux media tour DerivedData lives only where a tour can be routed (a gui or session runner), warm by role there."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(os.path.realpath(self.tmp.name))
+        self.root = base / "DerivedData"
+        self.state = base / "state"
+        self.runners = base / "runners"
+        self.fam = gd.Family("xcode-derived-data", self.root, True, "rebuild", build_output=True)
+        self.patches = [mock.patch.object(gd, "process_evidence", lambda: ([], "")),
+                        mock.patch.object(gd, "CMUX_RUNNER_STATE", self.state),
+                        mock.patch.object(gd, "MEDIA_TOUR_LOCKS", base / "locks"),
+                        mock.patch.object(gd, "_MEDIA_TOUR_HOST_SET", False),
+                        mock.patch.object(gd, "FLOOR_HOLD", {})]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def runner(self, n: int, labels: list[str], installed: bool = True) -> None:
+        rdir = self.runners / f"r{n}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        if installed:
+            (rdir / ".runner").write_text("{}")
+        receipt = self.state / f"instance-{n}" / "receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"mode": "install", "runnerDir": str(rdir),
+                                       "registration": {"labels": ["self-hosted", "glaeda-mini", *labels]}}))
+
+    def verdicts(self) -> dict[str, str]:
+        gd._MEDIA_TOUR_HOST_SET = False
+        return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], 12, 0)}
+
+    def test_host_is_derived_from_enrolled_runner_labels(self) -> None:
+        self.assertIsNone(gd.media_tour_host(self.state), "no runner enrolled: not a CI mini, nothing changes")
+        self.runner(1, ["glaeda-std-xcode-26.6", "glaeda-gui-std-linux", "glaeda-session-std", "glaeda-gui-std-xcode-"])
+        self.assertIs(gd.media_tour_host(self.state), False, "only the labels the tour's route picks count")
+        self.runner(2, ["glaeda-gui-std-xcode-26.6"], installed=False)
+        self.assertIs(gd.media_tour_host(self.state), False, "an uninstalled runner's labels route nothing here")
+        self.runner(3, ["glaeda-session-light-xcode-26.6"])
+        self.assertIs(gd.media_tour_host(self.state), True)
+        (self.state / "instance-9").mkdir()
+        (self.state / "instance-9" / "receipt.json").write_text("{not json")
+        self.assertIs(gd.media_tour_host(self.state), True, "a host with a gui runner stays one")
+
+    def test_unreadable_receipt_changes_nothing(self) -> None:
+        (self.state / "instance-0").mkdir(parents=True)
+        (self.state / "instance-0" / "receipt.json").write_text("{not json")
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        self.assertIsNone(gd.media_tour_host(self.state))
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent"})
+
+    def test_non_media_host_drops_media_dd_at_any_age(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=0.5)
+        make(self.root / "cmux-ci-media-pr-12-head", age_hours=0.5)
+        make(self.root / "cmux-other", age_hours=0.5)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable",
+                                           "cmux-ci-media-pr-12-head": "reclaimable",
+                                           "cmux-other": "recent"})
+
+    def test_a_wide_media_dd_is_not_a_cmux_reload_unit(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        slot = make(self.root / "cmux-ci-media-slot0-base", age_hours=0.5)
+        for n in range(40):  # wider than cmux_active's budget below, as a real ModuleCache.noindex is
+            (slot / "ModuleCache.noindex" / f"m{n}").mkdir(parents=True)
+        real = gd.cmux_active
+        self.assertTrue(real(slot, 3, 10), "the bounded walk alone calls it busy")
+        with mock.patch.object(gd, "cmux_active", lambda path, levels=3, budget=5000: real(path, levels, 10)):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable"})
+
+    def test_open_media_dd_is_still_in_use(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        held = make(self.root / "cmux-ci-media-slot0-head", age_hours=0.5)
+        with mock.patch.object(gd, "process_evidence", lambda: ([], f"/x/cmux-tui --dir {held}/Build")):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-head": "in-use"})
+
+    def test_media_host_keeps_warm_slots_by_role(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=400)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=400)
+        make(self.root / "cmux-ci-media-slot2-head", age_hours=13)  # an overflow slot: the 12 h window
+        make(self.root / "cmux-ci-media-pr-7-base", age_hours=13)
+        make(self.root / "cmux-ci-media-slot3-base", age_hours=2)
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "recent",
+                                           "cmux-ci-media-slot1-head": "recent",
+                                           "cmux-ci-media-slot2-head": "reclaimable",
+                                           "cmux-ci-media-pr-7-base": "reclaimable",
+                                           "cmux-ci-media-slot3-base": "recent"})
+        with mock.patch.object(gd, "POLICY", {**gd.POLICY, "media_tour_warm_slots": 1}):
+            self.assertEqual(self.verdicts()["cmux-ci-media-slot1-head"], "reclaimable")
+
+    def tag_held(self, tag: str):
+        (self.root.parent / "locks").mkdir(exist_ok=True)
+        fd = os.open(self.root.parent / "locks" / f"{tag}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+
+    def test_a_held_tour_tag_keeps_its_dirs(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        make(self.root / "cmux-ci-media-slot0-head", age_hours=30)
+        make(self.root / "cmux-ci-media-slot1-head", age_hours=30)
+        self.tag_held("ci-media-slot0")  # claimed: the tour has not opened anything yet
+        self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "in-use", "cmux-ci-media-slot0-head": "in-use",
+                                           "cmux-ci-media-slot1-head": "reclaimable"})
+
+    def test_apply_deletes_only_under_the_tag_lock_and_fresh_evidence(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        claimed = make(self.root / "cmux-ci-media-slot0-base", age_hours=30)
+        started = make(self.root / "cmux-ci-media-slot1-base", age_hours=30)
+        stray = make(self.root / "cmux-ci-media-pr-3-head", age_hours=30)
+        gd._MEDIA_TOUR_HOST_SET = False
+        items = gd.survey([self.fam], 12, 0)
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        self.tag_held("ci-media-slot0")  # a tour claims slot 0 after the survey
+        # and an xcodebuild starts in slot 1 after the survey: only a fresh ps at apply sees it
+        calls = []
+
+        def evidence():  # apply's own first reading sees nothing; the build starts after it
+            calls.append(1)
+            return [], (f"xcodebuild -derivedDataPath {started}" if len(calls) > 1 else "")
+        with mock.patch.object(gd, "process_evidence", evidence), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {self.fam.id: self.fam}, self.root.parent / "r.jsonl", None, 12)
+        self.assertTrue(claimed.exists(), "a claimed slot is never removed")
+        self.assertTrue(started.exists(), "a build that started after the survey keeps its dir")
+        self.assertFalse(stray.exists())
+
+    def test_warm_slot_goes_only_under_the_runner_floor(self) -> None:
+        self.runner(1, ["glaeda-gui-std-xcode-26.6"])
+        slot = make(self.root / "cmux-ci-media-slot0-base", age_hours=1)
+        dev = self.root.stat().st_dev
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable"})
+            item = gd.Item("xcode-derived-data", str(slot), gd.GIB, 1.0, "reclaimable")
+            self.assertTrue(gd.floor_hold_only(self.fam, item, 12), "it waits for the floor stop like warm builds")
+
+
+class TipLoopWorkTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.state = self.home / "Library/Application Support/hq-tip-loop/state"
+        (self.state / "work").mkdir(parents=True)
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            self.fam = next(f for f in gd.default_families() if f.id == "hq-tip-loop-work")
+            self.assertNotIn(self.fam.id, [f.id for f in gd.default_families("devbox")])
+
+    def work(self, name, hours):
+        path = self.fam.root / name
+        make(path / "nightly/build/Products/nested", age_hours=hours)
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_old_work_goes_but_recent_deep_writes_and_sibling_receipts_stay(self):
+        old, recent, deep = self.work("old", 48), self.work("recent", 0.5), self.work("deep", 48)
+        (deep / "nightly/build/Products/nested/blob").touch()
+        receipts = [make(self.state / name / "receipt", age_hours=96)
+                    for name in ("receipts", "outbox", "candidates")]
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            self.assertEqual(next(i.verdict for i in items if i.path == str(old)), "reclaimable")
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(all(p.exists() for p in [recent, deep, *receipts]))
+
+    def test_work_opened_after_the_survey_is_kept(self):
+        path = self.work("inflight", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        with mock.patch.object(gd, "process_evidence", return_value=([str(path / "build-a1.log")], "")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(path.exists())
+
+    def test_symlinked_root_or_ancestor_is_never_enumerated(self):
+        for root in (self.fam.root, self.state, self.state.parent, self.home / "Library"):
+            with self.subTest(root=root):
+                aside = root.with_name(root.name + "-original")
+                root.rename(aside)
+                root.symlink_to(aside, target_is_directory=True)
+                try:
+                    self.assertEqual(gd.candidates(self.fam), [])
+                    self.assertEqual(gd.interrupted_families([self.fam]), [])
+                finally:
+                    root.unlink()
+                    aside.rename(root)
+
+    def test_root_redirected_to_outbox_after_survey_is_kept(self):
+        old = self.work("old", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            outbox = self.state / "outbox"
+            self.fam.root.rename(outbox)
+            self.fam.root.symlink_to(outbox, target_is_directory=True)
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue((outbox / old.name).is_dir())
+        self.assertIn("changed:root-boundary", (self.home / "receipt.jsonl").read_text())
+
+    def test_unreadable_ancestor_does_not_abort_family_discovery(self):
+        original = Path.is_symlink
+        def inaccessible(path):
+            if path == self.state:
+                raise PermissionError("state is not traversable")
+            return original(path)
+        with mock.patch.object(Path, "is_symlink", inaccessible), mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            families = gd.default_families()
+        self.assertNotIn(self.fam.id, [f.id for f in families])
+        self.assertTrue(families, "other cleanup families remain available")
+
+    def test_final_delete_cannot_follow_a_root_redirect(self):
+        old = self.work("old", 48)
+        saved = make(self.state / "outbox" / f"{gd.DELETING_PREFIX}old-{os.getpid()}" / "saved-receipt", age_hours=48)
+        original = gd.shutil.rmtree
+        def redirect(name, *args, **kwargs):
+            self.fam.root.rename(self.state / "work-original")
+            self.fam.root.symlink_to(self.state / "outbox", target_is_directory=True)
+            return original(name, *args, **kwargs)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+            with mock.patch.object(gd.shutil, "rmtree", side_effect=redirect):
+                gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(saved.exists(), "deletion is relative to the pinned parent, never the redirected outbox")
+        self.assertFalse((self.state / "work-original" / old.name).exists())
+
+    def test_interrupted_delete_inherits_and_pins_the_original_boundary(self):
+        name = f"{gd.DELETING_PREFIX}old-99999"
+        aside = self.work(name, 48)
+        families = gd.interrupted_families([self.fam])
+        self.assertEqual(len(families), 1)
+        interrupted = families[0]
+        self.assertEqual(interrupted.boundary_root, self.fam.root)
+        saved = make(self.state / "outbox" / name / "saved-receipt", age_hours=48)
+        original = gd.shutil.rmtree
+        def redirect(child, *args, **kwargs):
+            self.fam.root.rename(self.state / "work-original")
+            self.fam.root.symlink_to(self.state / "outbox", target_is_directory=True)
+            return original(child, *args, **kwargs)
+        with mock.patch.object(gd.shutil, "rmtree", side_effect=redirect):
+            gd.finish_deletion(aside, boundary_root=interrupted.boundary_root)
+        self.assertTrue(saved.exists())
+        self.assertFalse((self.state / "work-original" / name).exists())
+        self.assertEqual(gd.candidates(interrupted), [])
+
+    def test_unknown_process_evidence_preserves_old_work(self):
+        path = self.work("unknown", 48)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 1, 0)
+        with mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("probe unavailable")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 1)
+        self.assertTrue(path.exists())
+
+
+class SparkleAppcastTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(os.path.realpath(self.tmp.name))
+        (self.home / "Library/Caches/Sparkle_generate_appcast").mkdir(parents=True)
+        for key, value in (("HOME", self.home), ("DARWIN", True), ("ROLE", "fleet-mini")):
+            patch = mock.patch.object(gd, key, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            families = {f.id: f for f in gd.default_families()}
+        self.fam = families["sparkle-appcast"]
+        self.assertIn("Sparkle_generate_appcast", families["library-caches"].skip)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]):
+            devbox = next(f for f in gd.default_families("devbox") if f.id == "sparkle-appcast")
+        self.assertTrue(devbox.pressure_only, "keep the existing devbox cache policy")
+
+    def extract(self, name: str, hours: float) -> Path:
+        path = self.fam.root / name
+        make(path / "cmux NIGHTLY.app/Contents/Frameworks/Sparkle.framework/Versions/B/Resources", age_hours=hours)
+        stamp = time.time() - hours * 3600
+        for folder, dirs, files in os.walk(path):
+            for child in dirs + files:
+                os.utime(Path(folder) / child, (stamp, stamp))
+            os.utime(folder, (stamp, stamp))
+        return path
+
+    def test_extracted_apps_go_after_an_hour_even_with_deep_generated_bundles(self) -> None:
+        old, recent = self.extract("old", 2), self.extract("recent", 0.5)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 24, 0)
+            by_path = {i.path: i for i in items}
+            self.assertEqual(by_path[str(old)].verdict, "reclaimable", by_path[str(old)].reasons)
+            self.assertEqual(by_path[str(recent)].verdict, "recent")
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_an_app_used_after_the_survey_is_kept(self) -> None:
+        path = self.extract("in-flight", 7)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([self.fam], 24, 0)
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        with mock.patch.object(gd, "process_evidence", return_value=([str(path / "cmux NIGHTLY.app")], "")):
+            gd.apply(items, {self.fam.id: self.fam}, self.home / "receipt.jsonl", None, 24)
+        self.assertTrue(path.exists(), "live appcast generation keeps its extraction")
+
+
 class LinuxLayoutTest(unittest.TestCase):
     """The Linux layout, checked on every platform by pointing HOME and DARWIN at a fake host."""
 
@@ -2226,7 +10692,7 @@ class LinuxLayoutTest(unittest.TestCase):
             fam.root.mkdir(parents=True, exist_ok=True)
         keep = {"user-cache": ["glaeda", "glaeda-disk", "glaeda-fullapp", "glaeda-fleet-cas", "cmux-job",
                                "huggingface", "codex-runtimes"],
-                "library-caches": ["glaeda", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
+                "library-caches": ["glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
         for fid, names in keep.items():
             fam = fams.get(fid)
             if fam is None:
@@ -2249,7 +10715,8 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in by_id["worktrees"]),
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
-        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build"})
+        self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build",
+                                       gd.STALE_TMP_SCRATCH, *gd.LANE_TMP_FAMILY_IDS})
         self.assertEqual(next(f for f in fams if f.id == "tmp").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "user-cache").platform, "linux")
         self.assertEqual(next(f for f in fams if f.id == "home-caches").platform, "linux")
@@ -2260,7 +10727,8 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
-    def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
+    @twelve_hour_ages
+    def test_cmux_job_units_go_and_unpushed_checkouts_go_to_a_bundle(self) -> None:
         job = self.home / ".cache/cmux-job"
         # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
         (job / "reload-cloud-ios/DerivedData/slot-1/Build").mkdir(parents=True)
@@ -2287,8 +10755,8 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         verdicts = {Path(i.path).relative_to(self.home).as_posix(): (i.family, i.verdict) for i in items}
         self.assertEqual(verdicts[".cache/cmux-job/reload-cloud-ios/DerivedData"], ("cmux-job-cache", "reclaimable"))
-        # a commit no remote holds keeps its checkout
-        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
+        # idle past 12 h: a commit no remote holds goes to a bundle, then the checkout goes
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "reclaimable"))
         self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
         receipt = self.home / "receipt.jsonl"
         fams_by_id = {f.id: f for f in fams}
@@ -2301,7 +10769,8 @@ class LinuxLayoutTest(unittest.TestCase):
                 gd.process_evidence = saved
         self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
         self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
-        self.assertTrue((base / ".git").is_dir())
+        self.assertFalse(base.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
         # a delete interrupted after its rename leaves a tree nothing else will ever clean up
         dead = subprocess.Popen(["true"])
         dead.wait()
@@ -2321,7 +10790,8 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         self.assertEqual(again[str(left)], ("interrupted-deletions", "reclaimable"))
 
-    def test_idle_cmux_job_mirrors_go_after_a_week_unless_a_job_holds_them(self) -> None:
+    @twelve_hour_ages
+    def test_idle_cmux_job_mirrors_go_after_12h_bundled_unless_a_job_holds_them(self) -> None:
         """2026-10-11: 107 GiB of reload-cloud trees idle since Sep 28-Oct 2 on eight minis, all kept as
         "git-checkout (checkout below the top level)", so glaeda-disk reported 0.0 G reclaimable."""
         job = self.home / ".cache/cmux-job"
@@ -2348,9 +10818,9 @@ class LinuxLayoutTest(unittest.TestCase):
             os.utime(job / rel, (t, t))
 
         age("", 8 * 24)
-        age("slots", 3 * 24)  # idle, but not a week: its local commit still keeps it
+        age("slots", 26)  # idle past 12 h and the pass window: its local commit goes to a bundle and the tree goes
         fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
-        self.assertEqual(fams[0].mirror_idle_hours, 168.0)
+        self.assertEqual(fams[0].mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
         with mock.patch.object(gd, "process_evidence",
                                return_value=([], f"rsync -a {job}/reload-cloud/work/slot-1/ x\n")):
             items = {Path(i.path).relative_to(job).as_posix(): i for i in gd.survey(fams, 24, 0)}
@@ -2360,9 +10830,10 @@ class LinuxLayoutTest(unittest.TestCase):
             "reload-cloud/work": "in-use",  # a running command names a slot in it
             "reload-cloud-ios/cmux-base": "in-use",  # its unit's work/<slot>/.lock
             "reload-cloud-ios/work": "in-use",
-            "slots/host.1": "git-checkout",
+            "slots/host.1": "reclaimable",
             "SourcePackages/host.1": "reclaimable"})
-        self.assertIn("idle 168h+: its checkouts are mirrors", items["reload-cloud/cmux-base"].reasons)
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["reload-cloud/cmux-base"].reasons)
         receipt = self.home / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")):
@@ -2370,9 +10841,1288 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse((job / "reload-cloud/cmux-base").exists())
         self.assertFalse((job / "SourcePackages/host.1").exists())
         self.assertTrue((job / "reload-cloud/work/slot-1/.git").is_dir())
-        self.assertTrue((job / "slots/host.1/.git").is_dir())
+        self.assertFalse((job / "slots/host.1").exists())
         self.assertTrue((job / "reload-cloud-ios/cmux-base/slot-2/.git").is_dir())
+        # no remote: each deleted clone's whole history is in a verified bundle
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(sorted(("cmux-base" in b.name, "host.1" in b.name) for b in bundles),
+                         [(False, True), (True, False)])
+        for b in bundles:
+            self.assertRegex(b.name, gd.MIRROR_BUNDLE_RE)
+            self.assertIn("refs/heads/", subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True,
+                                                         text=True, check=True).stdout)
 
+
+    def mirror_unit(self, srv_commits: int = 1) -> tuple[Path, Path, dict]:
+        """A cmux-job reload unit idle a day whose clone's origin is a trusted stand-in for GitHub."""
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        srv = self.home / "srv"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True, env=env)
+        for n in range(srv_commits):
+            subprocess.run(["git", "-C", str(srv), "commit", "-q", "--allow-empty", "-m", f"c{n}"], check=True, env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "clone", "-q", str(srv), str(unit / "slot-1")], check=True, env=env)
+        saved = gd.TRUSTED_LOCAL_REMOTES
+        gd.TRUSTED_LOCAL_REMOTES = (str(srv),)
+        self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", saved)
+        return unit, unit / "slot-1", env
+
+    def apply_mirror(self, unit: Path, between=None) -> tuple[dict, str]:
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        items = [i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit)]
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        if between is not None:
+            between()
+        receipt, err = self.home / "receipt.jsonl", io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
+        return json.loads(receipt.read_text().splitlines()[-1]), err.getvalue()
+
+    def survey_mirror(self, unit: Path):
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        return next(i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit))
+
+    def bundle_heads(self) -> dict[str, str]:
+        heads = {}
+        for b in sorted((self.home / "archive/glaeda-disk").glob("*.bundle")):
+            subprocess.run(["git", "bundle", "verify", str(b)], cwd=self.home / "srv", check=True, capture_output=True)
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.stdout.splitlines()})
+        return heads
+
+    def test_a_mirrors_unpushed_commit_and_local_refs_survive_in_a_verified_bundle(self) -> None:
+        unit, clone, env = self.mirror_unit(srv_commits=2)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "tag", "only-here", "origin/main~1"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "branch", "side", "origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", "--detach", "HEAD"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "detached"], check=True, env=env)
+        detached = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        want = {r: subprocess.run(["git", "-C", str(clone), "rev-parse", r], capture_output=True, text=True,
+                                  check=True).stdout.strip() for r in ("refs/heads/main", "refs/tags/only-here",
+                                                                       "refs/heads/side")}
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        heads = self.bundle_heads()
+        self.assertEqual({r: heads.get(r) for r in want}, want)
+        self.assertEqual(heads.get(gd.ARCHIVE_REF + detached), detached)  # a commit only HEAD held
+        self.assertTrue(any("bundled to" in r for r in rec["reasons"]))
+
+    def _unreachable_clone(self, how: str) -> tuple[Path, Path, dict, str]:
+        """A mirror unit whose clone (full, shallow or blob:none partial) holds an unpushed commit, a staged edit and
+        an untracked file, and whose origin no longer answers (a lane VM's private origin with no credentials)."""
+        unit, clone, env = self.mirror_unit(srv_commits=3)
+        srv = self.home / "srv"
+        for text in ("an old blob the partial clone never fetched\n", "the blob at origin's tip\n"):
+            (srv / "big.txt").write_text(text * 100)
+            subprocess.run(["git", "-C", str(srv), "add", "big.txt"], check=True, env=env)
+            subprocess.run(["git", "-C", str(srv), "commit", "-qm", "blob"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "config", "uploadpack.allowFilter", "true"], check=True, env=env)
+        shutil.rmtree(clone)
+        extra = {"shallow": ["--depth", "1"], "partial": ["--filter=blob:none"], "full": []}[how]
+        r = subprocess.run(["git", "clone", "-q", *extra, f"file://{srv}", str(clone)], capture_output=True, text=True,
+                           env={k: v for k, v in env.items() if k != "GIT_NO_LAZY_FETCH"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        if how == "partial":  # the old blob is not here: a lazy fetch would have to ask origin for it
+            old = subprocess.run(["git", "-C", str(srv), "rev-parse", "HEAD~1:big.txt"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+            listed = subprocess.run(["git", "-C", str(clone), "rev-list", "--objects", "--all", "--missing=print"],
+                                    capture_output=True, text=True, check=True).stdout
+            self.assertIn("?" + old, listed.split())
+        (clone / "new.txt").write_text("committed only here\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-qm", "unpushed"], check=True, env=env)
+        (clone / "new.txt").write_text("staged edit\n")
+        subprocess.run(["git", "-C", str(clone), "add", "new.txt"], check=True, env=env)
+        (clone / "notes.md").write_text("untracked\n")
+        subprocess.run(["git", "-C", str(clone), "remote", "set-url", "origin", "https://127.0.0.1:9/gone.git"],
+                       check=True, env=env)
+        head = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        return unit, clone, env, head
+
+    def test_an_unreachable_origin_is_judged_by_its_last_fetched_refs(self) -> None:
+        """A lane VM's /tmp/bsz (12.7G) stayed whole as "remote origin of /tmp/bsz/cef-fix/.git did not answer"
+        (2026-11-18). A full, a shallow and a blob:none partial clone each lose nothing: the unpushed commit goes to a
+        verified bundle on top of what origin held at the last fetch, the uncommitted work to a patch and a tar."""
+        for how in ("full", "shallow", "partial"):
+            with self.subTest(how=how):
+                shutil.rmtree(self.home / "archive", ignore_errors=True)
+                shutil.rmtree(self.home / "srv", ignore_errors=True)
+                shutil.rmtree(self.home / ".cache/cmux-job", ignore_errors=True)
+                gd._DISCOVERED.clear()
+                unit, clone, env, head = self._unreachable_clone(how)
+                rec, err = self.apply_mirror(unit)
+                self.assertEqual(rec["outcome"], "reclaimed", (how, rec["reasons"], err))
+                self.assertFalse(unit.exists())
+                self.assertTrue(any("judged by its last-fetched refs" in r for r in rec["reasons"]), rec["reasons"])
+                bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+                self.assertTrue(bundles)
+                heads = {}
+                for b in bundles:
+                    out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True,
+                                         check=True).stdout
+                    heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.splitlines()})
+                self.assertEqual(heads.get("refs/heads/main"), head)
+                # the bundle holds only what origin lacked: it applies onto origin's history
+                subprocess.run(["git", "-C", str(self.home / "srv"), "fetch", "-q", str(bundles[0]),
+                                "refs/heads/main:refs/heads/restored"], check=True, env=env)
+                show = subprocess.run(["git", "-C", str(self.home / "srv"), "show", "restored:new.txt"],
+                                      capture_output=True, text=True, check=True).stdout
+                self.assertEqual(show, "committed only here\n")
+                archived = list((self.home / "archive/glaeda-disk").iterdir())
+                self.assertTrue(any(p.name.endswith(".patch") for p in archived), archived)
+                self.assertTrue(any(p.name.endswith(".tar.gz") for p in archived), archived)
+
+    def test_an_unreachable_origin_without_tracking_refs_bundles_the_whole_history(self) -> None:
+        unit, clone, env, head = self._unreachable_clone("full")
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "update-ref", "-d", "refs/remotes/origin/HEAD"], check=False, env=env)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_a_mirror_held_by_live_worktrees_elsewhere_names_them(self) -> None:
+        """A lane VM's /tmp/wt-rd (22.1G) holds a cmux mirror three checkouts under ~/Projects/checkouts still use:
+        kept, and the plan names each one that holds it."""
+        unit, clone, env = self.mirror_unit()
+        live = [self.home / "Projects/checkouts/cmux" / n for n in ("lane--a", "lane--b")]
+        for w in live:
+            self.git(clone, "worktree", "add", "-q", "--detach", str(w), env=env)
+        gone = self.home / "gone-wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(gone), env=env)
+        shutil.rmtree(gone)
+        why = gd.mirror_repos(unit)[0]
+        self.assertIn("held by 2 that still exist", why)
+        for w in live:
+            self.assertIn(str(w), why)
+        self.assertNotIn("whose tree is gone", why)  # its HEAD a branch reaches: nothing to lose through it
+        self.assertNotIn(str(gone), why)
+        held = self.survey_mirror(unit)  # kept by the plan itself, before any bundle (git_used_from_outside)
+        self.assertEqual(held.verdict, "in-use")
+        for w in live:
+            self.assertIn(f"{w} (a linked worktree of", " ".join(held.reasons))
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # and by the bundle step too
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(all((w / ".git").is_file() for w in live))
+
+    def test_a_mirror_whose_bundle_fails_is_kept_and_alerts(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        (self.home / "archive").write_text("not a directory")  # the bundle cannot be written
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:bundle-failed", "blocked"))
+        self.assertIn("ALERT", err)
+        self.assertEqual(gd.RUN.pop("bundle_failed"), [os.fspath(unit)])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual(subprocess.run(["git", "-C", str(clone), "for-each-ref", gd.ARCHIVE_REF],
+                                        capture_output=True, text=True).stdout, "")
+
+    def test_a_bundle_or_archive_without_room_for_it_keeps_the_tree(self) -> None:
+        # a relief that writes before it frees must fit (the 2026-11-12 repack outage's class): with no room in
+        # ~/archive the bundle and the uncommitted work's archive are not written, and the tree stays
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
+        real = gd.free_bytes
+        tight = lambda p: (gd.RELIEF_QUICK_FLOOR - 1, 495 * gd.GIB) if "archive" in os.fspath(p) else real(p)
+        for name in ("bundle", "archive"):
+            with self.subTest(name):
+                shutil.rmtree(self.home / ".cache", ignore_errors=True)
+                shutil.rmtree(self.home / "srv", ignore_errors=True)
+                gd.RUN.pop("bundle_failed", None)
+                if name == "bundle":
+                    unit, clone, env = self.mirror_unit()
+                    subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"],
+                                   check=True, env=env)
+                else:
+                    unit, clone, env = self.dirty_mirror()
+                with mock.patch.object(gd, "free_bytes", tight):
+                    rec, _ = self.apply_mirror(unit)
+                self.assertEqual(rec["verdict"], "blocked", rec)
+                self.assertTrue(any("no room" in r for r in rec["reasons"]), rec["reasons"])
+                self.assertTrue((clone / ".git").is_dir())
+                self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.bundle")), [])
+                self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), [])
+
+    def test_a_failed_bundle_is_remembered_and_not_retried_or_walked_until_the_tree_changes(self) -> None:
+        """cmux8s/10s/11s/13s, cmuxs-3, 2026-11-05: every pressure pass re-walked the same 16-42 GiB scratch trees
+        with du and failed the same bundle again."""
+        unit, clone, env = self.mirror_unit()
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        (self.home / "archive").write_text("not a directory")  # the bundle cannot be written
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertIn("ALERT", err)
+        memo = gd.load_bundle_failures()[os.fspath(unit)]
+        self.assertIsInstance(memo["size"], int)
+        gd.RUN.pop("bundle_failed", None)
+        fam = next(f for f in gd.default_families() if f.id == "cmux-job-cache")
+        items = [i for i in gd.survey([fam], 24, 0) if i.path == os.fspath(unit)]
+        self.assertEqual(items[0].verdict, "bundle-failed")
+        self.assertIn("Retry at", items[0].hold["by"])
+        self.assertIn(memo["why"], items[0].hold["by"])
+        cached = {os.fspath(unit): memo["size"]}
+        sized = next(i for i in gd.survey([fam], 24, 0, cached) if i.path == os.fspath(unit))
+        self.assertEqual(sized.verdict, "bundle-failed")
+        mtime = gd.item_mtime(fam, unit)
+        self.assertEqual(memo["mtime"], mtime)
+        # unchanged: neither bundled again nor walked with du, and still listed as failed
+        walked = []
+        real_du = gd.du_bytes
+        with mock.patch.object(gd, "du_bytes", lambda p: walked.append(p) or real_du(p)):
+            self.assertEqual([i.path for i in gd.survey([fam], 24, 0, {}) if i.path == os.fspath(unit)],
+                             [os.fspath(unit)])
+        self.assertNotIn(unit, walked)
+        # If the hold expires after the survey, these held items still have no authority to remove the tree.
+        with mock.patch.object(gd, "recent_bundle_failure", return_value=None), \
+                mock.patch.object(gd, "archive_mirror", side_effect=AssertionError("bundled a held item")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.apply([sized], {fam.id: fam}, self.home / "expired-hold.jsonl", None, 24)
+        self.assertTrue(unit.is_dir())
+        receipt, err = self.home / "receipt2.jsonl", io.StringIO()
+        with mock.patch.object(gd, "archive_mirror", side_effect=AssertionError("bundled again")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.apply(items, {fam.id: fam}, receipt, None, 24)
+        rec = json.loads(receipt.read_text().splitlines()[-1])
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("has not changed since" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertEqual(gd.RUN.pop("bundle_failed"), [os.fspath(unit)])
+        self.assertEqual(gd.RUN.pop("bundle_failed_remembered"), [os.fspath(unit)])
+        self.assertNotIn("ALERT", err.getvalue())
+        # past the retry age, or once the tree changes, it is bundled again (and the archive works now)
+        self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), mtime, now=time.time() + 13 * 3600))
+        (self.home / "archive").unlink()
+        (clone / "touched").write_text("x")
+        os.utime(clone, (mtime + 10, mtime + 10))
+        self.assertIsNone(gd.recent_bundle_failure(os.fspath(unit), gd.item_mtime(fam, unit)))
+        self.assertEqual(gd.remembered_bundle_failures([(fam, unit)]), {})
+
+    def test_a_bundle_that_failed_on_a_silent_remote_is_retried_after_an_hour(self) -> None:
+        """cmux11s, 2026-11-05: a SwiftPM repository's ls-remote timed out once on the loaded uplink; that is not
+        held for 12 h."""
+        path, mtime = os.fspath(self.home / "tree"), 100.0
+        gd.remember_bundle_failure(path, mtime, "remote origin of x did not answer", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 1800))
+        self.assertIsNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 3700))
+        gd.remember_bundle_failure(path, mtime, "unreadable refs", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime, now=time.time() + 3700))
+
+    def test_a_remembered_failure_is_retried_by_a_new_glaeda_disk_or_once_free_space_has_grown(self) -> None:
+        """cmux17, 2026-11-21: ~/m2l-viewer's bundle failed "no room" at 5.1G free and stayed kept at 16G free, and the
+        hot-verify mirror stayed kept on a judgement #2277 had fixed: 9.8G reclaimable, 0 reclaimed every pass."""
+        path, mtime = os.fspath(self.home / "tree"), 100.0
+        gd.remember_bundle_failure(path, mtime, "x: has linked worktrees outside it or missing; kept", 5)
+        self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+        self.assertEqual(gd.load_bundle_failures()[path]["glaeda"], gd.glaeda_disk_sha256())
+        with mock.patch.object(gd, "_OWN_SHA256", "another"):
+            self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+        doc = gd.load_bundle_failures()
+        del doc[path]["glaeda"]  # recorded by a glaeda-disk before this field
+        gd.bundle_failures_path().write_text(json.dumps(doc))
+        self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+        free = 50 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", lambda p: (free, 100 * gd.GIB)):
+            gd.remember_bundle_failure(path, mtime, "bundle of x/.git: no room: its peak needs 5.6G free", 5)
+            self.assertEqual(gd.load_bundle_failures()[path]["free"], free)
+            self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+            free += gd.GIB // 2
+            self.assertIsNotNone(gd.recent_bundle_failure(path, mtime))
+            free += gd.GIB
+            self.assertIsNone(gd.recent_bundle_failure(path, mtime))
+
+    def test_a_worktree_reflog_only_commit_of_an_outside_repository_goes_to_a_bundle(self) -> None:
+        """cmux10s ~/cnx-macnext, cmux13s chiefinv/src, cmuxs-3 ~/cnx-hybrid: a worktree of ~/cmux whose detached
+        commits only its reflog holds kept the tree forever, since git bundle had no ref to name."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        wt = unit / "slot-1"
+        self.git(main, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "only the worktree reflog", env=env)
+        lost = self.git(wt, "rev-parse", "HEAD")
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        self.assertIn("reflog holds", gd.mirror_repos(unit)[0])  # still refused where nothing bundles it
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        self.assertEqual(self.bundle_heads().get(gd.ARCHIVE_REF + lost), lost)
+        self.assertEqual(self.git(main, "for-each-ref", gd.ARCHIVE_REF), "")  # the names were removed again
+        restored = self.home / "restored"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(restored)], check=True, env=env)
+        bundle = next(b for b in (self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.git(restored, "fetch", "-q", str(bundle), f"{gd.ARCHIVE_REF}{lost}:refs/heads/back", env=env)
+        self.assertEqual(self.git(restored, "rev-parse", "back"), lost)
+
+    def test_an_item_that_is_itself_a_worktree_with_reflog_commits_and_edits_goes(self) -> None:
+        """cmuxs-3 ~/cnx-hybrid, 2026-11-05: the item is a worktree of ~/cmux itself, with reflog-only commits and
+        uncommitted work; everything was archived, yet the post-rename recheck put it back every pass."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(unit)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        self.git(main, "worktree", "add", "-q", "--detach", str(unit), env=env)
+        self.git(unit, "commit", "-q", "--allow-empty", "-m", "only the worktree reflog", env=env)
+        lost = self.git(unit, "rev-parse", "HEAD")
+        self.git(unit, "checkout", "-q", "--detach", "origin/main", env=env)
+        (unit / "notes.txt").write_text("untracked work\n")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertEqual(self.bundle_heads().get(gd.ARCHIVE_REF + lost), lost)
+
+    def test_a_swiftpm_checkout_sharing_objects_inside_the_item_survives_the_rename_recheck(self) -> None:
+        """cmuxs-3 ~/cnx-hybrid, cmux10s ~/cnx-macnext, 2026-11-05: SwiftPM's checkouts/<pkg> borrows objects from
+        repositories/<pkg> through an absolute alternates path inside the item, so after the rename aside git could
+        not read the checkout and the recheck put the tree back on every pass."""
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("build/\n")
+        pkgsrv = self.home / "pkgsrv"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(pkgsrv)], check=True, env=env)
+        subprocess.run(["git", "-C", str(pkgsrv), "commit", "-q", "--allow-empty", "-m", "p0"], check=True, env=env)
+        repos = clone / "build/SourcePackages/repositories/pkg-1234"
+        subprocess.run(["git", "clone", "-q", "--mirror", str(pkgsrv), str(repos)], check=True, env=env)
+        co = clone / "build/SourcePackages/checkouts/pkg"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(repos), str(co)], check=True, env=env)
+        self.git(co, "remote", "set-url", "origin", str(pkgsrv))
+        self.git(co, "checkout", "-q", "main", env=env)
+        self.assertTrue((co / ".git/objects/info/alternates").read_text().startswith(os.fspath(repos)))
+        gd.TRUSTED_LOCAL_REMOTES = (*gd.TRUSTED_LOCAL_REMOTES, str(pkgsrv))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+
+    def test_renamed_alternates_ignore_undecodable_files_and_stores_outside_the_tree(self) -> None:
+        """Review of #1881: a non-UTF-8 alternates file must not crash the recheck after the rename, and a path that
+        leaves the renamed tree (.., a symlink) is never offered."""
+        old, doomed = self.home / "item", self.home / "aside"
+        outside = self.home / "outside/objects"
+        outside.mkdir(parents=True)
+        (doomed / "a/.git/objects/info").mkdir(parents=True)
+        (doomed / "b/.git/objects/info").mkdir(parents=True)
+        (doomed / "store/objects").mkdir(parents=True)
+        (doomed / "link").symlink_to(self.home / "outside")
+        (doomed / "a/.git/objects/info/alternates").write_bytes(b"\xff\xfe\x00bad")
+        (doomed / "b/.git/objects/info/alternates").write_text(
+            f"{old}/../outside/objects\n{old}/link/objects\n{old}/store/objects\n")
+        saved = os.environ.pop("GIT_ALTERNATE_OBJECT_DIRECTORIES", None)
+        self.addCleanup(lambda: saved is not None and os.environ.__setitem__("GIT_ALTERNATE_OBJECT_DIRECTORIES", saved))
+        with gd.renamed_alternates(old, doomed):
+            self.assertEqual(os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES"), f"{doomed}/store/objects")
+        self.assertNotIn("GIT_ALTERNATE_OBJECT_DIRECTORIES", os.environ)
+
+    def test_a_tree_the_rename_recheck_puts_back_says_why_in_its_receipt(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        with mock.patch.object(gd, "mirror_rename_recheck",
+                               lambda path, recheck: (lambda: (_ for _ in ()).throw(gd.SlotTaken("cmuxs-3 reason")))):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("cmuxs-3 reason", rec["reasons"])
+
+    def test_a_reflog_only_commit_made_after_the_bundle_keeps_the_tree(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        main = self.home / "main"
+        subprocess.run(["git", "clone", "-q", str(self.home / "srv"), str(main)], check=True, env=env)
+        wt = unit / "slot-1"
+        self.git(main, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "bundled", env=env)
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        why, _, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        self.git(wt, "commit", "-q", "--allow-empty", "-m", "after the bundle", env=env)
+        self.git(wt, "checkout", "-q", "--detach", "origin/main", env=env)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            self.assertIn("came in after the bundle", gd.mirror_moved(self.families_job(), unit, recheck))
+
+    def test_a_repository_with_missing_objects_goes_to_a_tar_of_its_git_dir(self) -> None:
+        """cmux11s ~/cmux-next-ios-e2e/chats/src: its .git borrowed objects from a ~/cmux/.git/objects since removed,
+        so rev-list failed (missing parent 2d9b4e88) and the 41.6 GiB tree stayed on every pass."""
+        unit, clone, env = self.mirror_unit()
+        shutil.rmtree(clone)
+        borrowed = self.home / "borrowed.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.home / "srv"), str(borrowed)], check=True, env=env)
+        # file://, so git borrows from the reference instead of hard-linking a local clone's objects
+        subprocess.run(["git", "clone", "-q", "--reference", str(borrowed), f"file://{self.home / 'srv'}",
+                        str(clone)], check=True, env=env)
+        self.git(clone, "remote", "set-url", "origin", str(self.home / "srv"))  # the trusted stand-in
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed, on borrowed history", env=env)
+        local = self.git(clone, "rev-parse", "HEAD")
+        # as there: every ref's commit is in the clone's own store, its parent only in the borrowed one
+        self.git(clone, "update-ref", "-d", "refs/remotes/origin/HEAD")
+        self.git(clone, "update-ref", "-d", "refs/remotes/origin/main")
+        shutil.rmtree(borrowed)  # the alternate goes; the server copy stands in for origin but lacks `local`
+        self.assertIn("alternate object store gone", " ".join(gd.repo_damage(clone / ".git")))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        tars = sorted(archive.glob("*.gitdir.expires-*.tar.gz"))
+        self.assertEqual(len(tars), 1)
+        self.assertRegex(tars[0].name, gd.MIRROR_BUNDLE_RE)
+        entry = next(json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()
+                     if json.loads(ln)["name"] == tars[0].name)
+        self.assertEqual(entry["sha256"], gd._sha256(tars[0]))
+        self.assertIn("alternate object store gone", entry["missing"])
+        self.assertEqual(entry["kind"], "damaged git dir")
+        out = self.home / "out"
+        out.mkdir()
+        subprocess.run(["tar", "-xzf", str(tars[0]), "-C", str(out)], check=True)
+        self.assertEqual(subprocess.run(["git", "--git-dir", str(out / "git"), "cat-file", "-t", local],
+                                        capture_output=True, text=True).stdout.strip(), "commit")
+        self.assertEqual(os.listdir(out), ["git"])  # its git dir only, never the work tree
+
+    def test_a_repository_whose_branch_object_is_gone_goes_to_a_tar_with_its_hard_links(self) -> None:
+        """Review of #1865 (F1, F2): a branch whose object is gone fails before any history is read, and a
+        git dir with hard-linked files (a local clone's objects) is still archived."""
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "checkout", "-q", "-b", "side", env=env)
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        head = self.git(clone, "rev-parse", "HEAD")
+        self.git(clone, "checkout", "-q", "main", env=env)  # the work tree stays readable; only `side` breaks
+        loose = clone / ".git/objects" / head[:2] / head[2:]
+        os.link(loose, clone / ".git/objects/info/linked-copy")  # a hard link inside the git dir
+        loose.unlink()
+        self.assertTrue(gd.repo_damage(clone / ".git"))
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        self.assertEqual(len(list(archive.glob("*.gitdir.expires-*.tar.gz"))), 1)
+        entry = [json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()][-1]
+        self.assertEqual(entry["kind"], "damaged git dir")
+        self.assertTrue(entry["missing"])
+
+    def test_a_git_dir_with_hard_linked_files_archives_whole(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        head = clone / ".git/HEAD"
+        os.link(head, clone / ".git/HEAD-link")
+        written: list[Path] = []
+        self.assertEqual(gd.archive_git_dir(clone / ".git", "k", written, ["missing commit x"]), "")
+        self.assertEqual(len(written), 1)
+
+    def test_a_damaged_git_dir_without_room_for_its_tar_is_not_written(self) -> None:
+        # glaeda#1972 F2: a damaged repository's whole git dir goes to a tar; that writer fits in what is free too
+        _, clone, _ = self.mirror_unit()
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
+        written: list[Path] = []
+        with mock.patch.object(gd, "free_bytes", lambda p: (0, 495 * gd.GIB)):
+            why = gd.archive_git_dir(clone / ".git", "k", written, ["missing commit x"])
+        self.assertTrue(why.startswith(f"tar of {clone / '.git'}: no room"), why)
+        self.assertEqual(written, [])
+        self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), [])
+
+    def test_a_repository_that_only_fails_for_other_reasons_is_not_called_damaged(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        self.assertEqual(gd.repo_damage(clone / ".git"), [])
+        self.assertEqual(gd.salvage_damaged(clone / ".git", "k", [], "remote origin did not answer"),
+                         "remote origin did not answer")
+
+    def test_a_submodule_store_whose_work_tree_is_gone_is_still_read(self) -> None:
+        """cmux8s cache/cmux-workspaces: modules/vendor/bonsplit's core.worktree was deleted, so git chdir'd there
+        and failed every command ("unreadable refs")."""
+        _, clone, _ = self.mirror_unit()
+        self.git(clone, "config", "core.worktree", "../../gone/vendor/bonsplit")
+        self.assertIsNotNone(gd.local_tips(clone / ".git"))
+        self.assertIsNotNone(gd._git_dir_run(clone / ".git", "-c", "protocol.version=2", "for-each-ref"))
+        self.assertIsNone(gd._git_dir_run(clone / ".git", "status"))  # a command that reads the work tree still fails
+
+    def test_a_reclaim_never_lazily_fetches_into_a_partial_clone(self) -> None:
+        """A CI mini under its floor, 2026-11-15: judging a blobless (blob:none) lane clone, cat-file of the
+        server's commits fetched about 0.9 GiB of packs into it each pass, then gave up as "unreadable objects"."""
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        env.pop("GIT_NO_LAZY_FETCH", None)  # the setup clone below is a real one; glaeda-disk set it process-wide
+        srv = self.home / "srv-partial"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True, env=env)
+        (srv / "big.txt").write_text("x" * 4096)
+        subprocess.run(["git", "-C", str(srv), "add", "big.txt"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "commit", "-q", "-m", "c0"], check=True, env=env)
+        subprocess.run(["git", "-C", str(srv), "config", "uploadpack.allowFilter", "true"], check=True, env=env)
+        blob = subprocess.run(["git", "-C", str(srv), "rev-parse", "HEAD:big.txt"], check=True, env=env,
+                              capture_output=True, text=True).stdout.strip()
+        clone = self.home / "partial"
+        subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", f"file://{srv}", str(clone)],
+                       check=True, env=env)
+        packs = sorted(p.name for p in (clone / ".git/objects/pack").iterdir())
+        self.assertEqual(os.environ.get("GIT_NO_LAZY_FETCH"), "1")  # every git glaeda-disk starts
+        self.assertIsNone(gd._git_dir_run(clone / ".git", "cat-file", "-p", blob))  # missing, not fetched
+        out = gd._git_dir_run(clone / ".git", "cat-file", "--batch-check=%(objectname) %(objecttype)",
+                              stdin=f"{blob}\n")
+        self.assertEqual(out.split(), [blob, "missing"])  # the readers here count it as not held locally
+        self.assertEqual(sorted(p.name for p in (clone / ".git/objects/pack").iterdir()), packs)  # nothing written
+
+    def test_a_mirror_with_nothing_unpushed_goes_without_a_bundle(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertFalse(unit.exists())
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
+    def git(self, repo: Path, *args: str, env: dict | None = None) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True,
+                              env=env).stdout.strip()
+
+    def test_a_branch_the_server_deleted_is_bundled_despite_its_stale_tracking_ref(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)
+        feat = self.git(clone, "rev-parse", "origin/feat")
+        self.git(srv, "branch", "-q", "-D", "feat", env=env)  # origin/feat in the clone is stale now
+        self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+        self.git(srv, "gc", "-q", "--prune=now", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/mine"), feat)
+
+    def test_bundle_names_never_collide_or_overwrite(self) -> None:
+        self.assertNotEqual(gd._bundle_name("/a/b_c")[16:], gd._bundle_name("/a/b/c")[16:])
+        self.assertNotEqual(gd._bundle_name("/r", "refs/heads/a_b")[16:], gd._bundle_name("/r", "refs/heads/a/b")[16:])
+        _, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        written: list[Path] = []
+        args = (clone / ".git", "same", ["refs/heads/main", "--not", "origin/main"], {"refs/heads/main"}, written)
+        self.assertEqual(gd._write_bundle(*args), "")
+        first = written[0].read_bytes()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "another", env=env)
+        self.assertIn("FileExistsError", gd._write_bundle(*args))
+        self.assertEqual((written, written[0].read_bytes()), ([written[0]], first))
+
+    def dirty_mirror(self) -> tuple[Path, Path, dict]:
+        """A mirror whose clone has a committed text and binary file, then uncommitted edits, a staged new file,
+        untracked notes, and untracked build output (ignored, a CACHEDIR.TAG tree, node_modules)."""
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "config", "core.autocrlf", "false")
+        (clone / "tracked.txt").write_text("v1\n")
+        (clone / "bin.dat").write_bytes(bytes(range(256)))
+        (clone / "gone.txt").write_text("deleted later\n")
+        self.git(clone, "add", ".", env=env)
+        self.git(clone, "commit", "-q", "-m", "files", env=env)
+        (clone / "tracked.txt").write_text("v2, edited on a laptop\n")
+        (clone / "bin.dat").write_bytes(bytes(reversed(range(256))))
+        (clone / "gone.txt").unlink()
+        (clone / "staged.txt").write_text("staged\n")
+        self.git(clone, "add", "staged.txt", env=env)
+        (clone / "notes.txt").write_text("untracked notes\n")
+        (clone / "sub").mkdir()
+        (clone / "sub/deep.txt").write_text("deep\n")
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("build/\n")
+        (clone / "build").mkdir()
+        (clone / "build/out.o").write_text("x")
+        (clone / ".cargo-target/release").mkdir(parents=True)
+        (clone / ".cargo-target/CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
+        (clone / ".cargo-target/release/big.rlib").write_bytes(b"\0" * 4096)
+        (clone / "node_modules").mkdir()
+        (clone / "node_modules/x.js").write_text("x")
+        return unit, clone, env
+
+    def test_a_mirrors_uncommitted_work_is_archived_then_it_goes_and_the_archive_restores_it(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        want = {n: (clone / n).read_bytes() for n in ("tracked.txt", "bin.dat", "staged.txt", "notes.txt",
+                                                      "sub/deep.txt")}
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        patches, tars = sorted(archive.glob("*.patch")), sorted(archive.glob("*.tar.gz"))
+        self.assertEqual((len(patches), len(tars)), (1, 1))
+        manifest = [json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()]
+        listed = {e["name"]: e for e in manifest}
+        for f in (*patches, *tars):
+            self.assertRegex(f.name, gd.MIRROR_BUNDLE_RE)
+            self.assertEqual(listed[f.name]["sha256"], gd._sha256(f))
+        import tarfile
+        with tarfile.open(tars[0]) as t:
+            self.assertEqual(sorted(t.getnames()), ["notes.txt", "sub/deep.txt"])  # never build output
+        # restore: the bundled commit, then the patch, then the untracked files
+        restored = self.home / "restored"
+        self.git(self.home, "clone", "-q", str(self.home / "srv"), str(restored), env=env)
+        bundle = next(archive.glob("*.bundle"))
+        self.git(restored, "fetch", "-q", str(bundle), "refs/heads/main:refs/heads/restored", env=env)
+        self.git(restored, "checkout", "-q", "restored", env=env)
+        self.assertEqual(self.git(restored, "rev-parse", "HEAD"), listed[patches[0].name]["head"])
+        self.git(restored, "apply", "--binary", str(patches[0]), env=env)
+        subprocess.run(["tar", "-xzf", str(tars[0]), "-C", str(restored)], check=True)
+        self.assertEqual({n: (restored / n).read_bytes() for n in want}, want)
+        self.assertFalse((restored / "gone.txt").exists())
+        # and they expire with the bundles
+        self.assertEqual(gd.prune_mirror_archive(today="9999-12-31"), 3)
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["manifest.jsonl"])
+
+    def test_uncommitted_work_no_patch_can_hold_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        self.git(clone, "update-index", "--assume-unchanged", "tracked.txt", env=env)
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:uncommitted", "blocked"))
+        self.assertTrue(any("hidden from status" in r for r in rec["reasons"]))
+        self.assertTrue((clone / "notes.txt").exists())
+        self.assertNotIn("bundle_failed", gd.RUN)
+        self.assertNotIn("ALERT", err)
+
+    def test_uncommitted_work_that_changes_after_its_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        real = gd.archive_work_tree
+
+        def then_edit(*args):
+            out = real(*args)
+            (clone / "tracked.txt").write_text("v3, edited while it was archived\n")  # same status line
+            return out
+        with mock.patch.object(gd, "archive_work_tree", side_effect=then_edit):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        # a mode change alone, same bytes, is a change too
+        found = {os.path.realpath(clone)}
+        before = gd.work_tree_fingerprint(clone, found)
+        os.chmod(clone / "notes.txt", 0o755)
+        self.assertNotEqual(gd.work_tree_fingerprint(clone, found), before)
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
+
+    def test_package_manager_clones_in_a_mirror_are_not_checkouts_to_keep_it_for(self) -> None:
+        """cmux22, 2026-11-07: a retired runner's checkout kept 15.7 GiB as "an untracked checkout no scan found
+        (.spm-cache/checkouts/Sparkle/)". SwiftPM and cargo clones are fetched again; the work is still archived."""
+        unit, clone, env = self.dirty_mirror()
+        for rel in (".spm-cache/checkouts/Sparkle", ".spm-cache/repositories/Sparkle-1a2b",
+                    ".cargo/git/checkouts/acp-8bd5/0f1e"):
+            dep = clone / rel
+            dep.mkdir(parents=True)
+            self.git(dep, "init", "-q", env=env)
+            (dep / "Package.swift").write_text("// upstream\n")
+            self.git(dep, "add", ".", env=env)
+            self.git(dep, "commit", "-q", "-m", "upstream", env=env)
+        bare = clone / ".cargo/git/db/acp-8bd5"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, env=env)
+        self.assertTrue(gd.dependency_clones(clone / ".spm-cache/checkouts"))
+        self.assertTrue(gd.dependency_clones(clone / ".cargo/git/db"))
+        self.assertFalse(gd.dependency_clones(clone / "checkouts"), "a checkouts dir of its own is searched")
+        self.assertFalse(gd.dependency_clones(clone / "git/db"), "git/db outside a cargo home is searched")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(clone.exists())
+        self.assertTrue(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), "the clone's own work is archived")
+
+    def test_a_repository_rooted_at_a_dependency_clone_dir_is_still_bundled(self) -> None:
+        """Review of the dependency-clone skip: a repository at .spm-cache/checkouts itself is someone's, not a clone
+        below it; the mirror is kept with its local-only commit, as at base."""
+        unit, clone, env = self.dirty_mirror()
+        own = clone / ".spm-cache/checkouts"
+        own.mkdir(parents=True)
+        self.git(own, "init", "-q", env=env)
+        (own / "mine.txt").write_text("local only\n")
+        self.git(own, "add", ".", env=env)
+        self.git(own, "commit", "-q", "-m", "local only", env=env)
+        sha = self.git(own, "rev-parse", "HEAD").strip()
+        self.assertTrue(gd.dependency_clones(own))
+        self.assertEqual(gd.checkouts(clone / ".spm-cache", gd.NESTED_DEPTH, gd.NESTED_BUDGET, strict=True), [own])
+        self.assertFalse(gd.under_dependency_clones(".spm-cache/checkouts/"), "the directory itself is not below it")
+        self.assertTrue(gd.under_dependency_clones(".spm-cache/checkouts/Sparkle/"))
+        rec, _ = self.apply_mirror(unit)
+        # as at base: an untracked checkout of its own keeps the mirror, never deleted unarchived
+        self.assertEqual(rec["outcome"], "blocked:uncommitted", rec["reasons"])
+        self.assertTrue(any("an untracked checkout no scan found (.spm-cache/checkouts/)" in r for r in rec["reasons"]))
+        self.assertEqual(self.git(own, "rev-parse", "HEAD").strip(), sha)
+
+    def test_staged_content_the_work_tree_no_longer_has_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        (clone / "staged.txt").unlink()  # AD: the staged blob is only in the index
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:uncommitted")
+        self.assertTrue(any("staged content differs" in r for r in rec["reasons"]))
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_an_archive_that_changes_before_the_delete_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        why, written, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        tar = next(w for w in written if w.name.endswith(".tar.gz"))
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "server_still_holds", return_value=""):
+            self.assertEqual(gd.mirror_moved(self.families_job(), unit, recheck), "")
+            tar.write_bytes(b"truncated")
+            self.assertIn("changed", gd.mirror_moved(self.families_job(), unit, recheck))
+            tar.unlink()
+            self.assertIn("gone", gd.mirror_moved(self.families_job(), unit, recheck))
+
+    def families_job(self):
+        return next(f for f in gd.default_families() if f.id == "cmux-job-cache")
+
+    def test_a_symlinked_or_inside_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        (self.home / "archive").mkdir()
+        (self.home / "archive/glaeda-disk").symlink_to(clone)  # its archive would go with the tree
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        (self.home / "archive/glaeda-disk").unlink()
+        (self.home / "archive/glaeda-disk").mkdir()
+        (self.home / "archive/glaeda-disk/manifest.jsonl").symlink_to(self.home / "elsewhere.jsonl")
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_a_process_that_comes_in_during_the_rename_puts_the_mirror_back(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        calls = []
+
+        def evidence():
+            calls.append(1)  # the pass's own reads find nothing; the read after the rename finds a shell in it
+            doomed = unit.with_name(f"{gd.DELETING_PREFIX}{unit.name}-{os.getpid()}")
+            return ([os.fspath(doomed / "slot-1")] if doomed.exists() else []), ""
+        with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+            rec, _ = self.apply_mirror(unit)
+        self.assertNotEqual(rec["outcome"], "reclaimed")
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_an_expired_archive_in_use_or_changed_is_kept(self) -> None:
+        unit, _, _ = self.dirty_mirror()
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        archive = self.home / "archive/glaeda-disk"
+        files = sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: True), 0)
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: p.name.endswith(".expiring")), 0)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), files)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+        for f in archive.iterdir():
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f.name)
+        files[0].write_bytes(b"changed since")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31"), len(files) - 1)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
+        self.assertEqual(files[0].read_bytes(), b"changed since")
+
+    def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("vendor/\n")
+        dep = clone / "vendor/dep"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(dep)], check=True, env=env)
+        self.git(dep, "commit", "-q", "--allow-empty", "-m", "only here", env=env)
+        head = self.git(dep, "rev-parse", "HEAD")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_an_unreadable_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        store = clone / ".git/modules/sub"
+        store.mkdir(parents=True)
+        try:
+            with mock.patch.object(gd, "git_used_from_outside", return_value=""):  # the bundle step's own check
+                rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+            self.assertIn("cannot read", gd.git_used_from_outside(unit, fresh=True))  # the guard alone keeps it too
+        finally:
+            os.chmod(store, 0o755)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertIn("unreadable submodule store", " ".join(rec["reasons"]))
+        self.assertTrue(clone.is_dir())
+
+    def test_a_commit_made_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its git refs or work trees changed while they were bundled", rec["reasons"])
+        self.assertTrue(clone.is_dir())
+
+    def bundled_pairs(self) -> set[tuple[str, str]]:
+        pairs = set()
+        for b in (self.home / "archive/glaeda-disk").glob("*.bundle"):
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            pairs |= {(ln.split(" ")[1], ln.split(" ")[0]) for ln in out.stdout.splitlines()}
+        return pairs
+
+    def test_a_nested_embedded_submodules_commits_are_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        sub, nested = clone / "sub", clone / "sub/nested"
+        for repo in (sub, nested):
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=env)
+        self.git(nested, "commit", "-q", "--allow-empty", "-m", "nested only", env=env)
+        head = self.git(nested, "rev-parse", "HEAD")
+        for outer, inner in ((sub, "nested"), (clone, "sub")):
+            self.git(outer, "add", inner, env=env)
+            self.git(outer, "commit", "-q", "-m", f"link {inner}", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertIn(("refs/heads/main", head), self.bundled_pairs())
+
+    def test_a_repository_created_while_bundling_keeps_the_mirror(self) -> None:
+        unit, _, env = self.mirror_unit()
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            subprocess.run(["git", "init", "-q", str(unit / "slot-2")], check=True, env=env)
+            self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "new", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("repositories changed" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-2/.git").is_dir())
+
+    def test_a_tree_dirtied_before_its_snapshot_has_that_work_archived(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        real = gd.mirror_git_snapshot
+        calls = []
+
+        def dirtying(gitdirs, trees):
+            if not calls:  # after the scan, before the baseline: the baseline and the archive both hold it
+                (clone / "notes.txt").write_text("edited")
+            calls.append(1)
+            return real(gitdirs, trees)
+        with mock.patch.object(gd, "mirror_git_snapshot", dirtying):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        import tarfile
+        with tarfile.open(next((self.home / "archive/glaeda-disk").glob("*.tar.gz"))) as t:
+            self.assertEqual(t.extractfile("notes.txt").read(), b"edited")
+
+    def test_a_mirrors_owner_and_references_are_read_again_after_bundling(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        why, _, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        retired = gd.Family("hq", unit.parent, True, "x", retired_only=True)
+        referenced = gd.Family("hq", unit.parent, True, "x", reference_root=self.home)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with mock.patch.object(gd, "owner_retired", return_value=False):
+                self.assertIn("owner loaded", gd.mirror_moved(retired, unit, recheck))
+            with mock.patch.object(gd, "artifact_referenced", return_value=True):
+                self.assertIn("referenced", gd.mirror_moved(referenced, unit, recheck))
+            with mock.patch.object(gd, "owner_retired", return_value=True), \
+                    mock.patch.object(gd, "artifact_referenced", return_value=False):
+                self.assertEqual(gd.mirror_moved(retired, unit, recheck), "")
+
+    def test_a_locked_linked_worktree_keeps_the_mirror(self) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        main = self.home / "main-clone"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True, env=env)
+        self.git(main, "commit", "-q", "--allow-empty", "-m", "c", env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        unit.mkdir(parents=True)
+        self.git(main, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-1"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-1/.git").is_file())
+
+    def test_a_branch_the_server_drops_after_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)  # on the server now: no bundle needed
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(srv, "branch", "-q", "-D", "feat", env=env)
+            self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+            self.git(srv, "gc", "-q", "--prune=now", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("no longer on one" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_directory_read_error_while_finding_repositories_keeps_the_mirror(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        hidden = unit / "slot-2/deep"
+        hidden.mkdir(parents=True)
+        real = os.scandir
+
+        def failing(p):
+            if os.fspath(p) == os.fspath(unit / "slot-2"):
+                raise OSError(errno.EIO, "I/O error")
+            return real(p)
+        with mock.patch.object(gd.os, "scandir", failing):
+            why, bundles, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable", why)
+        self.assertEqual(bundles, [])
+        self.assertEqual(gd.checkouts(unit, strict=False) is None, False)
+
+    def test_a_locked_worktree_of_a_repository_inside_the_mirror_keeps_it(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-2"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r or "has linked worktrees" in r for r in rec["reasons"]),
+                        rec["reasons"])
+        self.assertTrue((unit / "slot-2/.git").is_file())
+
+    def test_a_commit_made_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        (unit / "store/sub").mkdir(parents=True)
+        (clone / ".git/modules").symlink_to(unit / "store")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("unreadable submodule store" in r for r in rec["reasons"]), rec["reasons"])
+        (clone / ".git/modules").unlink()
+        (clone / ".git/modules/a").mkdir(parents=True)
+        (clone / ".git/modules/a/b").symlink_to(unit / "store")
+        why, _, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable submodule store", why)
+
+    def test_an_empty_repository_goes_without_a_bundle(self) -> None:
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(unit / "slot-1")], check=True)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
+    def test_a_job_that_starts_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        busy = []
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            busy.append(1)  # a job takes the unit during the network wait
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow), \
+                mock.patch.object(gd, "job_busy", lambda fam, p: bool(busy)):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("in use while its git work was bundled", rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_an_unborn_repositorys_linked_worktree_commit_is_never_lost(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(unit / "slot-2"), env=env)
+        self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "worktree only", env=env)
+        only = self.git(unit / "slot-2", "rev-parse", "HEAD")
+        for ref in self.git(clone, "for-each-ref", "--format=%(refname)").split():
+            self.git(clone, "update-ref", "-d", "--no-deref", ref, env=env)
+        shutil.rmtree(clone / ".git/logs")  # the common repository now reads as unborn
+        rec, _ = self.apply_mirror(unit)
+        if rec["outcome"] == "reclaimed":
+            self.assertIn(only, {c for _, c in self.bundled_pairs()})
+        else:
+            self.assertTrue((unit / "slot-2/.git").is_file())
+
+    def test_unreadable_linked_worktree_records_keep_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(self.home / "outside"), env=env)
+        record = next((clone / ".git/worktrees").iterdir()) / "gitdir"
+        os.chmod(record, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            with contextlib.suppress(OSError):
+                os.chmod(record, 0o644)
+        self.assertTrue(record.exists(), "nothing prunes the record")
+        self.assertIn("unreadable linked worktree records", why)
+        self.assertEqual(bundles, [])
+
+    def test_an_unreadable_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        hidden = clone / ".git/logs/refs/heads"
+        os.chmod(hidden, 0)
+        try:
+            self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+            self.assertIsNone(gd.local_tips(clone / ".git"))
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(hidden, 0o755)
+        self.assertTrue(why)
+        self.assertEqual(bundles, [])
+
+    def test_a_linked_worktree_inside_the_mirror_goes_with_it_after_the_rename_recheck(self) -> None:
+        """Its record names an absolute path; after the rename aside, renamed_gitfiles reads it at the new one, so
+        the worktree is checked again there instead of keeping the item forever."""
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("target/\nwts/\n")
+        built = clone / "target/wt"  # build output is not scanned for checkouts, so a worktree there keeps it
+        self.git(clone, "worktree", "add", "-q", "--detach", str(built), env=env)
+        self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
+        self.git(clone, "worktree", "remove", "--force", str(built), env=env)
+        wt = clone / "wts/wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        (wt / "edit.txt").write_text("uncommitted")
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+
+    def test_sibling_worktrees_of_a_repository_inside_the_item_are_bundled_and_go(self) -> None:
+        """cmux16 ~/lane-host-mguard, 2026-11-08: hq with linked worktrees hq-base (detached) and hq-skip (a branch
+        the server lacks, uncommitted edits) beside it, all inside the item, was kept on every pass as
+        blocked:bundle-failed "has linked worktrees". Everything is archived, then the item goes."""
+        unit, clone, env = self.mirror_unit()
+        base, skip = unit / "hq-base", unit / "hq-skip"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(base), env=env)
+        self.git(clone, "worktree", "add", "-q", "-b", "gate-skipped", str(skip), env=env)
+        self.git(skip, "commit", "-q", "--allow-empty", "-m", "only here", env=env)
+        lost = self.git(skip, "rev-parse", "HEAD")
+        (skip / "notes.txt").write_text("untracked work\n")
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertFalse(unit.exists())
+        self.assertEqual(self.bundle_heads().get("refs/heads/gate-skipped"), lost)
+        self.assertTrue(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")))
+
+    def test_a_worktree_outside_the_item_keeps_its_repository_inside_it(self) -> None:
+        """Deleting the repository would orphan a worktree elsewhere; a record whose tree is gone is kept too."""
+        unit, clone, env = self.mirror_unit()
+        outside = self.home / "elsewhere"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
+        self.assertIn("has linked worktrees outside it", gd.mirror_repos(unit)[0])
+        self.assertEqual(self.survey_mirror(unit).verdict, "in-use")
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue((outside / ".git").is_file())
+        shutil.rmtree(outside)  # a stale record whose HEAD a branch reaches: git worktree prune drops it, nothing lost
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
+
+    def test_a_gone_worktree_record_holding_its_own_commit_goes_with_that_commit_bundled(self) -> None:
+        """cmux17, 2026-11-21: the 4.7G hot-verify mirror stayed kept for 1 gone record of an ended step whose HEAD
+        held a commit no branch reached. bundle_unpushed bundles that commit with the repository, so the record no
+        longer keeps it; a locked record (its tree may be on an unmounted volume) still does."""
+        unit, clone, env = self.mirror_unit()
+        outside = self.home / "elsewhere-own"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(outside), env=env)
+        self.git(outside, "commit", "-q", "--allow-empty", "-m", "only in this worktree", env=env)
+        own = self.git(outside, "rev-parse", "HEAD", env=env).strip()
+        shutil.rmtree(outside)
+        self.assertEqual(gd.mirror_repos(unit)[0], "")
+        record = next((clone / ".git/worktrees").iterdir())
+        (record / "locked").write_text("")
+        self.assertIn("has linked worktrees outside it or missing", gd.mirror_repos(unit)[0])
+        (record / "locked").unlink()
+        with mock.patch.object(gd, "git_used_from_outside", return_value=""):
+            rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", (rec["reasons"], err))
+        self.assertIn(own, self.bundle_heads().values())
+
+    def test_tree_git_dir_reads_a_moved_gitfile_only_while_renamed(self) -> None:
+        old, doomed = self.home / "item", self.home / "aside"
+        (doomed / "wt").mkdir(parents=True)
+        (doomed / "wt/.git").write_text(f"gitdir: {old}/repo/.git/worktrees/wt\n")
+        self.assertEqual(gd.tree_git_dir(doomed / "wt"), doomed / "wt/.git")
+        with gd.renamed_gitfiles(old, doomed):
+            self.assertEqual(gd.tree_git_dir(doomed / "wt"), doomed / "repo/.git/worktrees/wt")
+            self.assertEqual(gd.moved_git_path(f"{old}x/y"), f"{old}x/y")  # a sibling with a longer name
+        self.assertEqual(gd.GITFILE_MOVES, [])
+
+    def test_a_symlinked_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        heads = clone / ".git/logs/refs/heads"
+        shutil.move(os.fspath(heads), os.fspath(self.home / "heads-elsewhere"))
+        heads.symlink_to(self.home / "heads-elsewhere")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def test_an_unreadable_outside_linked_worktree_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        parent = self.home / "locked-away"
+        parent.mkdir()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(parent / "wt"), env=env)
+        os.chmod(parent, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(parent, 0o755)
+        self.assertIn("linked worktree", why)
+        self.assertEqual(bundles, [])
+
+    def test_a_commit_after_the_last_recheck_puts_the_mirror_back(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.mirror_moved
+
+        def late(fam, path, recheck):
+            out = real(fam, path, recheck)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made after the recheck", env=env)
+            return out
+        with mock.patch.object(gd, "mirror_moved", late):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir(), "renamed back to its path")
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_a_checkout_referenced_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        bundled = []
+        real = gd.archive_mirror
+
+        def archive(path):
+            bundled.append(path)  # a tool names the checkout while its git work is bundled
+            return real(path)
+        with mock.patch.object(gd, "referenced_main_checkout",
+                               lambda path, nested=False: "named by ~/.local/bin/tool" if bundled else ""), \
+                mock.patch.object(gd, "archive_mirror", archive):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("referenced while its git work was bundled" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_or_special_reflog_file_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        log = clone / ".git/logs/HEAD"
+        log.rename(self.home / "head-log")
+        log.symlink_to(self.home / "head-log")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def recheck_after_rename(self, change, unit: Path | None = None) -> tuple[dict, Path]:
+        """apply with `change(doomed)` run on the renamed-aside tree, right before the post-rename recheck."""
+        unit = unit or self.mirror_unit()[0]
+        real = gd.mirror_rename_recheck
+
+        def wrapped(path, recheck):
+            inner = real(path, recheck)
+
+            def run():
+                change(path.with_name(f"{gd.DELETING_PREFIX}{path.name}-{os.getpid()}"))
+                inner()
+            return run
+        with mock.patch.object(gd, "mirror_rename_recheck", wrapped):
+            rec, _ = self.apply_mirror(unit)
+        return rec, unit
+
+    def test_work_staged_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def stage(doomed):
+            (doomed / "slot-1/new.txt").write_text("x")
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "add", "new.txt"], check=True)
+        rec, unit = self.recheck_after_rename(stage)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-1/new.txt").exists())
+
+    def test_a_repository_created_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def create(doomed):
+            subprocess.run(["git", "init", "-q", str(doomed / "slot-9")], check=True)
+        rec, unit = self.recheck_after_rename(create)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-9/.git").is_dir())
+
+    def test_a_symlinked_packed_refs_is_unreadable(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        (clone / ".git/packed-refs").write_text("")
+        (clone / ".git/packed-refs").rename(self.home / "packed")
+        (clone / ".git/packed-refs").symlink_to(self.home / "packed")
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+
+    def test_a_tree_that_cannot_go_back_is_kept_aside_and_never_finished(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real_rename = gd.rename_noreplace
+
+        def blocked(src, dst):
+            raise OSError(errno.EEXIST, "File exists")
+
+        def commit(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "commit", "-q", "--allow-empty", "-m", "late"],
+                           check=True, env=env)
+        with mock.patch.object(gd, "rename_noreplace", blocked):
+            rec, _ = self.recheck_after_rename(commit, unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        aside = [p for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue(gd.mirror_keep_marker(aside[0]).exists())
+        with self.assertRaises(OSError):
+            gd.finish_deletion(aside[0])
+        fam = gd.Family(gd.INTERRUPTED, unit.parent, True, "x")
+        self.assertIn("kept it", gd.keep_verdict(fam, aside[0]))
+        self.assertTrue((aside[0] / "slot-1/.git").is_dir())
+        del real_rename
+
+    def test_a_symlinked_packed_refs_is_never_judged_empty(self) -> None:
+        bare = self.home / "bare.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        (self.home / "packed").write_text("# pack-refs with: peeled\n")
+        (bare / "packed-refs").symlink_to(self.home / "packed")
+        self.assertFalse(gd.repo_unborn(bare))
+        self.assertTrue(gd.bundle_unpushed(bare, "k", []))
+
+    def test_a_branch_named_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def name(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "tag", "made-late", "HEAD"], check=True)
+        rec, unit = self.recheck_after_rename(name)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("made-late", subprocess.run(["git", "-C", str(unit / "slot-1"), "tag"], capture_output=True,
+                                                  text=True, check=True).stdout)
+
+    def test_a_keep_marker_that_cannot_be_written_keeps_the_tree_in_place(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        with mock.patch.object(gd, "mirror_keep_marker", lambda aside: self.home / "no-such-dir" / "marker"):
+            rec, _ = self.apply_mirror(unit)
+        self.assertTrue(rec["outcome"].startswith("incomplete:"), rec["outcome"])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
+        archive = self.home / "archive/glaeda-disk"
+        archive.mkdir(parents=True)
+        name = "20260901T000000-1-{:016x}-r.expires-{}.bundle".format
+        listed = {name(1, "2026-10-01"): "2026-10-01", name(2, "2026-11-19"): "2026-11-19",
+                  name(3, "2026-10-02"): "2026-10-02"}  # 3: changed since it was written
+        for n in [*listed, name(4, "2026-10-01")]:  # 4: expired by its name, but not in the manifest
+            (archive / n).write_text(n)
+        with (archive / "manifest.jsonl").open("w") as m:
+            for n, exp in listed.items():
+                m.write(json.dumps({"name": n, "sha256": gd._sha256(archive / n), "expires": exp}) + "\n")
+        (archive / name(3, "2026-10-02")).write_text("changed")
+        (self.home / "archive/other.bundle").write_text("x")
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(
+                gd, "process_evidence", side_effect=gd.NoEvidence("ps failed")):
+            gd.apply([], {f.id: f for f in fams}, self.home / "r.jsonl", None, 24)
+        self.assertTrue((archive / name(1, "2026-10-01")).exists())  # no evidence: nothing is deleted
+        self.assertEqual(gd.prune_mirror_archive("2026-10-26"), 1)
+        self.assertEqual(sorted(p.name for p in archive.glob("*.bundle")),
+                         sorted([name(2, "2026-11-19"), name(3, "2026-10-02"), name(4, "2026-10-01")]))
+        self.assertNotIn(name(1, "2026-10-01"), (archive / "manifest.jsonl").read_text())
+        self.assertTrue((self.home / "archive/other.bundle").exists())
+
+    @mock.patch.object(gd, "ACTIVITY_MODE", None)
+    @mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False)
     def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
         """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
         in the fleet CI store, where cmux-kept-build lists only its own names."""
@@ -2450,6 +12200,27 @@ class ProcEvidenceTest(unittest.TestCase):
         self.assertTrue(cmds.strip())
 
 
+@unittest.skipUnless(sys.platform == "darwin", "reads macOS process evidence")
+class DarwinEvidenceTest(unittest.TestCase):
+    def test_owned_query_returns_text_and_status(self) -> None:
+        with mock.patch.object(gd, "_owned_query", side_effect=[
+            (0, "p123\nn/Users/cmux/work\n"),
+            (0, "launchd\n"),
+        ]):
+            opened, commands = gd.process_evidence()
+        self.assertEqual(opened, ["/Users/cmux/work"])
+        self.assertEqual(commands, "launchd\n")
+
+    def test_owned_query_parses_cache_path(self) -> None:
+        with mock.patch.object(gd, "_owned_query", side_effect=[
+            (0, "p123\nn/Users/cmux/cache\n"),
+            (0, "launchd\n"),
+        ]):
+            opened, commands = gd.process_evidence()
+        self.assertEqual(opened, ["/Users/cmux/cache"])
+        self.assertEqual(commands, "launchd\n")
+
+
 @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
 class DedupeTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -2506,6 +12277,39 @@ class DedupeTest(unittest.TestCase):
         self.assertTrue(all(p.read_bytes() == data for p in (*copies, module)))
         self.assertEqual(build.stat().st_ino, build_ino)
 
+    def test_cmux_next_ci_products_are_deduped_only_with_opt_in_guard(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        root = self.root / "Library/Caches/cmux-next-ci"
+        first = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-a/Products/a.o", data)
+        second = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-b/Products/a.o", data)
+        before = second.stat().st_ino
+        # The ordinary input-only roots intentionally do not include Products.
+        self.assertEqual(gd.dedupe(gd.dedupe_roots(root / "cmux-scheme"), self.state)["cloned_bytes"], 0)
+        self.assertEqual(second.stat().st_ino, before)
+        # An explicit inactive-Products pass can clone it after its guard has rechecked
+        # the state roots.  This test uses a constant guard because APFS clone support
+        # is already the class-level Darwin requirement.
+        r = gd.dedupe(gd.cmux_next_ci_dedupe_roots(root), self.state, guard=lambda _: True)
+        self.assertEqual(r["cloned_bytes"], len(data))
+        self.assertEqual(second.read_bytes(), data)
+        self.assertNotEqual(second.stat().st_ino, before)
+        self.assertEqual(first.read_bytes(), data)
+
+    def test_cmux_next_ci_nested_build_products_are_deduped(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        root = self.root / "Library/Caches/cmux-next-ci"
+        first = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-a/Build/Products/a.o", data)
+        second = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-b/Build/Products/a.o", data)
+        before = second.stat().st_ino
+        # The ordinary input-only roots still exclude the Build tree.
+        self.assertEqual(gd.dedupe(gd.dedupe_roots(root / "cmux-scheme"), self.state)["cloned_bytes"], 0)
+        self.assertEqual(second.stat().st_ino, before)
+        r = gd.dedupe(gd.cmux_next_ci_dedupe_roots(root), self.state, guard=lambda _: True)
+        self.assertEqual(r["cloned_bytes"], len(data))
+        self.assertEqual(second.read_bytes(), data)
+        self.assertNotEqual(second.stat().st_ino, before)
+        self.assertEqual(first.read_bytes(), data)
+
     @unittest.skipUnless(sys.platform == "darwin", "APFS clones")
     def test_dedupe_main_scans_cmux_next_ci(self) -> None:
         data = os.urandom(2 * 1024 * 1024)
@@ -2520,6 +12324,26 @@ class DedupeTest(unittest.TestCase):
         self.assertIn("cloned 0.0G", out.getvalue())  # 2 MiB rounds to 0.0G; the state records the clone
         state = json.loads(self.state.read_text())
         self.assertTrue(all(v["cloned"] for v in state.values()))
+
+    def test_dedupe_main_shares_release_state_packages_with_runner_copies(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        ci = "Library/Caches/cmux-next-ci"
+        runner = self.blob(f"{ci}/cmux-scheme/host-glaeda-2/SourcePackages/artifacts/x.bin", data)
+        daily = self.blob(f"{ci}/dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/SourcePackages/"
+                          "artifacts/x.bin", data)
+        product = self.blob(f"{ci}/dev-daily-release/0123456789abcdef/Release/xcode-89abcdef/Build/Products/x.bin",
+                            data)
+        before = {p: p.stat().st_ino for p in (runner, daily, product)}
+        out = io.StringIO()
+        with mock.patch.object(gd, "HOME", self.root), mock.patch.object(gd, "DEDUPE_STATE", self.state), \
+                mock.patch.object(gd, "default_families", return_value=[]), contextlib.redirect_stdout(out):
+            self.assertEqual(gd.main(["--dedupe"]), 0)
+        self.assertIn("dedupe: 2 files >= 1 MiB", out.getvalue())  # Build/Products is --dedupe-builds' only
+        self.assertEqual(product.stat().st_ino, before[product])
+        self.assertEqual(sum(p.stat().st_ino != before[p] for p in (runner, daily)), 1)
+        self.assertTrue(runner.read_bytes() == daily.read_bytes() == data)
+        if (ids := {gd.file_clone_id(os.fspath(p)) for p in (runner, daily)}) != {None}:
+            self.assertEqual(len(ids), 1)  # one data stream on disk
 
     def test_target_changed_after_hash_is_refused(self) -> None:
         data = os.urandom(2 * 1024 * 1024)
@@ -2551,6 +12375,1558 @@ class DedupeTest(unittest.TestCase):
         self.blob("b/small", b"x" * 10)
         r = gd.dedupe([self.root / "a", self.root / "b"], self.state)
         self.assertEqual((r["files"], r["cloned_bytes"]), (0, 0))
+
+
+class _Stat:
+    """An lstat result with some fields replaced (st_dev, st_uid), for paths a test pretends are elsewhere."""
+
+    def __init__(self, st: os.stat_result, **over: int) -> None:
+        self._st, self._over = st, over
+
+    def __getattr__(self, name: str):
+        return self._over[name] if name in self._over else getattr(self._st, name)
+
+
+apfs = unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+
+
+class CaptureDedupeTest(unittest.TestCase):
+    """cmux-mac-mini, 2026-10-18..21: every pressure pass freed 0 GiB while ~/messageslab-26 held 11.2 GiB of
+    byte-identical PNG frames (deputy-2 cloned them by hand at a 16 KiB floor). Dedupe looked only at Xcode's
+    folders with a 1 MiB floor. Capture and evidence trees are now policy roots with their own smaller floor."""
+
+    KIB = 1024
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(dir=os.path.expanduser("~"))
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state.json"
+        self.policy = dict(gd.POLICY_DEFAULTS)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def blob(self, rel: str, data: bytes, mode: int = 0o644, mtime: float = 1_000_000) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        os.chmod(p, mode)
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def dedupe(self, roots: list[Path], **kw):
+        kw.setdefault("min_bytes", 16 * self.KIB)
+        kw.setdefault("strict", True)
+        return gd.dedupe(roots, self.state, **kw)
+
+    def files(self) -> set[str]:
+        return {p.relative_to(self.root).as_posix() for p in self.root.rglob("*")
+                if p.is_file() and p != self.state and not p.name.startswith("dedupe")}
+
+    def run_main(self, policy: dict | None = None, writers: frozenset = frozenset()) -> str:
+        dd = self.root / "Library/Developer/Xcode/DerivedData"
+        dd.mkdir(parents=True, exist_ok=True)
+        out = io.StringIO()
+        with mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "DEDUPE_STATE", self.root / ".cache/glaeda-disk/dedupe.json"), \
+                mock.patch.object(gd, "POLICY", policy or self.policy), \
+                mock.patch.object(gd, "default_families",
+                                  return_value=[gd.Family("xcode-derived-data", dd, True, "x")]), \
+                mock.patch.object(gd, "open_for_writing", return_value=writers), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gd.main(["--dedupe"]), 0)
+        return out.getvalue()
+
+    # -- the policy declares the roots and the floor --------------------------------------------------
+
+    def test_policy_declares_capture_roots_and_a_16_kib_floor(self) -> None:
+        roots = gd.POLICY_DEFAULTS["dedupe_capture_roots"]
+        for want in ("~/messageslab-*", "~/Projects/captures", "~/Applications/cx-ui-captures",
+                     "/Users/Shared/cmux-capture", "/Users/Shared/cmux-captures"):
+            self.assertIn(want, roots)
+        self.assertEqual(gd.POLICY_DEFAULTS["dedupe_capture_min_kib"], 16)
+        self.assertGreater(gd.POLICY_DEFAULTS["dedupe_capture_settle_minutes"], 0)
+        self.assertGreater(gd.POLICY_DEFAULTS["dedupe_capture_budget_minutes"], 0)
+        self.assertEqual(gd.DEDUPE_MIN_BYTES, 1024 * 1024)  # Xcode's folders keep their 1 MiB floor
+
+    def test_a_host_policy_file_replaces_the_roots_and_bad_values_keep_the_default(self) -> None:
+        path = self.root / "disk-policy.json"
+        path.write_text(json.dumps({"dedupe_capture_roots": ["~/evidence", "/data/caps-*"],
+                                    "dedupe_capture_min_kib": 64}))
+        got = gd.disk_policy(path)
+        self.assertEqual(got["dedupe_capture_roots"], ["~/evidence", "/data/caps-*"])
+        self.assertEqual(got["dedupe_capture_min_kib"], 64)
+        for bad in ("~/evidence", ["~/ok", 3], [""]):
+            path.write_text(json.dumps({"dedupe_capture_roots": bad}))
+            self.assertEqual(gd.disk_policy(path)["dedupe_capture_roots"],
+                             gd.POLICY_DEFAULTS["dedupe_capture_roots"])
+        path.write_text(json.dumps({"dedupe_capture_roots": []}))  # an empty list turns the pass off
+        self.assertEqual(gd.disk_policy(path)["dedupe_capture_roots"], [])
+
+    def test_roots_expand_home_and_globs_and_skip_missing_files_and_symlinks(self) -> None:
+        for d in ("messageslab-26", "messageslab-27", "Projects/captures"):
+            (self.root / d).mkdir(parents=True)
+        (self.root / "messageslab-notes").write_text("a file, not a tree")
+        (self.root / "messageslab-link").symlink_to(self.root / "Projects")
+        got = gd.capture_dedupe_roots(["~/messageslab-*", "~/Projects/captures", "~/missing",
+                                       os.fspath(self.root / "Projects/captures")], home=self.root)
+        self.assertEqual(got, [self.root / "messageslab-26", self.root / "messageslab-27",
+                               self.root / "Projects/captures"])
+
+    # -- the pass itself ----------------------------------------------------------------------------
+
+    @apfs
+    def test_main_dedupe_clones_capture_frames_down_to_16_kib_and_deletes_nothing(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("messageslab-26/sendw/take1/frames/0001.png", frame)
+        b = self.blob("messageslab-26/sendw/take2/frames/0001.png", frame)
+        c = self.blob("Projects/captures/run/0001.png", frame)
+        tiny = os.urandom(8 * self.KIB)
+        t1 = self.blob("messageslab-26/a/tiny.png", tiny)
+        t2 = self.blob("messageslab-26/b/tiny.png", tiny)
+        # Xcode's folders keep their 1 MiB floor: a 64 KiB duplicate there stays as it is.
+        pkg = os.urandom(64 * self.KIB)
+        x1 = self.blob("Library/Developer/Xcode/DerivedData/p1/SourcePackages/x.bin", pkg)
+        x2 = self.blob("Library/Developer/Xcode/DerivedData/p2/SourcePackages/x.bin", pkg)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*", "~/Projects/captures"]
+        inodes = {p: p.stat().st_ino for p in (a, b, c, t1, t2, x1, x2)}
+        before = self.files()
+        out = self.run_main()
+        self.assertIn("dedupe captures: 3 files >= 16 KiB in 2 roots", out)
+        self.assertEqual(self.files(), before)  # never deletes
+        self.assertTrue(all(p.read_bytes() == frame for p in (a, b, c)))
+        self.assertEqual(sum(p.stat().st_ino != inodes[p] for p in (a, b, c)), 2)
+        for p in (t1, t2, x1, x2):
+            self.assertEqual(p.stat().st_ino, inodes[p])
+        state = json.loads((self.root / ".cache/glaeda-disk/dedupe-captures.json").read_text())
+        self.assertTrue(all(state[os.fspath(p)]["cloned"] for p in (a, b, c)))
+
+    @apfs
+    def test_no_capture_roots_means_no_capture_pass(self) -> None:
+        self.policy["dedupe_capture_roots"] = []
+        self.assertNotIn("dedupe captures", self.run_main())
+
+    @apfs
+    def test_young_capture_files_wait_for_a_later_pass(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("messageslab-26/a.png", frame)
+        b = self.blob("messageslab-26/b.png", frame, mtime=time.time() - 60)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*"]
+        ino = b.stat().st_ino
+        out = self.run_main()
+        self.assertIn("still settling 1", out)
+        self.assertEqual(b.stat().st_ino, ino)
+        self.assertEqual(a.read_bytes(), frame)
+
+    @apfs
+    def test_files_open_for_writing_are_left_alone(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        ino = b.stat().st_ino
+        with open(b, "r+b") as held:  # a recorder still has it open for writing (real lsof)
+            r = self.dedupe([self.root / "caps"], guard=gd.capture_dedupe_guard())
+            self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1))
+            self.assertEqual(b.stat().st_ino, ino)
+            held.seek(0)
+        r = self.dedupe([self.root / "caps"], guard=gd.capture_dedupe_guard())
+        self.assertEqual(r["cloned_bytes"], len(frame))
+        self.assertEqual(b.read_bytes(), frame)
+
+    def test_writers_are_read_from_lsof_access_modes(self) -> None:
+        out = ("p10\nfcwd\na \nn/Users/x\nf3\nar\nn/caps/read.png\nf4\naw\nn/caps/write.png\n"
+               "p11\nf5\nau\nn/caps/rw.png\nf6\na \nn/caps/none.png\n")
+        self.assertEqual(gd.lsof_writers(out), frozenset({"/caps/write.png", "/caps/rw.png"}))
+
+    @apfs
+    def test_without_lsof_evidence_the_capture_pass_is_skipped(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("messageslab-26/a.png", frame)
+        b = self.blob("messageslab-26/b.png", frame)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*"]
+        ino = b.stat().st_ino
+        with mock.patch.object(gd, "open_for_writing", side_effect=gd.NoEvidence("lsof: boom")):
+            out = io.StringIO()
+            with mock.patch.object(gd, "HOME", self.root), mock.patch.object(gd, "POLICY", self.policy), \
+                    mock.patch.object(gd, "DEDUPE_STATE", self.root / ".cache/dedupe.json"), \
+                    mock.patch.object(gd, "default_families", return_value=[]), contextlib.redirect_stdout(out):
+                self.assertEqual(gd.main(["--dedupe"]), 0)
+        self.assertIn("dedupe captures: skipped (lsof: boom)", out.getvalue())
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_files_on_different_volumes_are_never_paired(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        real = os.lstat
+
+        def lstat(p, *args, **kw):
+            st = real(p, *args, **kw)
+            return _Stat(st, st_dev=st.st_dev + 1) if os.fspath(p) == os.fspath(b) else st
+
+        ino = b.stat().st_ino
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            r = self.dedupe([self.root / "caps"])
+            self.assertEqual((r["cloned_bytes"], r["hashed_bytes"]), (0, 0))
+            key = gd._file_key(os.lstat(b))
+            self.assertFalse(gd.clone_over(str(a), str(b), key, gd._file_key(os.lstat(a))))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    # -- safety of each swap ------------------------------------------------------------------------
+
+    @apfs
+    def test_a_strict_clone_keeps_mode_times_birthtime_xattrs_and_group(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame, mode=0o600)
+        os.utime(b, (500_000, 500_000))  # moves b's birthtime back to 500000 (APFS keeps birth <= mtime)
+        os.utime(b, (2_000_000, 2_000_000))
+        for p in (a, b):
+            subprocess.run(["xattr", "-w", "com.example.take", "send-typed", os.fspath(p)], check=True)
+        before = os.lstat(b)
+        r = self.dedupe([self.root / "caps"])
+        self.assertEqual(r["cloned_bytes"], len(frame))
+        after = os.lstat(b)
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual(b.read_bytes(), frame)
+        self.assertEqual((oct(after.st_mode), after.st_uid, after.st_gid, after.st_mtime_ns, after.st_flags),
+                         (oct(before.st_mode), before.st_uid, before.st_gid, before.st_mtime_ns, before.st_flags))
+        self.assertEqual(int(after.st_birthtime), 500_000)
+        self.assertEqual(gd.file_xattrs(os.fspath(b)), {"com.example.take": b"send-typed"})
+        self.assertEqual([p.name for p in self.root.rglob("*glaeda-clone*")], [])
+
+    @apfs
+    def test_a_strict_clone_refuses_differing_xattrs_acls_or_flags(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+
+        def pair(name: str) -> Path:
+            self.blob(f"{name}/a.png", frame)
+            return self.blob(f"{name}/b.png", frame)
+
+        xattr_b, acl_b, flag_b = pair("xattr"), pair("acl"), pair("flag")
+        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;x;y;", os.fspath(xattr_b)], check=True)
+        subprocess.run(["chmod", "+a", "everyone deny delete", os.fspath(acl_b)], check=True)
+        os.chflags(flag_b, stat.UF_HIDDEN)
+        inodes = {p: p.stat().st_ino for p in (xattr_b, acl_b, flag_b)}
+        for p in (xattr_b, acl_b, flag_b):
+            r = gd.dedupe([p.parent], self.root / f"{p.parent.name}.json", min_bytes=16 * self.KIB, strict=True)
+            self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1), p.parent.name)
+            self.assertEqual(p.stat().st_ino, inodes[p], p.parent.name)
+        os.chflags(flag_b, 0)
+        subprocess.run(["chmod", "-N", os.fspath(acl_b)], check=True)
+
+    @apfs
+    def test_a_strict_clone_refuses_a_file_someone_else_owns(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        real = os.lstat
+
+        def lstat(p, *args, **kw):
+            st = real(p, *args, **kw)
+            return _Stat(st, st_uid=st.st_uid + 1) if os.fspath(p) == os.fspath(b) else st
+
+        key, akey = gd._file_key(os.lstat(b)), gd._file_key(os.lstat(a))
+        ino = b.stat().st_ino
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            self.assertFalse(gd.clone_over(str(a), str(b), key, akey, strict=True))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_bytes_are_compared_so_a_hash_collision_is_never_cloned(self) -> None:
+        a = self.blob("caps/a.png", os.urandom(32 * self.KIB))
+        b = self.blob("caps/b.png", os.urandom(32 * self.KIB))
+        want = b.read_bytes()
+        with mock.patch.object(gd, "_sha256", return_value="same"):
+            r = self.dedupe([self.root / "caps"])
+        self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1))
+        self.assertEqual(b.read_bytes(), want)
+        self.assertNotEqual(a.read_bytes(), want)
+
+    @apfs
+    def test_files_already_sharing_a_clone_are_left_as_they_are(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.root / "caps/b.png"
+        subprocess.run(["/bin/cp", "-c", os.fspath(a), os.fspath(b)], check=True)  # deputy-2's hand dedupe
+        os.utime(b, (1_000_000, 1_000_000))
+        ino = b.stat().st_ino
+        r = self.dedupe([self.root / "caps"])
+        self.assertEqual((r["cloned_bytes"], r["shared"], r["refused"]), (0, 1, 0))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_git_dirs_inside_a_capture_root_are_not_walked(self) -> None:
+        data = os.urandom(32 * self.KIB)
+        self.blob("caps/.git/objects/pack/a.pack", data)
+        self.blob("caps/.git/objects/pack/b.pack", data)
+        self.assertEqual(self.dedupe([self.root / "caps"])["files"], 0)
+
+    # -- a bounded pass -----------------------------------------------------------------------------
+
+    @apfs
+    def test_a_zero_budget_does_nothing_and_says_it_is_incomplete(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        ino = b.stat().st_ino
+        r = self.dedupe([self.root / "caps"], budget_s=0)
+        self.assertEqual((r["complete"], r["cloned_bytes"]), (False, 0))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_bounded_passes_each_stop_on_time_and_together_finish_every_root(self) -> None:
+        """A pass stops at its budget (each clock read is one tick here) and says it is incomplete; later passes
+        resume from the hashes it saved and start at the root it stopped in, so roots bigger than one pass
+        cannot starve the ones after them."""
+        roots, frames = [], {}
+        for name in ("r1", "r2", "r3", "r4"):
+            data = os.urandom(32 * self.KIB)
+            for n in range(3):
+                frames[self.blob(f"{name}/f{n}.png", data)] = data
+            roots.append(self.root / name)
+        inodes = {p: p.stat().st_ino for p in frames}
+        ticks = iter(range(10**6))
+
+        def changed() -> collections.Counter:
+            return collections.Counter(p.parent.name for p in frames if p.stat().st_ino != inodes[p])
+
+        passes = 0
+        while sum(changed().values()) < 8:
+            passes += 1
+            self.assertLess(passes, 40)
+            r = self.dedupe(roots, budget_s=10, clock=lambda: float(next(ticks)))
+            self.assertFalse(r["complete"])  # 12 files never fit one 10-tick pass
+            self.assertGreater(r["hashed_bytes"] + r["cloned_bytes"], 0)  # yet every pass gets somewhere
+        self.assertGreater(passes, 2)
+        self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
+        self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
+
+
+class HygieneMirrorTest(unittest.TestCase):
+    """The 12 h hygiene rule on a CI mini: fleet cache entries, CUA build trees and ~/Library/Caches/cmux* idle past
+    12 h go once their unpushed commits are bundled into ~/archive; a process in one keeps it (cmux13s, 2026-10-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / "shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def checkout(self, tree: Path) -> Path:
+        """A clone with a commit no remote holds, idle 26 h."""
+        repo = tree / "work"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "local only"], check=True, env=self.env)
+        (tree / "build.o").write_bytes(b"o" * 4096)
+        t = time.time() - 26 * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+        return repo
+
+    def families(self, runners: bool = True) -> dict[str, gd.Family]:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner"] if runners else []):
+            return {f.id: f for f in gd.default_families()
+                    if f.id in ("fleet-artifacts", "cua-cache", "library-caches")}
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def test_an_idle_tree_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/ios-workspaces"
+        self.checkout(tree)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(fam.mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
+        item = self.survey(fam)["ios-workspaces"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+        heads = subprocess.run(["git", "bundle", "list-heads", str(bundles[0])], capture_output=True, text=True,
+                               check=True).stdout
+        self.assertIn("refs/heads/", heads)
+
+    def test_a_tree_with_a_process_in_it_is_kept(self) -> None:
+        tree = gd.HOME / "Library/Caches/cmux/cmux-cua/build-src-abc"
+        repo = self.checkout(tree)
+        fam = self.families()["cua-cache"]
+        self.assertEqual(self.survey(fam)["build-src-abc"].verdict, "reclaimable")
+        item = self.survey(fam, opened=[f"{repo}"])["build-src-abc"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        # a process that starts after the survey keeps it at apply's fresh evidence, before any bundle goes
+        idle = self.survey(fam)["build-src-abc"]
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], f"swift build --package-path {repo}\n")):
+            gd.apply([idle], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((repo / ".git").is_dir())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_only_cmux_library_caches_and_never_a_warm_tree_kept_by_role(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        for name in ("cmux-ci", "cmux-release-support", "org.example.tool"):
+            self.checkout(caches / name)
+        items = self.survey(self.families()["library-caches"])
+        self.assertEqual(items["cmux-ci"].verdict, "reclaimable", items["cmux-ci"].reasons)
+        self.assertNotIn("cmux-release-support", items)  # NEVER_DELETE: a release builder's warm trees
+        self.assertEqual(items["org.example.tool"].verdict, "git-checkout")
+
+    def test_warm_caches_kept_by_role_never_take_the_rule_even_unsplit(self) -> None:
+        """cmux-nightly-next is a library-caches item while its split is off: the rule must still pass it by, as it
+        does cmux-next-ci, cmux-release-support and cmux-ci-media."""
+        caches = gd.HOME / "Library/Caches"
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.checkout(caches / name)
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": ""}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = self.families()["library-caches"]
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fam.skip)
+            items = self.survey(fam)
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.assertFalse(gd.mirror_due(fam, caches / name, 999.0), name)
+            if name in items:
+                self.assertNotEqual(items[name].verdict, "reclaimable", (name, items[name].reasons))
+
+    def test_a_lone_file_never_takes_the_rule_and_still_goes_by_age(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        caches.mkdir(parents=True)
+        (caches / "cmux-notes.txt").write_text("x")
+        self.assertFalse(gd.mirror_due(self.families()["library-caches"], caches / "cmux-notes.txt", 999.0))
+        files = {"fleet-artifacts": gd.FLEET_ROOT / "cache/old.tar", "cua-cache": gd.HOME / "Library/Caches/cmux/cmux-cua/f.bin"}
+        t = time.time() - 26 * 3600
+        for fid, f in files.items():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x" * 4096)
+            os.utime(f, (t, t))
+            fam = self.families()[fid]
+            self.assertFalse(gd.mirror_due(fam, f, 26.0), fid)
+            item = self.survey(fam)[f.name]
+            self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+            receipt = self.home / f"{fid}.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply([item], {fam.id: fam}, receipt, None, 24)
+            self.assertFalse(f.exists(), (fid, receipt.read_text()))
+
+    def test_another_filesystem_below_a_mirror_keeps_it(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/split-spring-apps"
+        (tree / "apps/vol").mkdir(parents=True)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(gd.mount_below(tree), "")
+        self.assertIn("too large", gd.mount_below(tree, budget=1))
+        real_scandir = os.scandir
+
+        class Entry:  # a DirEntry whose directory sits on another device
+            def __init__(self, e):
+                self._e, self.name, self.path = e, e.name, e.path
+
+            def is_dir(self, follow_symlinks=True):
+                return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+            def stat(self, follow_symlinks=True):
+                st = self._e.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:])) \
+                    if self.name == "vol" else st
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Entry(e) for e in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertEqual(gd.mount_below(tree), "another filesystem is mounted below it (apps/vol)")
+        t = time.time() - 26 * 3600
+        for d in (tree / "apps/vol", tree / "apps", tree):
+            os.utime(d, (t, t))
+        item = self.survey(fam)["split-spring-apps"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        receipt = self.home / "receipt.jsonl"
+        with mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (apps/vol)"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((tree / "apps/vol").is_dir())
+        self.assertIn("blocked:mount", receipt.read_text())
+        # an unreadable directory below it could hide a mount: inconclusive keeps it
+        os.chmod(tree / "apps/vol", 0)
+        try:
+            self.assertIn("unreadable below it", gd.mount_below(tree))
+            self.assertTrue(gd.archive_mirror(tree)[0])  # mirror_repos or mount_below refuses it, never a bundle
+        finally:
+            os.chmod(tree / "apps/vol", 0o755)
+        # and a mount that appears while the work is bundled keeps it at mirror_moved
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {}, {}, {})))
+
+    def test_other_archives_expire_30_days_after_their_newest_change_and_never_sooner(self) -> None:
+        archive = gd.HOME / "archive"
+        manual = archive / "cnx-wg-aziz-20261027"
+        manual.mkdir(parents=True)
+        (manual / "uncommitted.patch").write_text("diff")
+        (manual / "head.bundle").write_bytes(b"bundle")
+        (archive / "loose.tar.gz").write_bytes(b"x")
+        (archive / "busy.patch").write_bytes(b"x")
+        fresh = archive / "fresh"
+        (fresh / "deep").mkdir(parents=True)
+        (fresh / "deep/new.txt").write_text("touched two days from now")
+        later = time.time() + 2 * 86400
+        os.utime(fresh / "deep/new.txt", (later, later))
+        (archive / "glaeda-disk").mkdir()
+        (archive / "glaeda-disk/kept.bundle").write_bytes(b"listed or not, the manifest decides")
+        outside = gd.HOME / "elsewhere"
+        outside.mkdir()
+        (archive / "link").symlink_to(outside)
+        held = archive / "held"
+        held.mkdir()
+        locked = archive / "locked"
+        (locked / "inner").mkdir(parents=True)
+        everything = sorted(p.name for p in archive.iterdir())
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 29 * 86400), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), everything)
+        def in_use(p: Path) -> bool:  # busy.patch comes into use only after it is renamed aside
+            return p == held or p.name.startswith(gd.DELETING_PREFIX + "busy.patch")
+        os.chmod(locked / "inner", 0)  # unreadable: kept, whatever its age
+        try:
+            gone = gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=in_use)
+        finally:
+            os.chmod(locked / "inner", 0o755)
+        self.assertEqual(sorted(Path(p).name for p in gone), ["cnx-wg-aziz-20261027", "loose.tar.gz"])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()),
+                         ["busy.patch", "fresh", "glaeda-disk", "held", "link", "locked"])
+        self.assertTrue((archive / "glaeda-disk/kept.bundle").exists() and outside.is_dir())
+
+    def test_an_archive_that_comes_into_use_or_changes_while_it_expires_goes_back(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        calls = []
+
+        def busy_on_recheck(p: Path) -> bool:
+            calls.append(p.name)
+            return len(calls) > 1  # free at the first look, in use after the rename
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=busy_on_recheck), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["old"])
+        self.assertEqual((old / "a.patch").read_text(), "diff")
+        import socket
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        cwd = os.getcwd()
+        os.chdir(old)  # a relative name: the temp path may be past the AF_UNIX length limit
+        try:
+            sock.bind("s")
+        except PermissionError:
+            self.skipTest("this sandbox refuses AF_UNIX binds")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])  # a socket below it
+        (old / "s").unlink()
+        self.assertEqual(len(gd.prune_foreign_archives(now=time.time() + 31 * 86400)), 1)
+        self.assertEqual(list(archive.iterdir()), [])
+
+    def test_the_renames_own_ctime_never_reads_as_a_change(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        newest = gd._newest_change(old)
+        root = os.lstat(archive)
+        doomed = old.with_name(f"{gd.DELETING_PREFIX}old-{os.getpid()}")
+        os.rename(old, doomed)
+        st = os.lstat(doomed)
+        later = newest + 3600  # the rename's ctime, made deterministic: never read as the entry's age
+        real = os.lstat
+
+        def lstat(q, *a, **k):
+            r = real(q, *a, **k)
+            return os.stat_result((*r[:9], later)) if os.fspath(q) == os.fspath(doomed) else r
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False,
+                                        (st.st_dev, st.st_ino))  # passes: no raise
+        (doomed / "a.patch").write_text("changed")
+        later = newest + 3600
+        os.utime(doomed / "a.patch", (later, later))
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)
+        self.assertEqual((old / "a.patch").read_text(), "changed")  # put back
+
+    def test_an_archive_swapped_for_another_before_its_rename_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        f.unlink()
+        f.write_text("new contents")  # a fresh file at the same name, its mtime set back
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        if (os.lstat(doomed).st_ino) == first.st_ino:
+            self.skipTest("the filesystem reused the inode")
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino))
+        self.assertEqual(f.read_text(), "new contents")
+
+    def test_a_file_rewritten_in_place_with_its_old_mtime_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        digest = gd._sha256(f)
+        with f.open("r+") as h:  # same inode, new bytes, old mtime
+            h.write("new")
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino), digest)
+        self.assertEqual(f.read_text(), "new")
+
+    def test_a_directory_swapped_for_a_fresh_file_after_its_look_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        real = gd.mount_below
+
+        def swap(path, *a, **k):  # after the age was judged, before the rename
+            if path == old and old.is_dir():
+                shutil.rmtree(old)
+                old.write_text("fresh data")
+            return real(path, *a, **k)
+        with mock.patch.object(gd, "mount_below", side_effect=swap), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])
+        self.assertEqual(old.read_text(), "fresh data")
+
+    def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
+        root = gd.mirror_archive()
+        root.mkdir(parents=True)
+        os.chmod(root.parent, 0o755)
+        os.chmod(root, 0o755)
+        (root / "manifest.jsonl").write_text("")
+        os.chmod(root / "manifest.jsonl", 0o644)
+        tmp = root / ".t.tmp"
+        tmp.write_text("x")
+        gd._private_archive_dir()
+        gd._keep_archive(tmp, root / "x.expires-2099-01-01.patch", "2099-01-01", [])
+        self.assertEqual([stat.S_IMODE(os.stat(p).st_mode) for p in (root.parent, root, root / "manifest.jsonl")],
+                         [0o700, 0o700, 0o600])
+
+    def test_off_where_no_ci_runner_is_enrolled(self) -> None:
+        (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
+        fams = self.families(runners=False)
+        self.assertEqual({fid: f.mirror_idle_hours for fid, f in fams.items()},
+                         {"fleet-artifacts": None, "cua-cache": None, "library-caches": None})
+        self.checkout(gd.FLEET_ROOT / "cache/ios-workspaces")
+        self.assertEqual(self.survey(fams["fleet-artifacts"])["ios-workspaces"].verdict, "git-checkout")
+
+    def test_a_tree_that_stays_in_use_leaves_no_bundles_behind(self) -> None:
+        """A warm tree in use at the last recheck stays whole; the bundles written for its delete go again, or a
+        cache in constant use is bundled anew every pass (5,695 bundles, 65 GiB in ~/archive in a day)."""
+        tree = gd.FLEET_ROOT / "cache/ios-workspaces"
+        repo = self.checkout(tree)
+        fam = self.families()["fleet-artifacts"]
+        item = self.survey(fam)["ios-workspaces"]
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "mirror_moved", return_value="in use while its git work was bundled"):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((repo / ".git").is_dir())
+        archive = self.home / "archive/glaeda-disk"
+        self.assertEqual(sorted(archive.glob("*.bundle")) if archive.is_dir() else [], [])
+        manifest = archive / "manifest.jsonl"
+        self.assertEqual(manifest.read_text().strip() if manifest.exists() else "", "")
+
+    def test_the_fleet_swiftpm_cache_never_takes_the_mirror_rule(self) -> None:
+        for name in ("swiftpm", "ios-workspaces"):
+            (gd.FLEET_ROOT / "cache" / name).mkdir()
+        fam = self.families()["fleet-artifacts"]
+        self.assertFalse(gd.mirror_due(fam, gd.FLEET_ROOT / "cache/swiftpm", 999.0))
+        self.assertTrue(gd.mirror_due(fam, gd.FLEET_ROOT / "cache/ios-workspaces", 999.0))
+
+    def test_a_bundle_a_newer_one_holds_whole_is_pruned_before_its_expiry(self) -> None:
+        repo = self.checkout(gd.FLEET_ROOT / "cache/w")
+        archive = self.home / "archive/glaeda-disk"
+        written: list[Path] = []
+        real_strftime = time.strftime
+        with mock.patch.object(gd.time, "strftime", side_effect=lambda f, *a: "20261027T100000" if "T" in f
+                               else real_strftime(f, *a)):
+            self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        self.commit_more(repo)
+        other: list[Path] = []
+        self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("other"), ["--all"], set(), other), "")
+        self.assertEqual(len(written), 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            gone = gd.prune_mirror_archive()
+        self.assertEqual(gone, 1)
+        self.assertFalse(written[0].exists())
+        self.assertTrue(written[1].exists())
+        self.assertTrue(other[0].exists())  # another repository's bundle is never another's superseder
+        self.assertNotIn(written[0].name, (archive / "manifest.jsonl").read_text())
+
+    def test_a_damaged_newer_bundle_supersedes_nothing(self) -> None:
+        repo = self.checkout(gd.FLEET_ROOT / "cache/w")
+        written: list[Path] = []
+        real_strftime = time.strftime
+        with mock.patch.object(gd.time, "strftime", side_effect=lambda f, *a: "20261027T100000" if "T" in f
+                               else real_strftime(f, *a)):
+            self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        self.assertEqual(gd._write_bundle(repo / ".git", gd._bundle_name("k"), ["--all"], set(), written), "")
+        newer = written[1]
+        data = newer.read_bytes()
+        newer.write_bytes(data[:-64] + b"\0" * 64)  # same header, damaged pack
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.prune_mirror_archive(), 0)
+        self.assertTrue(written[0].exists())
+
+    def commit_more(self, repo: Path) -> None:
+        (repo / "g").write_text("y")
+        subprocess.run(["git", "-C", str(repo), "add", "g"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "more"], check=True, env=self.env)
+
+
+class HomeScratchTest(unittest.TestCase):
+    """Folders lanes leave directly in a CI mini's home go after 12 h idle, unpushed commits bundled first; a process,
+    configuration that names it, and the folders kept by role stay (cmuxs-mac-mini-3, 2026-10-28: 60 GiB of cnx-*,
+    wgmedia-swift and smooth-tabs* trees idle 1-14 days that no family listed)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / ".shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self.daemons = mock.patch.object(gd, "home_scratch_reference_files", wraps=self._reference_files)
+        self.daemons.start()
+
+    def tearDown(self) -> None:
+        self.daemons.stop()
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def _reference_files(self) -> list[Path]:
+        """The real list, minus the suite host's own /Library/LaunchDaemons."""
+        with mock.patch.object(gd, "_strict_entries", lambda f, pat="*": [] if str(f).startswith("/Library/")
+                               else _real_strict_entries(f, pat)):
+            return _real_home_scratch_reference_files()
+
+    def age(self, tree: Path, hours: float = 26) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tree(self, name: str, git: bool = False, hours: float = 26) -> Path:
+        tree = self.home / name
+        tree.mkdir(parents=True)
+        (tree / "evidence.bin").write_bytes(b"e" * 4096)
+        if git:
+            subprocess.run(["git", "init", "-q", str(tree / "src")], check=True, env=self.env)
+            (tree / "src/f").write_text("x")
+            subprocess.run(["git", "-C", str(tree / "src"), "add", "f"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(tree / "src"), "commit", "-qm", "local only"], check=True, env=self.env)
+        self.age(tree, hours)
+        return tree
+
+    def family(self, runners: bool = True) -> gd.Family | None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"] if runners
+                               else []):
+            return next((f for f in gd.default_families() if f.id == gd.HOME_SCRATCH_FAMILY), None)
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def apply(self, fam: gd.Family, item: gd.Item, cmds: str = "") -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], cmds)):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_only_a_ci_mini_with_enrolled_runners_has_the_family(self) -> None:
+        self.tree("cnx-redial")
+        self.assertIsNotNone(self.family())
+        self.assertIsNone(self.family(runners=False))
+        gd.ROLE = "devbox"
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"]):
+            self.assertFalse(any(f.id == gd.HOME_SCRATCH_FAMILY for f in gd.default_families("devbox")))
+
+    def test_an_idle_evidence_tree_goes_and_a_fresh_one_stays(self) -> None:
+        old = self.tree("cnx-tv-evidence-20261019")
+        self.tree("smooth-tabs", hours=2)
+        fam = self.family()
+        items = self.survey(fam)
+        self.assertEqual(items["cnx-tv-evidence-20261019"].verdict, "reclaimable",
+                         items["cnx-tv-evidence-20261019"].reasons)
+        self.assertEqual(items["smooth-tabs"].verdict, "recent")
+        self.apply(fam, items["cnx-tv-evidence-20261019"])
+        self.assertFalse(old.exists())
+
+    def test_an_idle_clone_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = self.tree("wgmedia-swift", git=True)
+        fam = self.family()
+        item = self.survey(fam)["wgmedia-swift"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+
+    def test_unreadable_nested_refs_in_legacy_home_trees_alert_instead_of_deleting(self) -> None:
+        for name in ("cmux-ci-perf", "agent-work", "toolchain-quarantine-20260925", "fun"):
+            with self.subTest(name=name):
+                tree = self.tree(name, git=True)
+                self.assertFalse((tree / ".git").exists(), "a container is not itself a checkout")
+                with mock.patch.object(gd, "local_tips", return_value=None):
+                    why, written, _ = gd.archive_mirror(tree)
+                self.assertEqual(why, "unreadable refs in src/.git; kept for owner recovery")
+                self.assertEqual(written, [])
+                self.assertTrue((tree / "src/.git").is_dir())
+                fam = self.family()
+                item = self.survey(fam)[name]
+                with mock.patch.object(gd, "local_tips", return_value=None):
+                    receipt = self.apply(fam, item)
+                self.assertIn("blocked:bundle-failed", receipt)
+                self.assertIn("unreadable refs in src/.git; kept for owner recovery", receipt)
+                self.assertTrue(tree.exists(), "apply cannot delete a tree whose nested refs cannot be archived")
+
+    def test_a_cargo_git_db_in_a_legacy_home_tree_is_not_read_for_refs(self) -> None:
+        """cmux22, 2026-11-07: cmux-ci-perf kept 10 GiB as "unreadable refs in cache/cargo/git/db/...". Cargo's git
+        db holds upstream clones it fetches again, so its refs are never read; the tree's own checkout still is."""
+        tree = self.tree("cmux-ci-perf", git=True)
+        db = tree / "cache/cargo/git/db/cmux-codex-acp-8bd52ecc83e39be7"
+        db.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(tree / "src"), str(db)], check=True, capture_output=True,
+                       env=self.env)  # as cargo's db: a bare clone with commits
+        self.age(tree, 26)
+        real = gd.local_tips
+        with mock.patch.object(gd, "local_tips",
+                               side_effect=lambda g, *a, **k: None if "cargo/git/db" in os.fspath(g) else real(g, *a, **k)):
+            fam = self.family()
+            item = self.survey(fam)["cmux-ci-perf"]
+            self.assertEqual(item.verdict, "reclaimable", item.reasons)
+            receipt = self.apply(fam, item)
+        self.assertNotIn("unreadable refs", receipt)
+        self.assertFalse(tree.exists(), receipt)
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1, "src's commits bundled")
+
+    def retire(self, label: str, tree: Path, where: str = ".local/state/fleet-retired-workers") -> Path:
+        """A worker plist naming tree (work root and working directory), as a fleet heal step moves it out of
+        ~/Library/LaunchAgents once its manifest retires the label."""
+        d = self.home / where
+        d.mkdir(parents=True, exist_ok=True)
+        plist = d / f"{label}.plist"
+        plist.write_bytes(plistlib.dumps({"Label": label, "WorkingDirectory": str(tree),
+                                          "ProgramArguments": [f"{tree}/run.sh"],
+                                          "EnvironmentVariables": {"CMUX_CI_WORK_ROOT": str(tree)}}))
+        return plist
+
+    def test_a_folder_only_a_retired_plist_names_goes_without_its_idle_clock(self) -> None:
+        # The perf worker's work root, 2026-11-06: its plist was retired, but a cache pass inside it had touched
+        # it 1.8 h before, so the 12 h clock held 10-37 GiB per mini under the runner floor for half a day.
+        tree = self.tree("cmux-ci-perf", git=True, hours=0.5)
+        fresh = self.tree("cnx-fresh", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        items = self.survey(fam)
+        item = items["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("its owner retired" in r for r in item.reasons), item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons), item.reasons)  # unpushed work is bundled first
+        self.assertEqual(items["cnx-fresh"].verdict, "recent")  # nothing retired names it: the clock still holds
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual(len(sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def test_a_retired_owner_never_overrides_a_live_reference_or_an_open_file(self) -> None:
+        tree = self.tree("actions-runner-nightly-next", hours=0.5)
+        self.retire("ai.manaflow.nightly-builder.runner", tree)
+        live = self.retire("ai.manaflow.nightly-builder.watch", tree, where="Library/LaunchAgents")
+        fam = self.retired()  # a hand-made runner directory is the retired-runner family's, not home-scratch's
+        item = self.survey(fam)["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn(f"named by {live}", item.reasons)
+        live.unlink()
+        item = self.survey(fam, opened=[str(tree / "evidence.bin")])["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("open by a process", item.reasons)
+        item = self.survey(fam, cmds=f"/bin/sh {tree}/run.sh")["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "in-use")
+        # Nothing live left: the retired runner directory goes on this pass, 0.5 h after its last touch.
+        item = self.survey(fam)["actions-runner-nightly-next"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fam, item)
+        self.assertFalse(tree.exists())
+
+    def test_a_retired_folder_held_by_another_process_names_it_and_stays(self) -> None:
+        # cmux21, 2026-11-15: NotificationCenter held one strings file of an app copy in the retired perf worker's
+        # 18.7 GiB ~/cmux-ci-perf; the verdict said only "open by a process", so nobody could tell what held it.
+        tree = self.tree("cmux-ci-perf", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        opened = [str(tree / "evidence.bin")]
+        center = "/System/Library/CoreServices/NotificationCenter.app/Contents/MacOS/NotificationCenter"
+        with mock.patch.object(gd, "path_holders", return_value=[(473, center)]):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertTrue(any(r.startswith(f"held by {center[:100]} (pid 473), not its retired service "
+                                         "ai.manaflow.cmux-perf-worker: reported, not deleted") for r in item.reasons),
+                        item.reasons)
+        with mock.patch.object(gd, "path_holders", return_value=[(9, f"{tree}/run.sh --serve")]):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("its retired service ai.manaflow.cmux-perf-worker still runs (pid 9): kept until it exits",
+                      item.reasons)
+        with mock.patch.object(gd, "path_holders", return_value=None):
+            item = self.survey(fam, opened=opened)["cmux-ci-perf"]
+        self.assertIn("its holders are unreadable (lsof or ps failed)", item.reasons)
+        self.assertTrue(tree.exists())
+        # nobody holds it any more: it goes on this pass, as before
+        item = self.survey(fam)["cmux-ci-perf"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+
+    def test_a_dead_pass_takes_only_retired_folders_from_home_scratch(self) -> None:
+        tree = self.tree("cmux-ci-perf", hours=0.5)
+        self.tree("cnx-old", hours=48)  # idle long enough for the sweep, but nothing says it is dead
+        self.retire("ai.manaflow.cmux-perf-worker", tree)
+        fam = self.family()
+        with mock.patch.object(gd, "DEAD_MODE", True):
+            items = self.survey(fam)
+        self.assertEqual(set(items), {"cmux-ci-perf"})
+        self.assertEqual(items["cmux-ci-perf"].verdict, "reclaimable", items["cmux-ci-perf"].reasons)
+
+    def test_only_the_retired_directory_counts_and_only_for_home_folders(self) -> None:
+        tree = self.tree("cnx-elsewhere", hours=0.5)
+        self.retire("ai.manaflow.cmux-perf-worker", tree, where=".local/state/other")
+        self.assertEqual(gd.retired_owner(tree), "")
+        self.assertEqual(self.survey(self.family())["cnx-elsewhere"].verdict, "recent")
+        nested = self.home / "cnx-elsewhere/inner"
+        nested.mkdir()
+        self.retire("ai.manaflow.x-worker", nested)
+        self.assertEqual(gd.retired_owner(nested), "")  # never an item below the top of HOME
+
+    def test_kept_by_role_never_listed(self) -> None:
+        for name in (*gd.HOME_SCRATCH_KEEP, ".cache", ".rustup", "actions-runner-glaeda-3"):
+            self.tree(name)
+        items = self.survey(self.family())
+        self.assertEqual(items, {})
+
+    def test_a_process_in_it_keeps_it_at_survey_and_at_apply(self) -> None:
+        tree = self.tree("cnx-ios-e2e")
+        fam = self.family()
+        self.assertEqual(self.survey(fam, opened=[os.fspath(tree)])["cnx-ios-e2e"].verdict, "in-use")
+        item = self.survey(fam)["cnx-ios-e2e"]
+        receipt = self.apply(fam, item, cmds=f"python3 {tree}/run.py\n")
+        self.assertTrue(tree.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_configuration_that_names_it_keeps_it(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        self.tree("perf-worker")
+        with (agents / "ai.manaflow.perf.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.perf", "ProgramArguments": ["/usr/bin/python3",
+                           f"{self.home}/perf-worker/worker.py"]}, f, fmt=plistlib.FMT_BINARY)
+        self.tree("cnx-ios-builds")
+        hooks = self.home / "actions-runner-glaeda-ios-internal/glaeda-hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "dedicated-admit.sh").write_text("export CNX_BUILDS_ROOT=~/cnx-ios-builds\n")
+        self.tree("cnx-tool")
+        (self.home / ".local/bin").mkdir(parents=True)
+        (self.home / ".local/bin/cnx-tool").symlink_to(self.home / "cnx-tool/evidence.bin")
+        self.tree("cnx-hook-py")
+        (hooks / "admit_helper.py").write_text('ROOT = "~/cnx-hook-py"\n')  # any suffix in the hooks is read
+        self.tree("cnx-linked-plist")
+        real_plist = self.home / ".plists/ai.manaflow.linked.plist"
+        real_plist.parent.mkdir()
+        with real_plist.open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.linked", "WorkingDirectory": f"{self.home}/cnx-linked-plist"}, f)
+        (agents / "ai.manaflow.linked.plist").symlink_to(real_plist)  # a symlinked plist is read through
+        self.tree("cnx-tooling-old")  # a longer name that starts with a named one is not named
+        items = self.survey(self.family())
+        for name in ("perf-worker", "cnx-ios-builds", "cnx-tool", "cnx-hook-py", "cnx-linked-plist"):
+            self.assertEqual(items[name].verdict, "in-use", (name, items[name].reasons))
+            self.assertTrue(any(r.startswith("named by") for r in items[name].reasons), items[name].reasons)
+        self.assertEqual(items["cnx-tooling-old"].verdict, "reclaimable", items["cnx-tooling-old"].reasons)
+
+    def test_a_system_launch_agent_that_names_it_keeps_it(self) -> None:
+        self.tree("cnx-global")
+        system = self.home / ".system-agents"
+        system.mkdir()
+        with (system / "ai.manaflow.global.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.global", "ProgramArguments": [f"{self.home}/cnx-global/run"]}, f)
+        self.daemons.stop()  # the real list, with /Library's agents read from this test's folder
+        try:
+            with mock.patch.object(gd, "_strict_entries", lambda f, pat="*": _real_strict_entries(system, pat)
+                                   if str(f) == "/Library/LaunchAgents" else [] if str(f).startswith("/Library/")
+                                   else _real_strict_entries(f, pat)):
+                self.assertEqual(self.survey(self.family())["cnx-global"].verdict, "in-use")
+        finally:
+            self.daemons.start()
+
+    def test_an_installed_link_into_the_folder_keeps_it(self) -> None:
+        """A launch agent installed as a symlink to a plist inside the folder names it: only files that sit inside
+        the folder are its own."""
+        tree = self.tree("service-tree")
+        with (tree / "service.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.svc", "ProgramArguments": [f"{tree}/run"]}, f)
+        self.age(tree)
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "ai.manaflow.svc.plist").symlink_to(tree / "service.plist")
+        self.assertEqual(self.survey(self.family())["service-tree"].verdict, "in-use")
+
+    def test_a_configuration_folder_that_cannot_be_listed_keeps_it(self) -> None:
+        self.tree("cnx-unlisted")
+        def failing(folder, pattern="*"):
+            if folder == self.home / "Library/LaunchAgents":
+                raise PermissionError(13, "denied")
+            return [] if str(folder).startswith("/Library/") else _real_strict_entries(folder, pattern)
+        self.daemons.stop()  # the real list, with this test's listing failure
+        try:
+            with mock.patch.object(gd, "_strict_entries", failing):
+                self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-unlisted"),
+                                 "home folder references unreadable")
+                self.assertEqual(self.survey(self.family())["cnx-unlisted"].verdict, "in-use")
+        finally:
+            self.daemons.start()
+
+    def test_large_configuration_is_unread_unless_an_archive_or_binary(self) -> None:
+        self.tree("cnx-big")
+        runner = self.home / "actions-runner-glaeda-3"
+        runner.mkdir()
+        with mock.patch.object(gd, "HOME_SCRATCH_REF_MAX_BYTES", 16):
+            (runner / "actions-runner-osx-arm64.tar.gz").write_bytes(b"\x1f\x8b" + b"\0" * 64)
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-big"), "")
+            (runner / "generated.env").write_text("X=1\n" * 16 + f"ROOT={self.home}/cnx-big\n")
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-big"), "home folder references unreadable")
+
+    def test_apply_keeps_the_snapshot_sizes_of_folders_neither_family_lists(self) -> None:
+        self.tree("cnx-a")
+        fams = [f for f in (self.family(), self.retired()) if f is not None]
+        known = {os.fspath(self.home / "Library/Caches/x"): 1, os.fspath(self.home / "actions-runner-glaeda-2/_work"): 2,
+                 os.fspath(self.home / ".cache/y"): 3, os.fspath(self.home / "cnx-a"): 4,
+                 os.fspath(self.home / "actions-runner-old/_work"): 5}
+        kept = gd.fresh_for_apply(known, fams)
+        self.assertEqual(set(kept), {os.fspath(self.home / p) for p in
+                                     ("Library/Caches/x", "actions-runner-glaeda-2/_work", ".cache/y")})
+
+    def test_a_glaeda_runner_in_a_custom_directory_is_never_a_retired_runner(self) -> None:
+        custom = self.tree("actions-runner-custom")
+        (custom / ".runner").write_text("{}")
+        (custom / "glaeda-hooks").mkdir()
+        self.age(custom)
+        with mock.patch.object(gd, "enrolled_runners", return_value=[custom]):
+            fam = next(f for f in gd.default_families() if f.id == gd.RETIRED_RUNNER_FAMILY)
+        self.assertNotIn("actions-runner-custom", self.survey(fam))
+
+    def test_a_link_alias_named_by_configuration_keeps_it(self) -> None:
+        tree = self.tree("cnx-aliased")
+        (self.home / "runner-link").symlink_to(tree)
+        (self.home / ".zshrc").write_text("export ROOT=~/runner-link/bin\n")
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {self.home / '.zshrc'}")
+
+    def test_a_configuration_file_that_cannot_be_stat_keeps_it(self) -> None:
+        tree = self.tree("cnx-stat")
+        (self.home / ".zshrc").write_text("x\n")
+        real_stat = gd.Path.stat
+        def stat(p, *a, **k):
+            if p == self.home / ".zshrc":
+                raise PermissionError(13, "denied")
+            return real_stat(p, *a, **k)
+        with mock.patch.object(gd.Path, "stat", stat):
+            self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+
+    def test_unreadable_configuration_keeps_it(self) -> None:
+        self.tree("cnx-locked")
+        (self.home / ".zshrc").write_text("export X=1\n")
+        with mock.patch.object(gd, "_home_scratch_ref_text", return_value=None):
+            self.assertEqual(gd.home_scratch_referenced(self.home / "cnx-locked"), "home folder references unreadable")
+
+    def launchd_print(self, daemons: Path, outputs: dict[str, tuple[int, str]]):
+        """A root-only plist in daemons/ that the test cannot read, and launchctl print answering from outputs."""
+        plist = daemons / "com.tailscale.tailscaled.plist"
+        plist.write_text("<plist/>")
+        calls: list[list[str]] = []
+        def query(argv, timeout):
+            calls.append(argv)
+            return outputs.get(argv[-1], (113, "Could not find service"))
+        real_text = gd._home_scratch_ref_text
+        patches = [mock.patch.object(gd, "LAUNCHD_SYSTEM_DIRS", (daemons, self.home / "LaunchAgents")),
+                   mock.patch.object(gd, "_owned_query", query),
+                   mock.patch.object(gd, "_home_scratch_ref_text",
+                                     lambda c: None if c == plist else real_text(c))]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.daemons.stop()
+        self.daemons = mock.patch.object(gd, "home_scratch_reference_files",
+                                         wraps=lambda: [*self._reference_files(), plist])
+        self.daemons.start()
+        return plist, calls
+
+    def test_a_root_only_launchd_plist_is_read_through_launchctl(self) -> None:
+        # cmux15, 2026-11-02: Tailscale's 0600 plist kept 49.8 GiB of idle folders as "references unreadable"
+        tree = self.tree("cnx-approvals")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        loaded = (f"system/com.tailscale.tailscaled = {{\n\tpath = {daemons}/com.tailscale.tailscaled.plist\n"
+                  "\tprogram = /usr/local/bin/tailscaled\n\targuments = {\n\t\t/usr/local/bin/tailscaled\n\t}\n}\n")
+        outputs = {"system/com.tailscale.tailscaled": (0, loaded)}
+        plist, calls = self.launchd_print(daemons, outputs)
+        self.assertEqual(gd.home_scratch_referenced(tree), "")
+        self.assertEqual(calls, [["/bin/launchctl", "print", "system/com.tailscale.tailscaled"]])
+        # reloaded mid-run with a working directory in the folder: the recheck before a delete asks launchd again
+        outputs["system/com.tailscale.tailscaled"] = (0, loaded.replace("}\n", f"\tworking directory = {tree}\n}}\n", 1))
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {plist}")
+
+    def test_a_loaded_job_that_names_the_folder_keeps_it(self) -> None:
+        tree = self.tree("cnx-served")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        loaded = (f"system/com.tailscale.tailscaled = {{\n\tpath = {daemons}/com.tailscale.tailscaled.plist\n"
+                  f"\tworking directory = {tree}\n}}\n")
+        plist, _ = self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, loaded)})
+        self.assertEqual(gd.home_scratch_referenced(tree), f"named by {plist}")
+
+    def test_a_root_only_plist_launchd_did_not_load_from_it_still_keeps_it(self) -> None:
+        tree = self.tree("cnx-unloaded")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        other = (f"system/com.tailscale.tailscaled = {{\n\tpath = /Library/LaunchDaemons/elsewhere.plist\n}}\n")
+        self.launchd_print(daemons, {"system/com.tailscale.tailscaled": (0, other)})
+        self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+        with mock.patch.object(gd, "_owned_query", side_effect=subprocess.TimeoutExpired("launchctl", 5)):
+            self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+
+    def test_a_root_only_plist_launchd_has_not_loaded_keeps_it(self) -> None:
+        tree = self.tree("cnx-notloaded")
+        daemons = self.home / "LaunchDaemons"
+        daemons.mkdir()
+        self.launchd_print(daemons, {})
+        self.assertEqual(gd.home_scratch_referenced(tree), "home folder references unreadable")
+        self.assertEqual(self.survey(self.family())["cnx-notloaded"].verdict, "in-use")
+
+    def test_a_mention_that_appears_before_the_delete_keeps_it(self) -> None:
+        tree = self.tree("cnx-hybrid")
+        fam = self.family()
+        item = self.survey(fam)["cnx-hybrid"]
+        self.assertEqual(item.verdict, "reclaimable")
+        (self.home / ".zshrc").write_text(f'export PATH="$HOME/cnx-hybrid/bin:$PATH"\n')
+        receipt = self.apply(fam, item)
+        self.assertTrue(tree.exists())
+        self.assertIn("changed:referenced", receipt)
+
+    def retired(self, runners: bool = True) -> gd.Family | None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner-glaeda"] if runners
+                               else []):
+            return next((f for f in gd.default_families() if f.id == gd.RETIRED_RUNNER_FAMILY), None)
+
+    def test_a_hand_made_runner_nothing_runs_goes_and_glaedas_own_never_do(self) -> None:
+        old = self.tree("actions-runner-ios-internal")
+        (old / ".runner").write_text('{"agentName": "cmux9s-mac-mini-ios-internal", "workFolder": "_work"}')
+        (old / "run.sh").write_text(f"cd {old} && ./bin/Runner.Listener run\n")  # its own scripts never keep it
+        self.age(old)
+        self.tree("actions-runner-glaeda-ios-internal")
+        self.tree("actions-runner-glaeda-3")
+        fam = self.retired()
+        self.assertIsNone(self.retired(runners=False))
+        items = self.survey(fam)
+        self.assertEqual(set(items), {"actions-runner-ios-internal"})
+        self.assertEqual(items["actions-runner-ios-internal"].verdict, "reclaimable",
+                         items["actions-runner-ios-internal"].reasons)
+        self.assertNotIn("actions-runner-ios-internal", self.survey(self.family()))  # not home-scratch's too
+        self.apply(fam, items["actions-runner-ios-internal"])
+        self.assertFalse(old.exists())
+
+    def test_a_hand_made_runner_a_plist_or_listener_names_stays(self) -> None:
+        old = self.tree("actions-runner-nightly-next")
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        with (agents / "ai.manaflow.nightly-builder.runner.plist").open("wb") as f:
+            plistlib.dump({"Label": "ai.manaflow.nightly-builder.runner",
+                           "ProgramArguments": [f"{old}/run.sh"]}, f)
+        fam = self.retired()
+        self.assertEqual(self.survey(fam)["actions-runner-nightly-next"].verdict, "in-use")
+        (agents / "ai.manaflow.nightly-builder.runner.plist").unlink()
+        listener = f"{old}/bin/Runner.Listener run --startuptype service\n"
+        self.assertEqual(self.survey(fam, cmds=listener)["actions-runner-nightly-next"].verdict, "in-use")
+        self.assertEqual(self.survey(fam)["actions-runner-nightly-next"].verdict, "reclaimable")
+
+
+_real_glob = Path.glob
+_real_strict_entries = gd._strict_entries
+_real_home_scratch_reference_files = gd.home_scratch_reference_files
+
+
+class NightlyNextFallbackTest(unittest.TestCase):
+    """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
+    DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.home, self.home / "shared-fleet", True
+        gd._DISCOVERED.clear()
+        self.root = self.home / "Library/Caches" / gd.NIGHTLY_NEXT_ROOT
+        for name in ("cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5", "cmux14-glaeda",
+                     "cmux7s-mac-mini-nightly-next", "cmux7s-mac-mini-glaeda-nightly-next", "notes"):
+            # nightly_build_state.py's layout: SwiftPM clones and the compilation cache per identity, notices crates
+            ident = self.root / name / "0123456789abcdef0123456789abcdef"
+            clone = ident / "SourcePackages/checkouts/swift-collections"
+            (clone / ".git/objects").mkdir(parents=True)
+            (clone / ".git/HEAD").write_text("ref: refs/heads/main\n")
+            (clone / "Package.swift").write_text("// package\n")
+            (ident / "CompilationCache").mkdir()
+            (ident / "CompilationCache/blob").write_bytes(b"x" * 4096)
+            (self.root / name / "notices-crates/registry").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def families(self, label: str | None) -> dict[str, gd.Family]:
+        policy = dict(gd.POLICY)
+        if label is not None:
+            policy["nightly_next_dedicated_label"] = label
+        with mock.patch.object(gd, "POLICY", policy):
+            return {f.id: f for f in gd.default_families()}
+
+    def test_on_by_default_now_that_cmux_routes_to_the_label(self) -> None:
+        """cmux#26048 routes nightly-next to the dedicated builder, so the split is on unless a policy file opts out."""
+        self.assertEqual(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertEqual(gd.disk_policy(self.home / "no-such-policy.json")["nightly_next_dedicated_label"],
+                         gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_FAMILY, self.families(gd.POLICY_DEFAULTS["nightly_next_dedicated_label"]))
+
+    def test_inert_when_a_policy_file_clears_the_label(self) -> None:
+        for label in ("", "glaeda-trusted", "glaeda-trusted-next-nightly-x"):
+            fams = self.families(label)
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams, label)
+            # as before: the whole root is one library-caches item
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip, label)
+
+    def test_a_role_keep_in_the_root_splits_it_without_the_label(self) -> None:
+        """A dedicated runner keeping its tree by role holds that tree, not the whole root: before the routing label is
+        set, the root is split anyway, so the other runners' stale trees still go by age."""
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        kept = self.root / "cmux7s-mac-mini-glaeda-nightly-next"
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(kept)]))
+        fams = self.families("")
+        self.assertIn(gd.NIGHTLY_NEXT_FAMILY, fams)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        self.assertTrue(gd.toolchain_held(kept / "0123456789abcdef0123456789abcdef"))
+        self.assertFalse(gd.toolchain_held(self.root / "cmux9s-mac-mini-glaeda-2"))
+        # a keep elsewhere leaves the root whole, as before
+        (runner / gd.ROLE_KEEP_MARKER).write_text(json.dumps([os.fspath(runner / "_work/cmux/cmux")]))
+        fams = self.families("")
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, fams)
+        self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+
+    def test_policy_file_turns_it_on(self) -> None:
+        policy = self.home / "disk-policy.json"
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}))
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": ""}))  # "" is an opt-out, not a missing value
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "")
+        with mock.patch.object(gd, "POLICY", gd.disk_policy(policy)):
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.default_families()})
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": "off"}))  # any other label opts out too
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], "off")
+        policy.write_text(json.dumps({"cmux_next_ci_cap_gib": 40}))  # other string keys still ignore ""
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        policy.write_text(json.dumps({"nightly_next_dedicated_label": 1}))  # wrongly typed: the default stays
+        self.assertEqual(gd.disk_policy(policy)["nightly_next_dedicated_label"], gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+
+    def test_active_keeps_the_dedicated_builder_and_offers_pool_trees(self) -> None:
+        fams = self.families(gd.NIGHTLY_NEXT_DEDICATED_LABEL)
+        self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+        fam = fams[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(fam.root, self.root)
+        self.assertTrue(fam.reclaimable)
+        got = sorted(p.name for p in gd.candidates(fam))
+        self.assertEqual(got, ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def enroll(self, name: str) -> Path:
+        runner = self.home / f"actions-runner-{name}"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text(json.dumps({"agentName": name}))
+        old = time.time() - 30 * 24 * 3600
+        os.utime(runner / ".runner", (old, old))  # not mid re-registration
+        return runner
+
+    def sign(self, name: str, line: str | None = None) -> Path:
+        """An enrolled runner whose job-started runs the hook as the installer writes it for a signing runner."""
+        runner = self.enroll(name)
+        line = line or ("exec /usr/bin/python3 glaeda-cmux-runner-hook job-started --allowed-owner manaflow-ai "
+                        "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux --trusted-next-signing")
+        (runner / "glaeda-hooks/job-started.sh").write_text(f"#!/bin/sh\n{line}\n")
+        return runner
+
+    def one_job_tree(self) -> Path:
+        tree = self.root / gd.NIGHTLY_NEXT_ONE_JOB
+        (tree / "DerivedData/Build").mkdir(parents=True)
+        (tree / "DerivedData/Build/blob").write_bytes(b"x" * 4096)
+        old = time.time() - 30 * 24 * 3600
+        for p in [self.root, *self.root.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        return tree
+
+    def test_the_one_job_tree_is_kept_by_role_on_the_signing_mac(self) -> None:
+        """ONE_JOB_TREE: a month idle, the one-job nightly's tree is no family's item on a Mac with an enrolled
+        signing runner, with the routing label or without, while the signing runners' own pool trees still go."""
+        tree = self.one_job_tree()
+        self.assertEqual(gd.one_job_keep(), (), "no signing runner here: nothing kept by this name")
+        self.assertFalse(gd.toolchain_held(tree))
+        self.sign("glaeda")
+        self.sign("glaeda-1")
+        for pool in ("cmux15-glaeda", "cmux15-glaeda-1"):
+            (self.root / pool / "CompilationCache").mkdir(parents=True)
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        self.assertIn(os.fspath(tree), gd.role_keep())
+        self.assertTrue(gd.toolchain_held(tree))
+        self.assertTrue(gd.toolchain_held(tree / "DerivedData/Build"), "inside the kept tree")
+        self.assertTrue(gd.toolchain_held(self.root), "above it: the root is never taken whole")
+        self.assertFalse(gd.toolchain_held(self.root / "cmux15-glaeda"))
+        with self.assertRaises(OSError):
+            gd.remove(tree)
+        old = time.time() - 30 * 24 * 3600
+        for p in self.root.rglob("*"):
+            os.utime(p, (old, old), follow_symlinks=False)
+        for label in ("", gd.NIGHTLY_NEXT_DEDICATED_LABEL):
+            gd._DISCOVERED.clear()
+            policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
+            with self.subTest(label=label), mock.patch.object(gd, "POLICY", policy), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
+                fams = {f.id: f for f in gd.default_families()}
+                self.assertIn(gd.NIGHTLY_NEXT_FAMILY, fams, "the keep splits the root, as any role keep in it does")
+                self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+                self.assertNotIn(tree, gd.candidates(fams[gd.NIGHTLY_NEXT_FAMILY]))
+                listed = [f for f in fams.values() if f.reclaimable and f.root.is_relative_to(self.home)]
+                items = {Path(i.path): i.verdict for i in gd.survey(listed, 0, 0)}
+                self.assertFalse([p for p in items if p == self.root or p == tree or tree in p.parents])
+                self.assertEqual({items[self.root / n] for n in ("cmux15-glaeda", "cmux15-glaeda-1")}, {"reclaimable"})
+
+    def test_the_one_job_tree_is_kept_only_on_a_mac(self) -> None:
+        """The same home (the tree a month idle, two enrolled signing runners) keeps the tree as a Mac and nothing
+        as a Linux host: signing runners are Macs, so a same-named directory there is nobody's kept tree."""
+        tree = self.one_job_tree()
+        self.sign("glaeda")
+        self.sign("glaeda-1")
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertEqual(gd.one_job_keep(), ())
+            self.assertNotIn(os.fspath(tree), gd.role_keep())
+            self.assertFalse(gd.toolchain_held(tree))
+            self.assertFalse(gd.toolchain_held(self.root))
+
+    def test_the_one_job_name_is_never_a_fallback_tree(self) -> None:
+        """The fallback family takes pool runners' trees by name; the one-job tree's name must stay outside it."""
+        self.assertFalse(gd.nightly_next_fallback(self.root / gd.NIGHTLY_NEXT_ONE_JOB))
+        self.assertIsNone(gd.NIGHTLY_NEXT_POOL_RUNNER.fullmatch(gd.NIGHTLY_NEXT_ONE_JOB))
+        self.one_job_tree()
+        fam = gd.nightly_next_family(self.root)
+        self.assertNotIn(gd.NIGHTLY_NEXT_ONE_JOB, [p.name for p in gd.candidates(fam)])
+
+    def test_only_an_enrolled_signing_runner_keeps_the_one_job_tree(self) -> None:
+        tree = self.one_job_tree()
+        # a wrapper that names the flag only in a comment, or another runner class's flag
+        self.sign("glaeda-2", "exec python3 hook job-started --trusted-next-nightly  # --trusted-next-signing")
+        self.assertEqual(gd.one_job_keep(), ())
+        # a directory with the wrapper but no registration
+        stray = self.home / "actions-runner-glaeda-stray"
+        (stray / "glaeda-hooks").mkdir(parents=True)
+        (stray / "glaeda-hooks/job-started.sh").write_text("exec python3 hook job-started --trusted-next-signing\n")
+        self.assertEqual(gd.one_job_keep(), ())
+        # a symlink named like a runner, to a signing runner outside the home
+        outside = Path(os.path.realpath(tempfile.mkdtemp(dir=self.home.parent)))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / "glaeda-hooks").mkdir()
+        (outside / ".runner").write_text("{}")
+        (outside / "glaeda-hooks/job-started.sh").write_text("exec python3 hook job-started --trusted-next-signing\n")
+        (self.home / "actions-runner-glaeda-linked").symlink_to(outside)
+        self.assertEqual(gd.one_job_keep(), ())
+        self.assertFalse(gd.toolchain_held(tree))
+        # the tree as a symlink out of the home: only its spelling under the home is kept, never the target
+        self.sign("glaeda")
+        shutil.rmtree(tree)
+        target = outside / "elsewhere"
+        target.mkdir()
+        tree.symlink_to(target)
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        self.assertFalse(gd.toolchain_held(target))
+        # and with no tree there is nothing to keep, so the root is not split for it
+        tree.unlink()
+        self.assertEqual(gd.one_job_keep(), ())
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, self.families(""))
+
+    def test_a_pool_tree_whose_runner_has_a_job_is_in_use(self) -> None:
+        """A fallback build that started on the runner (its Runner.Worker in ps) holds its tree in the survey and,
+        when the job starts after the survey, at apply's fresh ps right before the delete."""
+        self.enroll("cmux9s-mac-mini-glaeda-2")
+        busy = self.enroll("cmux9s-mac-mini-glaeda-5")
+        old = time.time() - 30 * 24 * 3600
+        for p in [self.root, *self.root.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        worker = f"{busy}/bin/Runner.Worker spawnclient 151 154\n"
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = gd.nightly_next_family(self.root)
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)):
+                items = {Path(i.path).name: i for i in gd.survey([fam], 0, 0)}
+            self.assertEqual(items["cmux9s-mac-mini-glaeda-2"].verdict, "reclaimable")
+            self.assertEqual(items["cmux9s-mac-mini-glaeda-5"].verdict, "in-use")
+            self.assertIn("cmux9s-mac-mini-glaeda-5 is running a job",
+                          " ".join(items["cmux9s-mac-mini-glaeda-5"].reasons))
+            # survey saw no job; one starts before the delete
+            with mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
+                idle = next(i for i in gd.survey([fam], 0, 0) if Path(i.path).name == "cmux9s-mac-mini-glaeda-5")
+            self.assertEqual(idle.verdict, "reclaimable")
+            receipt = self.home / "r.jsonl"
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "command_lines", return_value=worker):
+                gd.apply([idle], {fam.id: fam}, receipt, None, 0)
+            self.assertTrue((self.root / "cmux9s-mac-mini-glaeda-5").is_dir())
+            self.assertIn("changed:in-use", receipt.read_text())
+            # ps failing at apply stops the deletes instead of reading as no job
+            with mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")), \
+                    mock.patch.object(gd, "command_lines", return_value=""):
+                gd.apply([idle], {fam.id: fam}, receipt, None, 0)
+            self.assertTrue((self.root / "cmux9s-mac-mini-glaeda-5").is_dir())
+
+    def test_runner_busy_fails_closed(self) -> None:
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        self.assertTrue(gd.nightly_next_runner_busy(tree, ""))  # ps failed
+        self.assertEqual(gd.nightly_next_runner_busy(tree, "/bin/zsh\n"), "")  # no runner of that name, roster whole
+        runner = self.enroll("cmux9s-mac-mini-glaeda-3")
+        os.utime(runner / ".runner")  # a .runner rewritten just now: the tree may be the renamed runner's
+        self.assertTrue(gd.nightly_next_runner_busy(tree, "/bin/zsh\n"))
+
+    def test_survey_of_every_family_never_offers_the_dedicated_tree(self) -> None:
+        old = time.time() - 30 * 24 * 3600
+        for p in self.root.rglob("*"):
+            os.utime(p, (old, old))
+        for label in ("", gd.NIGHTLY_NEXT_DEDICATED_LABEL):
+            gd._DISCOVERED.clear()
+            policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
+            with mock.patch.object(gd, "POLICY", policy), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
+                fams = [f for f in gd.default_families()
+                        if f.reclaimable and f.root.is_relative_to(self.home)]  # not the host's real temp dirs
+                items = {Path(i.path): i.verdict for i in gd.survey(fams, 0, 0)}
+            paths = set(items)
+            names = {p.name for p in paths if p.parent == self.root}
+            if label:
+                self.assertNotIn(self.root, paths)
+                self.assertEqual(names, {"cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"})
+                # the SwiftPM clones inside do not make a pool tree a checkout: a month idle, it is reclaimable
+                self.assertEqual({items[self.root / n] for n in names}, {"reclaimable"})
+            else:
+                self.assertIn(self.root, paths)  # inert: the root stays one library-caches item, as before
+                self.assertEqual(names, set())
+
+    def test_a_reused_tree_is_recent_from_its_deep_writes(self) -> None:
+        """A build that reuses an identity writes only deep files: the cache's index, SwiftPM's state."""
+        tree = self.root / "cmux9s-mac-mini-glaeda-2"
+        ident = tree / "0123456789abcdef0123456789abcdef"
+        index = ident / "CompilationCache/generic/v1.1/v8.index"
+        index.parent.mkdir(parents=True)
+        index.write_bytes(b"i")
+        state = ident / "SourcePackages/workspace-state.json"
+        state.write_text("{}")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        fam = gd.nightly_next_family(self.root)
+        self.assertLess(gd.item_mtime(fam, tree), old + 1)
+        for written in (index, state):
+            now = time.time() - 60
+            os.utime(written, (now, now))
+            self.assertGreaterEqual(gd.item_mtime(fam, tree), now - 1, written.name)
+            os.utime(written, (old, old))
+        # other families' items keep their usual shallow look
+        self.assertLess(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), old + 1)
+
+    def test_a_disposable_checkouts_git_writes_do_not_restart_its_idle_clock(self) -> None:
+        """cmux17, 2026-11-21: the mirror rule's archive step wrote refs/glaeda-archive in ~/m2l-viewer/src/.git on
+        every attempt, so the tree read idle 0.5 h for days and was never due."""
+        tree = self.root / "m2l-viewer"
+        gitdir = tree / "src/.git"
+        (gitdir / "refs/glaeda-archive").mkdir(parents=True)
+        work = tree / "src/main.c"
+        work.write_text("int main(void) { return 0; }\n")
+        old = time.time() - 30 * 24 * 3600
+        for p in [tree, *tree.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        now = time.time() - 60
+        os.utime(gitdir, (now, now))
+        disposable = gd.Family("home-scratch", self.root, True, "x", git_disposable=True)
+        self.assertLess(gd.item_mtime(disposable, tree), old + 1)
+        self.assertGreaterEqual(gd.item_mtime(gd.Family("x", self.root, True, "x"), tree), now - 1)  # as before
+        os.utime(work, (now, now))  # a work tree write is use
+        self.assertGreaterEqual(gd.item_mtime(disposable, tree), now - 1)
+
+    def test_runner_cache_profile(self) -> None:
+        with mock.patch.object(gd, "POLICY", {**gd.POLICY, "nightly_next_dedicated_label": "off"}):
+            self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, {f.id for f in gd.runner_cache_families()})
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": gd.NIGHTLY_NEXT_DEDICATED_LABEL}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = {f.id: f for f in gd.runner_cache_families()}[gd.NIGHTLY_NEXT_FAMILY]
+        self.assertEqual(gd.idle_window(fam, 1.0), gd.NIGHTLY_WARM_IDLE_HOURS)
+        self.assertEqual(sorted(p.name for p in gd.candidates(fam)),
+                         ["cmux14-glaeda", "cmux9s-mac-mini-glaeda-2", "cmux9s-mac-mini-glaeda-5"])
+
+    def test_pool_tree_goes_after_its_own_idle_window(self) -> None:
+        fam = gd.nightly_next_family(self.root)
+        window = gd.NIGHTLY_WARM_IDLE_HOURS  # the nightly's warm trees keep 12 h under the 1 h default
+        with mock.patch.object(gd, "DEFAULT_AGE_HOURS", 24.0):  # keep_legacy_ages on a reserved host
+            self.assertEqual(gd.idle_window(gd.nightly_next_family(self.root), 1.0), 24.0)
+        self.assertEqual(gd.idle_window(fam, gd.DEFAULT_AGE_HOURS), window)
+        self.assertEqual(gd.idle_window(fam, 1.0), window)
+        quiet = [time.time() - 3600]  # not a hot-tier family: the job count never stretches its window
+        for mode in ("sweep", "pressure", None):
+            with mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "job_starts", return_value=quiet), \
+                    mock.patch.object(gd, "running_job_hours", return_value=0.5):
+                self.assertTrue(gd.item_due(fam, window + 0.5, window)[0], mode)
+                self.assertFalse(gd.item_due(fam, window - 0.5, window)[0], mode)
 
 
 class ActivityClockTest(unittest.TestCase):
@@ -2591,6 +13967,7 @@ class ActivityClockTest(unittest.TestCase):
         self.assertTrue(self.due("pressure", 30, self.starts(1, 2)))
         self.assertFalse(self.due("sweep", 30, self.starts(1, 2)))
 
+    @twelve_hour_ages
     def test_many_jobs_past_it_make_it_a_candidate(self) -> None:
         busy = self.starts(*[i / 100 for i in range(100)])  # 100 jobs in the last hour
         self.assertTrue(self.due("pressure", 1.5, busy))    # past pressure_jobs (80)
@@ -2601,9 +13978,15 @@ class ActivityClockTest(unittest.TestCase):
         self.assertTrue(self.due("pressure", 2, self.starts(*[0.1] * 6)))  # past its window, min_jobs since
         self.assertTrue(self.due("pressure", 2, self.starts(0.1, 0.2)))
 
-    def test_no_job_log_keeps_parked_builds_until_a_reuse_observation(self) -> None:
+    def test_no_job_log_uses_bounded_idle_sweep_fallback(self) -> None:
         self.assertTrue(self.due("pressure", 2, None))
         self.assertTrue(self.due(None, 2, self.starts(0.1)))
+        # Pressure may evict disposable hot state once the emergency policy allows
+        # it, but an idle sweep needs a bounded wall-clock fallback when the host
+        # never produced a job log.  The seven-day window matches mirror retention.
+        self.assertFalse(self.due("sweep", gd.PARKED_NO_LOG_IDLE_HOURS - 1, None))
+        self.assertTrue(self.due("sweep", gd.PARKED_NO_LOG_IDLE_HOURS, None))
+        self.assertFalse(self.due(None, gd.PARKED_NO_LOG_IDLE_HOURS * 2, None))
         other = gd.Family("tmp", self.dir, True, "x")
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
             self.assertEqual(gd.item_due(other, 2, 1.0), (True, None))
@@ -2641,6 +14024,3463 @@ class ActivityClockTest(unittest.TestCase):
             gd.main(["--pressure", "--no-snapshot"])
             gd.main(["--pressure", "--need", "50", "--no-snapshot"])
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
+
+MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
+                "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET",
+                "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE", "PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED",
+                "PRESSURE_SIM_RUNTIMES")
+
+
+def keep_main_globals(stack: contextlib.ExitStack) -> None:
+    """glaeda-disk's main sets these for its run (a reserved host's legacy ages and POLICY too); put each back when
+    the stack closes, so no later test sees it."""
+    for name in (*MAIN_GLOBALS, *getattr(gd, "LEGACY_AGES", {})):
+        if hasattr(gd, name):
+            stack.enter_context(mock.patch.object(gd, name, getattr(gd, name)))
+    stack.enter_context(mock.patch.dict(gd.POLICY, dict(gd.POLICY)))
+
+
+class HostReservationTest(unittest.TestCase):
+    """A reserved fleet mini gets floor-pressure eviction only. The list lives only on the host; fixtures are made up."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.list = self.root / "fleet-reservations.json"
+        self.local = self.root / "reservation.json"
+        self.update = self.root / "update.json"  # absent: not known to be a personal Mac, whatever this host is
+        update = mock.patch.object(gd, "UPDATE_CONFIG", self.update)
+        update.start()
+        self.addCleanup(update.stop)
+        # a controller-worker host unless a test says otherwise: the fail-closed side
+        self.worker = mock.patch.object(gd, "controller_worker_host", return_value=True)
+        self.worker.start()
+        self.addCleanup(self.worker.stop)
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
+                                         "aliases": {"cmux30": ["cmux-thirty"]},
+                                         "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
+                                                           "from": "2026-10-25T22:00:00Z",
+                                                           "until": "2026-10-28T23:59:59Z"}]}))
+        self.during = gd.reservation_time("2026-10-27T00:00:00Z")
+
+    def reserved(self, names, now=None) -> str:
+        return gd.host_reservation(self.during if now is None else now, self.list, set(names), self.local)
+
+    def test_an_active_entry_or_alias_reserves_and_it_lapses_by_itself(self) -> None:
+        self.assertIn("reserved for someone until 2026-10-28T23:59:59Z (r1)", self.reserved({"cmux30"}))
+        self.assertIn("reserved for someone", self.reserved({"CMUX-Thirty"}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+        doc = json.loads(self.list.read_text())
+        self.list.write_text(json.dumps(dict(doc, expires="2026-10-30T00:00:00Z")))
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-29T00:00:00Z")), "", "lapsed")
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-25T21:59:59Z")), "", "not yet")
+
+    def test_an_expired_list_is_released_and_only_a_live_entry_in_it_holds(self) -> None:
+        """2026-11-23: a list 24 h past its expires printed "fleet reservations expired at ...; kept as reserved" on a
+        mini at 90% used, so keepup --runner-caches --dedupe-builds neither deduped nor evicted. Expired means
+        released: an expired list holds nothing unless an entry in it is still live by its own from/until."""
+        doc = json.loads(self.list.read_text())
+        after = gd.reservation_time("2026-10-28T00:00:00Z")  # past expires (10-27T13:00Z), inside r1 (to 10-28T23:59Z)
+        late = gd.reservation_time("2026-10-29T06:00:00Z")  # past expires and past r1
+        for absent in ([], [dict(doc["reservations"][0], hosts=["cmux31"])]):
+            with self.subTest(expired_absent=absent):  # expired, no entry naming this host: not reserved
+                self.list.write_text(json.dumps(dict(doc, reservations=absent)))
+                self.assertEqual(self.reserved({"cmux30"}, after), "")
+                self.assertIsNone(gd.RESERVATION_SINCE)
+        self.list.write_text(json.dumps(doc))
+        self.assertEqual(self.reserved({"cmux30"}, late), "", "expired list, its only entry lapsed: released")
+        self.assertEqual(self.reserved({"cmux31"}, after), "", "expired list, entry for another host: released")
+        held = self.reserved({"cmux30"}, after)  # expired list, entry still live: the live reservation still holds
+        self.assertEqual(held, "reserved for someone until 2026-10-28T23:59:59Z (r1) "
+                               "(list expired at 2026-10-27T13:00:00Z)")
+        self.assertEqual(gd.RESERVATION_SINCE, gd.reservation_time("2026-10-25T22:00:00Z"))
+        live = self.reserved({"cmux30"})  # a live list and entry: exactly today's message
+        self.assertEqual(live, "reserved for someone until 2026-10-28T23:59:59Z (r1)")
+        now = int(after)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}, after),
+                      "an expired list still reads the host-local marker")
+        self.local.unlink()
+        self.list.write_text(json.dumps(dict(doc, reservations=[{"hosts": "cmux31"}])))
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "expired and malformed: fails closed")
+        self.list.write_text(json.dumps({"reservations": []}))
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "no expires at all: fails closed")
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}, after), "absent on a worker host: fails closed")
+        with mock.patch.object(gd, "controller_worker_host", return_value=False):
+            self.assertEqual(self.reserved({"cmux31"}, after), "", "absent with no worker: no reservations")
+
+    def test_an_unreadable_list_fails_closed(self) -> None:
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.unlink()
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+
+    def test_a_missing_list_holds_no_hygiene_only_mac(self) -> None:
+        """A personal Mac (glaeda-mini-setup --hygiene-only) never receives the fleet's list. Failing closed there
+        held air-blue as reserved for good, so its pressure pass deleted nothing while the disk fell below 40 GiB."""
+        self.list.unlink()
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "no update.json: not known to be personal")
+        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--role=fleet-mini"]}))
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "a fleet mini without its list fails closed")
+        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--hygiene-only"]}))
+        self.assertEqual(self.reserved({"air-blue"}), "")
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"air-blue"}), "a host-local marker still holds")
+        self.local.unlink()
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "a list that is there but broken fails closed")
+
+    def test_a_missing_list_without_a_controller_worker_reserves_nothing(self) -> None:
+        """Coordinator, 2026-11-17: "A missing reservations file on a host with no controller worker means no
+        reservations. An unreadable existing file, or a controller-worker host, stays fail-safe."""
+        self.list.unlink()
+        with mock.patch.object(gd, "controller_worker_host", return_value=False):
+            self.assertEqual(self.reserved({"cmux31"}), "", "missing, no controller worker: no reservations")
+            now = int(self.during)
+            self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet",
+                                              "since": now - 60, "until": now + 60}))
+            self.assertIn("host reservation by fleet", self.reserved({"cmux31"}), "a host-local marker still holds")
+            self.local.unlink()
+            for broken in ("{nope", json.dumps({"reservations": []})):
+                with self.subTest(broken=broken):
+                    self.list.write_text(broken)  # there but unreadable or malformed: fails closed
+                    self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.write_bytes(b"\xff\xfe")
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}), "undecodable bytes")
+            self.list.unlink()
+            self.list.mkdir()  # there but not a file (IsADirectoryError): fails closed
+            self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+            self.list.rmdir()
+        self.assertIn("on a controller-worker host; kept as reserved", self.reserved({"cmux31"}),
+                      "missing on a controller-worker host: fails closed")
+
+    def test_a_controller_worker_host_is_read_from_launchd(self) -> None:
+        self.worker.stop()
+        self.addCleanup(self.worker.start)
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertTrue(gd.controller_worker_host(), "off macOS: unknown, fail-safe")
+        absent = mock.Mock(returncode=113)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent) as run:
+            self.assertFalse(gd.controller_worker_host(), "no plist, launchctl: could not find service")
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], list(gd.HQ_BUILD_WORKERS))
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=[absent, mock.Mock(returncode=0)]):
+            self.assertTrue(gd.controller_worker_host(), "the lent worker is loaded")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=5)):
+            self.assertFalse(gd.controller_worker_host(), "launchctl refused this user and no plist is installed")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=subprocess.TimeoutExpired("launchctl", 10)):
+            self.assertTrue(gd.controller_worker_host(), "launchctl hung: not proven absent")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.Path, "exists", return_value=True), \
+                mock.patch.object(gd.subprocess, "run", return_value=absent):
+            self.assertTrue(gd.controller_worker_host(), "its LaunchDaemon plist is installed")
+
+    def test_the_host_local_reservation_counts(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now - 1}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+
+    def test_a_reserved_host_keeps_the_ages_before_twelve_hours(self) -> None:
+        names = [*gd.LEGACY_AGES]
+        saved = {n: getattr(gd, n) for n in names}
+        self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
+        with mock.patch.dict(gd.POLICY, {"stale_marker_max_hours": 5.0}):
+            gd.keep_legacy_ages()
+            self.assertEqual(gd.POLICY["soft_idle_hours"], 24.0)
+            self.assertEqual(gd.POLICY["cmux_next_ci_host_idle_hours"], 48.0)
+            self.assertEqual(gd.POLICY["stale_marker_max_hours"], 5.0, "a disk-policy.json value stays")
+        self.assertEqual((gd.DEFAULT_AGE_HOURS, gd.CMUX_NEXT_CI_MIN_IDLE_HOURS, gd.RUNTIME_IDLE_DAYS), (24.0, 72.0, 14.0))
+        self.assertEqual(gd.RUNNER_STALE_CHECKOUT_HOURS, float("inf"), "no above-floor checkout eviction")
+        self.assertEqual(gd.CMUX_JOB_MIRROR_HOURS, 168.0, "no 12 h mirror deletion on a reserved host")
+
+    def test_a_disk_policy_key_set_to_the_new_default_stays_on_a_reserved_host(self) -> None:
+        saved = {n: getattr(gd, n) for n in gd.LEGACY_AGES}
+        self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
+        policy = Path(tempfile.mkdtemp()) / "disk-policy.json"
+        self.addCleanup(shutil.rmtree, policy.parent)
+        policy.write_text(json.dumps({"soft_idle_hours": 12, "stale_marker_max_hours": "twelve"}))
+        with mock.patch.object(gd, "DISK_POLICY", policy), mock.patch.dict(gd.POLICY, gd.disk_policy(policy)):
+            self.assertEqual(gd.policy_overrides(), {"soft_idle_hours": 12.0})
+            gd.keep_legacy_ages()
+            self.assertEqual(gd.POLICY["soft_idle_hours"], 12.0, "set explicitly, even to the new default")
+            self.assertEqual(gd.POLICY["stale_marker_max_hours"], 48.0, "a wrongly typed key is not a setting")
+
+    def test_a_malformed_list_anywhere_fails_closed(self) -> None:
+        good = {"id": "r2", "owner": "someone-else", "hosts": ["cmux40"], "from": "2026-10-25T00:00:00Z",
+                "until": "2026-10-28T00:00:00Z"}
+        bad_docs = (
+            [],  # not an object
+            {"aliases": {}},  # no reservations
+            {"reservations": {"r1": good}},
+            {"reservations": [dict(good, hosts="cmux31")]},  # a string, not a list: never matched letter by letter
+            {"reservations": [dict(good, hosts=[31])]},
+            {"reservations": ["cmux31"]},
+            {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [dict(good, hosts=["cmux31"], until=good["from"])]},  # zero length
+            {"reservations": [dict(good, hosts=["cmux31"], **{"from": good["until"], "until": good["from"]})]},
+            {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
+            {"reservations": [good], "aliases": []},
+        )
+        for doc in bad_docs:
+            with self.subTest(doc=doc):  # each with a fresh expires, so only its own fault can make it fail
+                self.list.write_text(json.dumps(dict(doc, expires="2026-10-27T13:00:00Z") if isinstance(doc, dict)
+                                                else doc))
+                self.assertIn("unreadable", self.reserved({"cmux31"}))
+        fresh = "2026-10-27T13:00:00Z"
+        self.list.write_text(json.dumps({"reservations": [good], "expires": fresh}))
+        self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
+        for expires in (None, "soon", 12):  # an expired one is released (test_an_expired_list_is_released_...)
+            with self.subTest(expires=expires):
+                doc = {"reservations": [good]} if expires is None else {"reservations": [good], "expires": expires}
+                self.list.write_text(json.dumps(doc))
+                self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 600,
+                                          "until": now - 60}))
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_the_list_is_read_from_the_fleet_owners_home(self) -> None:
+        owner = types.SimpleNamespace(pw_dir=os.fspath(self.root / "fleet-home"))
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), mock.patch.object(gd, "FLEET_ROOT", self.root), \
+                mock.patch.object(gd.pwd, "getpwuid", return_value=owner) as getpwuid:
+            self.assertEqual(gd.fleet_reservations_path(),
+                             self.root / "fleet-home/.local/share/glaeda/fleet-reservations.json")
+            getpwuid.assert_called_once_with(self.root.stat().st_uid)
+            self.assertIn("kept as reserved", gd.host_reservation(self.during, None, {"cmux31"}, self.local),
+                          "nothing written there yet")
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), \
+                mock.patch.object(gd, "FLEET_ROOT", self.root / "absent"):
+            self.assertEqual(gd.fleet_reservations_path(), gd.HOME / gd.FLEET_RESERVATIONS_NAME)
+
+    def test_a_reserved_hosts_pressure_starts_at_the_floor_itself(self) -> None:
+        fam = gd.Family("home", gd.HOME, False, "")
+        total = 1000 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, total)):
+            plain = next(iter(gd.filesystems([fam], "1", "1", floor_gib=30.0).values()))
+            held = next(iter(gd.filesystems([fam], "30", "50", floor_gib=30.0, reserved=True).values()))
+        self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
+        self.assertEqual(held.low, 30 * gd.GIB)
+        self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
+
+    def test_a_local_marker_that_is_there_but_unreadable_holds_the_host(self) -> None:
+        now = int(self.during)
+        for text in ("{nope", "[]", json.dumps({"schema": "other", "since": now - 60, "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "since": "yesterday", "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "until": now + 60})):
+            with self.subTest(text=text):
+                self.local.write_text(text)
+                self.assertIn("marker unreadable", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": now + 600, "until": now + 900}))
+        self.assertIn("host reservation", self.reserved({"cmux31"}), "a future since holds, as the runner hook reads it")
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == self.local:
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertIn("marker unreadable (PermissionError)", self.reserved({"cmux31"}))
+        self.local.unlink()
+        self.assertEqual(self.reserved({"cmux31"}), "", "no marker, no hold")
+
+    def test_a_reserved_pressure_pass_does_nothing_but_evict(self) -> None:
+        """Under its floor, a reserved host runs the pressure pass and nothing else: no marker clearing, paused-work
+        cleanup, test-residue reaping, clone gc or repack; and no dedupe at all."""
+        empty = self.root / "empty"
+        empty.mkdir()
+        state = self.root / "state"
+        state.mkdir()
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        with contextlib.ExitStack() as stack:
+            for name in ("SNAPSHOT", "DEDUPE_STATE", "CMUX_NEXT_CAP_RECORD", "MEASURE_LOCK", "ACCOUNTING",
+                         "HEALTH_SUMMARY", "EVICT_LOCK", "HOOK_PASS_LOCK", "HOOK_PASS_PENDING", "EVICT_OWNER",
+                         "NESTED_KEEP"):
+                stack.enter_context(mock.patch.object(gd, name, state / name))
+            keep_main_globals(stack)
+            for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
+                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures",
+                         "erase_idle_sim_devices"):
+                stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
+            stack.enter_context(mock.patch.object(gd, "default_families",
+                                                  return_value=[gd.Family("tmp", empty, True, "scratch")]))
+            stack.enter_context(mock.patch.object(gd, "host_reservation", return_value=why))
+            stack.enter_context(mock.patch.object(gd, "runner_floor_gib", return_value=30.0))
+            stack.enter_context(mock.patch.object(gd, "free_bytes", return_value=(20 * gd.GIB, 1000 * gd.GIB)))
+            stack.enter_context(mock.patch.object(gd, "DARWIN", True))
+            stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+            stack.enter_context(mock.patch.object(gd, "notify_disk"))
+            evict = stack.enter_context(mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.dict(gd.RUN, clear=True))
+            out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for args in (("--pressure",), ("--dedupe",), ("--dedupe-builds",)):
+                with self.subTest(args=args):
+                    code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot",
+                                          "--receipt", os.fspath(self.root / "receipt.jsonl"), *args])
+                    self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("eviction summary", out.getvalue(), "the pressure pass itself ran")
+        evict.assert_called_once()  # the floor's last resort still runs
+        self.assertIn("no dedupe", out.getvalue())
+
+    def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
+        """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
+        seen, run = {}, {}
+        saved = {n: getattr(gd, n) for n in getattr(gd, "LEGACY_AGES", {})}
+        self.addCleanup(lambda: [setattr(gd, n, v) for n, v in saved.items()])
+        self.addCleanup(lambda policy=dict(gd.POLICY): (gd.POLICY.clear(), gd.POLICY.update(policy)))
+
+        def filesystems(fams, low, target, *rest, reserved=False):
+            seen.update(low=low, target=target, **({"reserved": True} if reserved else {}))
+            run.update(gd.RUN, age_hours=gd.DEFAULT_AGE_HOURS)  # the ages this run's families were built with
+            raise SystemExit(0)  # stop before any survey: the gate is what is under test
+        with contextlib.ExitStack() as globals_back, mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=floor), \
+                mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "filesystems", side_effect=filesystems), \
+                mock.patch.object(gd, "disk_off", return_value=""), mock.patch.dict(gd.RUN, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            keep_main_globals(globals_back)
+            try:
+                code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot", *args])
+            except SystemExit as stop:
+                code = stop.code
+        return code, out.getvalue(), seen, run
+
+    def test_a_reserved_host_runs_only_floor_pressure_to_the_floor_plus_the_margin(self) -> None:
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        for args in (("--idle",), ()):
+            with self.subTest(args=args):
+                code, out, seen, run = self.run_disk(*args, reserved=why, floor=30.0, free_gib=50)
+                self.assertEqual(code, 0)
+                self.assertIn("only floor-pressure eviction runs here", out)
+                self.assertIn("nothing deleted", out)
+                self.assertEqual(seen, {}, "never reached a survey")
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=0.0, free_gib=50)
+        self.assertIn("no runner floor", out)
+        self.assertEqual(seen, {})
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=30.0, free_gib=50)
+        margin = gd.POLICY["target_margin_gib"]
+        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
+        self.assertEqual(run["reserved"], why)
+        self.assertEqual(run["age_hours"], 24.0, "the reserved run used the legacy ages")
+        self.assertEqual(gd.DEFAULT_AGE_HOURS, 1.0, "and put the 1 h ages back for whatever runs next")
+        # the runner-account caches were 168 h before the 12 h default, and stay 168 h on a reserved host
+        home = self.root / "runner-home"
+        for rel in ("Library/Developer/Xcode/DerivedData", ".cache/cmux-job"):
+            (home / rel).mkdir(parents=True)
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "HOME", home):
+            self.assertEqual({f.min_idle_hours for f in gd.runner_cache_families()}, {gd.DEFAULT_AGE_HOURS})
+            with mock.patch.multiple(gd, **{k: getattr(gd, k) for k in gd.LEGACY_AGES}), \
+                    mock.patch.dict(gd.POLICY, dict(gd.POLICY)):
+                gd.keep_legacy_ages()
+                fams = gd.runner_cache_families()
+            self.assertEqual(len(fams), 2)
+            self.assertEqual({f.min_idle_hours for f in fams}, {168.0}, "a reserved host keeps the old runner-cache age")
+        # the runner-cache profile is held to the same rule (given a root, as a Linux CI host has none of its own)
+        with mock.patch.object(gd, "runner_cache_families", return_value=[gd.Family("x", self.root, True, "x")]), \
+                mock.patch.object(gd, "runner_profile_roots_safe", return_value=True):
+            code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
+        self.assertIn("nothing deleted", out)
+        self.assertEqual(seen, {})
+        # an unreserved host keeps its policy and the 1 h ages
+        code, out, seen, run = self.run_disk("--pressure", reserved="", floor=30.0, free_gib=50)
+        self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
+        self.assertEqual(run["age_hours"], 1.0)
+
+class FleetCasNodeCapTest(unittest.TestCase):
+    """glaeda-disk's pressure passes (before every job and under the floor) run the fleet-cas node-store cap."""
+
+    def test_runs_the_node_only_prune_and_reports_what_it_freed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, prune = Path(tmp) / "xcode", Path(tmp) / "glaeda-fleet-cas-prune"
+            calls = Path(tmp) / "calls"
+            prune.write_text("import json, os, sys\n"
+                             f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + ' ' + os.environ['GLAEDA_FLEET_CAS_ROOT'] + '\\n')\n"
+                             "print(json.dumps({'node_store': 'removed 12 oldest files, 3.5 GiB', 'result': 'ok'}))\n")
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0, "no fleet-cas on this host: not run")
+            self.assertFalse(calls.exists())
+            root.mkdir()
+            (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gd.fleet_cas_node_cap(root, prune), int(3.5 * gd.GIB))
+            self.assertEqual(calls.read_text(), f"--apply --node-only {root}\n")
+            self.assertIn("fleet-cas node store: removed 12 oldest files", out.getvalue())
+            # over the cache budget: both stores capped at the given size, and a removed local CAS counts too
+            prune.write_text("import json, os, sys\n"
+                             f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                             "print(json.dumps({'node_store': 'removed 2 oldest files, 1.0 GiB', 'local_cas': 'removed',"
+                             f" 'local_cas_bytes': {6 * gd.GIB}, 'result': 'ok'}}))\n")
+            calls.unlink()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gd.fleet_cas_node_cap(root, prune, cap_gib=5.7), 7 * gd.GIB)
+            self.assertEqual(calls.read_text(), "--apply --cap-only --node-gib 5.7 --local-cas-gib 5.7\n")
+            prune.write_text("print('not json')\n")
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
+            self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
+
+
+class DeadItemsTest(unittest.TestCase):
+    """What nothing can use any more is reclaimed, by its own evidence and while jobs run (Leo, 2026-11-15: "and go
+    clear disk aggressively!"): an ended build-worker step's checkout, a stopped Tart VM nobody claims, the journey
+    cache's long-unused entries. Each was kept by a verdict before (cmux22, cmux23, cmux21 and cmux22)."""
+
+    STEP = "382d205322458928f0f27846"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE)
+        # A test that ran main() may leave FLEET_CLAIMS_EXPIRE set; these tests read claims as off a fleet mini.
+        gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE = self.home, self.root / "shared-fleet", False
+        gd._DISCOVERED.clear()
+        gd._ENDED_STEPS.clear()
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.FLEET_CLAIMS_EXPIRE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def step_checkout(self, name: str, step: str = STEP, hours: float = 2.0, live_step: bool = False) -> Path:
+        """`git worktree add $(mktemp -d)/src` from a step's warm checkout, with a ghostty submodule: the step's
+        directory (the worktree's gitdir) is gone once the step ended, unless live_step."""
+        work = self.root / "cmux-build-worker/work"
+        gitdir = work / "steps" / step / "src/.git/worktrees/src"
+        if live_step:
+            gitdir.mkdir(parents=True)
+        item = self.root / "T" / name
+        src = item / "src"
+        (src / "ghostty").mkdir(parents=True)
+        (src / ".git").write_text(f"gitdir: {gitdir}\n")
+        (src / ".gitmodules").write_text('[submodule "ghostty"]\n\tpath = ghostty\n\turl = ../ghostty\n')
+        (src / "ghostty/.git").write_text(f"gitdir: {gitdir}/modules/ghostty\n")
+        (src / "build.bin").write_bytes(b"\0" * 4096)
+        self.age(item, hours)
+        return item
+
+    def test_an_ended_steps_checkout_is_reclaimable_and_goes(self) -> None:
+        ended = self.step_checkout("tmp.VuQw7Es3HF")
+        live = self.step_checkout("tmp.live", step="a" * 24, live_step=True)
+        young = self.step_checkout("tmp.young", step="b" * 24, hours=0.25)
+        fam = gd.Family("user-tmp", self.root / "T", True, "scratch", git_disposable=True)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["tmp.VuQw7Es3HF"].verdict, "reclaimable", items["tmp.VuQw7Es3HF"].reasons)
+        self.assertIn(f"a checkout of build-worker step {self.STEP}, which ended (its step directory is gone)",
+                      items["tmp.VuQw7Es3HF"].reasons)
+        self.assertNotEqual(items["tmp.live"].verdict, "reclaimable")  # its step still runs: git rules judge it
+        self.assertEqual(items["tmp.young"].verdict, "recent")  # an hour's grace
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply(list(items.values()), {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(ended.exists(), receipt.read_text())
+        self.assertTrue(live.exists())
+        self.assertTrue(young.exists())
+
+    def test_a_step_checkout_with_anything_else_is_no_dead_checkout(self) -> None:
+        item = self.step_checkout("tmp.mixed")
+        self.assertTrue(gd.ended_step_checkout(item))
+        gd._ENDED_STEPS.clear()
+        (item / "src/ghostty/.git").unlink()
+        (item / "src/ghostty/.git").mkdir()  # a real repository inside: something git could lose
+        self.assertEqual(gd.ended_step_checkout(item), "")
+        gd._ENDED_STEPS.clear()
+        shutil.rmtree(item / "src/ghostty/.git")
+        (item / "src/ghostty/.git").write_text(f"gitdir: {self.root}/elsewhere/.git/modules/ghostty\n")
+        self.assertEqual(gd.ended_step_checkout(item), "", "a gitdir outside any step is not the step's")
+        gd._ENDED_STEPS.clear()
+        (item / "src/ghostty/.git").unlink()
+        self.assertTrue(gd.ended_step_checkout(item), "a submodule not checked out holds nothing")
+        gd._ENDED_STEPS.clear()
+        plain = self.root / "T/plain"
+        plain.mkdir()
+        self.assertEqual(gd.ended_step_checkout(plain), "", "no checkout at all: not a step's")
+        self.assertEqual(gd.ended_step_of(f"{self.root}/steps/{'c' * 24}/src"), "c" * 24)
+        self.assertEqual(gd.ended_step_of(f"{self.root}/steps/short/src"), "")
+
+    def tart_vm(self, name: str, days: float) -> Path:
+        vm = self.home / ".tart/vms" / name
+        vm.mkdir(parents=True)
+        (vm / "config.json").write_text('{"os": "darwin"}')
+        (vm / "disk.img").write_bytes(b"\0" * 4096)
+        (vm / "nvram.bin").write_bytes(b"\0" * 64)
+        self.age(vm, days * 24)
+        return vm
+
+    def tart_family(self) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == gd.TART_VMS)
+
+    def test_a_stopped_unclaimed_tart_vm_two_days_untouched_goes(self) -> None:
+        old = self.tart_vm("vm0", 26)  # cmux23: ubase and vm0-vm5, stopped since 2026-10-19
+        aside = self.tart_vm("aside-1", 78 / 24)  # one mini, 2026-11-17: idle 78 h and judged "recent" at 14 days
+        recent = self.tart_vm("vm1", 1)
+        golden = self.tart_vm("golden", 26)  # only ever cloned: Tart moves the directory's access date, nothing else
+        os.utime(golden, (time.time(), golden.stat().st_mtime))
+        claimed = self.tart_vm("vm2", 26)
+        (claimed / gd.ROLE_KEEP_MARKER).write_text("{}")
+        named = self.tart_vm("vm3", 26)
+        locked = self.tart_vm("vm4", 26)
+        holder = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                                   "fcntl.lockf(fd, fcntl.LOCK_EX)\n"
+                                   "print('locked', flush=True)\n"
+                                   "time.sleep(60)\n", os.fspath(locked / "config.json")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        fam = self.tart_family()
+        with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/tart run vm3 --no-graphics\n")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
+        self.assertEqual(items["vm1"].verdict, "recent")
+        self.assertEqual(items["golden"].verdict, "recent", items["golden"].reasons)
+        self.assertEqual(items["vm2"].verdict, "kept")
+        self.assertEqual(items["vm3"].verdict, "in-use")
+        self.assertEqual(items["vm4"].verdict, "in-use")
+        self.assertIn("tart runs it (its config.json lock is held)", items["vm4"].reasons)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["vm0"], items["aside-1"], items["vm4"]], {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(old.exists())
+        self.assertFalse(aside.exists())
+        self.assertTrue(locked.exists(), "the run lock is read again right before the delete")
+        for vm in (recent, golden, claimed, named):
+            self.assertTrue(vm.exists())
+
+    def lima_vm(self, name: str, days: float) -> Path:
+        vm = self.home / ".lima" / name
+        vm.mkdir(parents=True)
+        (vm / "lima.yaml").write_text("vmType: vz\n")
+        (vm / "diffdisk").write_bytes(b"\0" * 4096)
+        (vm / "basedisk").write_bytes(b"\0" * 4096)
+        self.age(vm, days * 24)
+        return vm
+
+    def lima_family(self) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == gd.LIMA_VMS)
+
+    def test_a_stopped_unclaimed_lima_vm_two_days_untouched_goes(self) -> None:
+        """ai.manaflow.cmux-linux-vm's slots (<host>-lvm-<k>) and their base under ~/.lima: a claim, a live
+        hostagent or a limactl command naming one keeps it; a stopped unclaimed one idle past the VM window goes."""
+        old = self.lima_vm("cmux-old-lvm-9", 26)
+        recent = self.lima_vm("cmux21-lvm-1", 1)
+        claimed = self.lima_vm("cmux21-lvm-5", 26)
+        (claimed / gd.ROLE_KEEP_MARKER).write_text('{"owner": "ai.manaflow.cmux-linux-vm", "why": "slot"}')
+        self.age(claimed, 26 * 24)
+        base = self.lima_vm("cmux-linux-bake", 26)  # no claim: clones never move its dates, so its name keeps it
+        racer = self.lima_vm("cmux21-lvm-4", 26)  # stopped at survey; its hostagent starts before the delete
+        running = self.lima_vm("cmux21-lvm-0", 26)
+        (running / "ha.pid").write_text(f"{os.getpid()}\n")
+        self.age(running, 26 * 24)
+        named = self.lima_vm("cmux21-lvm-2", 26)
+        stale = self.lima_vm("cmux21-lvm-3", 26)  # a hostagent that crashed left its pid file
+        dead = subprocess.Popen([sys.executable, "-I", "-c", ""])
+        dead.wait()
+        (stale / "ha.pid").write_text(f"{dead.pid}\n")
+        self.age(stale, 26 * 24)
+        for internal in ("_config", "_disks", "_networks", "_a_future_lima_dir", ".hidden"):
+            (self.home / ".lima" / internal).mkdir()
+            self.age(self.home / ".lima" / internal, 26 * 24)
+        fam = self.lima_family()
+        self.assertEqual({p.name for p in gd.candidates(fam)},
+                         {"cmux-old-lvm-9", "cmux21-lvm-1", "cmux21-lvm-5", "cmux-linux-bake", "cmux21-lvm-4",
+                          "cmux21-lvm-0", "cmux21-lvm-2", "cmux21-lvm-3"},
+                         "Lima's own _ entries (_config, _disks, _networks, ...) and dot entries are never items")
+        cmds = "/opt/homebrew/bin/limactl start cmux21-lvm-2 --tty=false\n"
+        # the slot's claim names ai.manaflow.cmux-linux-vm: installed here, whatever this test host has
+        with mock.patch.object(gd, "process_evidence", return_value=([], cmds)), \
+                mock.patch.object(gd, "launchd_job_installed", return_value=True):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cmux-old-lvm-9"].verdict, "reclaimable", items["cmux-old-lvm-9"].reasons)
+        self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
+        self.assertEqual(items["cmux21-lvm-1"].verdict, "recent")
+        self.assertEqual(items["cmux21-lvm-5"].verdict, "kept")
+        self.assertEqual(items["cmux-linux-bake"].verdict, "kept", items["cmux-linux-bake"].reasons)
+        self.assertEqual(items["cmux21-lvm-4"].verdict, "reclaimable", items["cmux21-lvm-4"].reasons)
+        self.assertEqual(items["cmux21-lvm-0"].verdict, "in-use")
+        self.assertIn(f"Lima runs it (hostagent pid {os.getpid()} in ha.pid is live)", items["cmux21-lvm-0"].reasons)
+        self.assertEqual(items["cmux21-lvm-2"].verdict, "in-use")
+        self.assertIn(gd.LIMA_VMS, gd.dead_family_ids())
+        # the racer's hostagent starts between the survey and the delete (its dates aged back, so only the ha.pid
+        # re-read in apply can keep it)
+        (racer / "ha.pid").write_text(f"{os.getpid()}\n")
+        self.age(racer, 26 * 24)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["cmux-old-lvm-9"], items["cmux21-lvm-3"], items["cmux21-lvm-4"]], {fam.id: fam},
+                     receipt, None, 12)
+        self.assertFalse(old.exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue(racer.exists(), "the hostagent's pid is read again right before the delete")
+        for vm in (recent, claimed, base, running, named):
+            self.assertTrue(vm.exists())
+
+    def test_a_symlinked_or_out_of_home_lima_root_is_never_walked(self) -> None:
+        store = self.root / "elsewhere"
+        (store / "slot-0").mkdir(parents=True)
+        self.age(store, 26 * 24)
+        (self.home / ".lima").symlink_to(store)
+        fam = self.lima_family()
+        self.assertEqual(gd.candidates(fam), [])
+        (store / f"{gd.DELETING_PREFIX}x-1").mkdir()
+        self.assertEqual(gd.interrupted_families([fam]), [], "no aside tree is finished through a symlinked ~/.lima")
+        (self.home / ".lima").unlink()
+        (self.home / ".lima").mkdir()
+        (self.home / ".lima/slot-1").symlink_to(store / "slot-0")
+        self.assertEqual(gd.candidates(fam), [], "an instance that is a symlink is never followed")
+        self.assertTrue((store / "slot-0").exists())
+
+    def test_an_idle_bench_lume_image_goes_unless_a_lume_vm_or_the_bench_runs(self) -> None:
+        """The computer-use bench's pinned Lume images (/Users/Shared/cu-driver-bench/.lume/<vm>): a pull brings one
+        back, so an idle one goes; the bench running, a lume run, or a lume command naming it keeps it."""
+        root = self.root / "cu-driver-bench/.lume"
+        image = root / "cu-bench-base-26-5-2"
+        (image / "disk.img").parent.mkdir(parents=True)
+        (image / "disk.img").write_bytes(b"x" * 4096)
+        (root / ".cache").mkdir()
+        self.age(root, 26)
+        self.assertTrue(gd.lume_root_safe(root))
+        fam = gd.lume_bench_family(root)
+        self.assertEqual([p.name for p in gd.candidates(fam)], ["cu-bench-base-26-5-2"], "dot entries are no items")
+        self.assertIn(fam.id, gd.REMOTE_COPY_FAMILIES)
+        for cmds, held in (("", False),
+                           ("/bin/bash scripts/measure/cu-driver-bench.sh --runs 3\n", True),
+                           ("/opt/homebrew/bin/lume run cu-bench-base-26-5-2 --no-display\n", True),
+                           ("/opt/homebrew/bin/lume run some-other-vm\n", True),
+                           ("/opt/homebrew/bin/lume pull ghcr.io/x/cu-bench-base-26-5-2:pinned\n", False),
+                           ("/opt/homebrew/bin/lume stop cu-bench-base-26-5-2\n", True),
+                           ("/usr/bin/vim notes-on-lume.txt\n", False)):
+            self.assertEqual(bool(gd.lume_vm_held(image, cmds)), held, cmds)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "/opt/homebrew/bin/lume run cu-bench-base-26-5-2\n")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "in-use", items["cu-bench-base-26-5-2"].reasons)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey([fam], 12, 0)}
+        self.assertEqual(items["cu-bench-base-26-5-2"].verdict, "reclaimable", items["cu-bench-base-26-5-2"].reasons)
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "process_evidence",
+                                                                          return_value=([], "")):
+            gd.apply([items["cu-bench-base-26-5-2"]], {fam.id: fam}, receipt, None, 12)
+        self.assertFalse(image.exists())
+        link = self.root / "linked/.lume"
+        link.parent.mkdir()
+        link.symlink_to(root)
+        self.assertFalse(gd.lume_root_safe(link), "a symlinked root is never walked")
+
+    def test_journey_cache_entries_unused_for_days_go(self) -> None:
+        cache = self.home / gd.JOURNEY_CACHE
+        old = cache / "builds/23ee510cbc3ac7c7a8eb22ad"
+        deep = old / "build/cmux.app"
+        for _ in range(8):  # an app bundle deeper than the generic git search reaches
+            deep = deep / "Contents"
+        deep.mkdir(parents=True)
+        (deep / "bin").write_bytes(b"\0" * 4096)
+        (old / "ok").write_text("")
+        self.age(old, 4 * 24)
+        fresh = cache / "builds/ad78c0f2819637807768af58"
+        fresh.mkdir(parents=True)
+        (fresh / "ok").write_text("")
+        stale_fetch = cache / "fetch/20261105T024056Z-1c65ed50"
+        stale_fetch.mkdir(parents=True)
+        (stale_fetch / "part").write_bytes(b"\0" * 4096)
+        self.age(stale_fetch, 10 * 24)
+        fams = [f for f in gd.default_families() if f.id in ("journey-builds", "journey-fetch", "user-cache")]
+        self.assertEqual({f.id for f in fams} - {"user-cache"}, {"journey-builds", "journey-fetch"})
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = {Path(i.path).name: i for i in gd.survey(fams, 12, 0)}
+        self.assertNotIn("cmux-journeys", items, "no longer one unchecked ~/.cache item")
+        self.assertEqual(items[old.name].verdict, "reclaimable", items[old.name].reasons)
+        self.assertEqual(items[fresh.name].verdict, "recent")
+        self.assertEqual(items[stale_fetch.name].verdict, "reclaimable")
+
+    def test_dead_pass_runs_while_a_job_runs_and_takes_only_dead_items(self) -> None:
+        tmp = self.root / "T"
+        ended = self.step_checkout("tmp.VuQw7Es3HF")
+        scratch = make(tmp / "agent-scratch", age_hours=48)  # old, but nothing says it is dead
+        vm = self.tart_vm("vm0", 26)
+        receipt = self.root / "receipt.jsonl"
+
+        def fams(role: str = "fleet-mini") -> list[gd.Family]:
+            return [gd.Family("user-tmp", tmp, True, "scratch", git_disposable=True),
+                    gd.Family(gd.TART_VMS, self.home / ".tart/vms", True, "vm", min_idle_hours=gd.TART_VM_IDLE_HOURS),
+                    gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")]
+        (self.root / "dd").mkdir()
+        old_dd = make(self.root / "dd/old", age_hours=48)
+        busy = "/Users/cmux/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 107 110\n"
+        with mock.patch.object(gd, "default_families", side_effect=fams), \
+                mock.patch.object(gd, "process_evidence", return_value=([], busy)), \
+                mock.patch.object(gd, "host_busy", return_value="a CI job is running"), \
+                mock.patch.object(gd, "DEAD_MODE", False), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            status = gd.main(["--dead", "--apply", "--no-snapshot", "--top", "0", "--min-mib", "0",
+                              "--receipt", str(receipt)])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertFalse(ended.exists(), out.getvalue())
+        self.assertFalse(vm.exists(), out.getvalue())
+        self.assertTrue(scratch.exists(), "scratch by age is the pressure and idle passes', never --dead's")
+        self.assertTrue(old_dd.exists(), "not a dead family")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            gd.main(["--dead", "--pressure", "--no-snapshot"])
+
+
+class CacheBudgetTest(unittest.TestCase):
+    """The host cache budget: every build cache on a volume together under POLICY cache_budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.dev = self.root.stat().st_dev
+        self.fs = gd.Fs(self.dev, "/", 50 * gd.GIB, 100 * gd.GIB, 35 * gd.GIB, 45 * gd.GIB)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "process_evidence", return_value=([], "")))
+        gd._DISCOVERED.clear()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_family_ids_named_before_their_constants_match_them(self) -> None:
+        for fid in (gd.RUNNER_BUILD_FAMILY, gd.HQ_CACHE_FAMILY, *(f"journey-{s}" for s in gd.JOURNEY_SUBDIRS)):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+
+    def test_state_counts_outermost_sizes_of_budget_families_and_the_fleet_cas(self) -> None:
+        seeds = gd.Family("cmux-seeds", self.root / "ci/seeds", True, "")
+        kept = gd.Family("cmux-kept-build", self.root / "ci", True, "")
+        other = gd.Family("projects", self.root / "projects", False, "")
+        for f in (seeds, kept, other):
+            f.root.mkdir(parents=True, exist_ok=True)
+        r = os.fspath(self.root)
+        sizes = {f"{r}/ci/seeds/a": 10 * gd.GIB, f"{r}/ci/seeds/a/inner": 9 * gd.GIB,  # inside a: counted once
+                 f"{r}/ci/derived-data": 12 * gd.GIB, f"{r}/projects/x": 50 * gd.GIB}
+        cas = {"at": 1000.0 - 600, "dev": self.dev, "bytes": 18 * gd.GIB}  # glaeda-fleet-cas-prune's last report
+        state = gd.cache_budget_state([seeds, kept, other], {self.dev: self.fs}, sizes, cas, now=1000.0)
+        row = state[self.dev]
+        self.assertEqual(row["used"], 40 * gd.GIB)
+        self.assertEqual(row["families"], {"cmux-seeds": 10 * gd.GIB, "cmux-kept-build": 12 * gd.GIB,
+                                           "fleet-cas": 18 * gd.GIB})
+        self.assertEqual(row["budget"], 35 * gd.GIB)
+        self.assertEqual(row["over"], 40 * gd.GIB - int(35 * gd.GIB * gd.BUDGET_STOP_SHARE))
+        # under the budget: nothing to give back; a fleet-cas report older than its bound is not counted
+        state = gd.cache_budget_state([seeds, kept], {self.dev: self.fs}, sizes, cas,
+                                      now=cas["at"] + gd.FLEET_CAS_RECORD_MAX_AGE_S + 1)
+        self.assertEqual((state[self.dev]["used"], state[self.dev]["over"]), (22 * gd.GIB, 0))
+
+    def test_a_zero_budget_turns_it_off(self) -> None:
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        gd.POLICY["cache_budget"] = "0"
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {f"{self.root}/a": 99 * gd.GIB}, {}), {})
+
+    def test_over_the_budget_warm_windows_drop_to_an_hour_and_other_families_keep_theirs(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12)
+        lib = gd.Family("library-caches", self.root, True, "", min_idle_hours=12)
+        gd.ACTIVITY_MODE = "pressure"
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+        gd.BUDGET_WARM_DEVS = frozenset({self.dev})
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), gd.BUDGET_IDLE_HOURS)
+        self.assertEqual(gd.item_window(lib, self.root / "a", 6), 12)
+        gd.ACTIVITY_MODE = None  # a report or a sweep never spends the budget
+        self.assertEqual(gd.item_window(dd, self.root / "a", 6), 12)
+
+    def test_apply_takes_warm_state_by_value_and_stops_once_under_the_budget(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12, build_output=True)
+        for name, age in (("young", 2), ("older", 3), ("oldest", 4), ("fresh", 0.2)):
+            make(self.root / name, mib=2, age_hours=age)
+        gd.ACTIVITY_MODE = "pressure"
+        gd.BUDGET_WARM_DEVS = frozenset({self.dev})
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 3 * 1024 * 1024, "families": {}}}
+        receipt = self.root.parent / f"{self.root.name}-receipt.jsonl"
+        self.addCleanup(receipt.unlink, missing_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([dd], 6, 0)
+            verdicts = {Path(i.path).name: i.verdict for i in items}
+            self.assertEqual(verdicts, {"young": "reclaimable", "older": "reclaimable", "oldest": "reclaimable",
+                                        "fresh": "recent"})
+            gd.apply(items, {dd.id: dd}, receipt, None, 6)
+        left = sorted(p.name for p in self.root.iterdir())
+        self.assertEqual(left, ["fresh", "young"])  # the two idle longest went; then the volume was under
+
+    def test_rows_name_the_mount_and_families_in_gib(self) -> None:
+        gd.CACHE_BUDGET = {self.dev: {"used": 40 * gd.GIB, "budget": 35 * gd.GIB, "over": 8 * gd.GIB,
+                                      "mount": "/", "families": {"a": 1 * gd.GIB, "b": 39 * gd.GIB}}}
+        self.assertEqual(gd.cache_budget_rows(), [{"mount": "/", "used_gib": 40.0, "budget_gib": 35.0,
+                                                   "over_gib": 8.0, "free_short_gib": 0.0, "free_short_left_gib": 0.0,
+                                                   "families_gib": {"b": 39.0, "a": 1.0}}])
+
+    def test_a_small_disk_under_its_free_share_gives_back_more_than_the_share_asks(self) -> None:
+        # a 228 GB mini: 30 GiB of caches is under the 35% share, but 8 GiB free is 60 GiB short of 30% free
+        fs = gd.Fs(self.dev, "/", 8 * gd.GIB, 228 * gd.GIB, 100 * gd.GIB, 150 * gd.GIB)
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        sizes = {f"{self.root}/a": 30 * gd.GIB}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]
+        self.assertEqual(row["free_short"], int(228 * gd.GIB * 0.30) - 8 * gd.GIB)
+        self.assertEqual(row["over"], 30 * gd.GIB)  # before the survey: never more than the caches hold
+        # after the survey: only what it found reclaimable in the budget's families counts; the rest is reported
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {}, reclaimable={self.dev: 5 * gd.GIB})[self.dev]
+        self.assertEqual(row["over"], 5 * gd.GIB)
+        self.assertEqual(row["free_short_left"], row["free_short"] - 5 * gd.GIB)
+        # nothing reclaimable: the volume is not over at all, so the next pass is no forced pressure pass
+        row = gd.cache_budget_state([fam], {self.dev: fs}, sizes, {}, reclaimable={})[self.dev]
+        self.assertEqual((row["over"], row["free_short_left"]), (0, row["free_short"]))
+        gd.POLICY["cache_budget_free"] = "0"  # the share alone: under it, nothing to give back
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]["over"], 0)
+
+    def test_reclaimable_counts_only_reclaimable_budget_family_items_once(self) -> None:
+        dd = gd.Family("xcode-derived-data", self.root, True, "")
+        r = os.fspath(self.root)
+        items = [gd.Item("xcode-derived-data", f"{r}/a", 4 * gd.GIB, 3.0, "reclaimable", []),
+                 gd.Item("xcode-derived-data", f"{r}/a/b", 1 * gd.GIB, 3.0, "reclaimable", []),
+                 gd.Item("xcode-derived-data", f"{r}/c", 2 * gd.GIB, 0.1, "recent", []),
+                 gd.Item("library-caches", f"{r}/d", 9 * gd.GIB, 30.0, "reclaimable", [])]
+        self.assertEqual(gd.cache_budget_reclaimable(items, [dd]), {self.dev: 4 * gd.GIB})
+
+    def test_outermost_compares_path_components(self) -> None:
+        self.assertEqual(gd._outermost(["/r/a", "/r/a-1", "/r/a/b", "/r/a-1/c", "/r/ab"]), ["/r/a", "/r/a-1", "/r/ab"])
+        sizes = {"/r/a": 1, "/r/a-1": 2, "/r/a/b": 4}
+        fam = gd.Family("cmux-seeds", Path("/r"), True, "")
+        with mock.patch.object(Path, "stat", return_value=os.stat_result((0, 0, 7, 0, 0, 0, 0, 0, 0, 0))):
+            self.assertEqual(gd._budget_dev_bytes([fam], sizes), {7: {"cmux-seeds": 3}})
+
+    def test_job_cache_media_slots_and_tokenless_admission_roots_keep_their_windows(self) -> None:
+        gd.ACTIVITY_MODE, gd.BUDGET_WARM_DEVS = "pressure", frozenset({self.dev})
+        self.assertNotIn("cmux-job-cache", gd.BUDGET_WARM_FAMILY_IDS)
+        job = gd.Family("cmux-job-cache", self.root, True, "", min_idle_hours=gd.DEFAULT_AGE_HOURS)
+        # its own family window, not the budget's BUDGET_IDLE_HOURS (both 1 h since #2138, so ask for 6 h)
+        self.assertEqual(gd.item_window(job, self.root / "u/DerivedData", 6), gd.idle_window(job, 6))
+        adm = gd.Family(gd.CANONICAL_ADMISSION, self.root, True, "", min_idle_hours=gd.CANONICAL_ADMISSION_IDLE_HOURS)
+        path = self.root / "cmux-ci" / "DerivedData"
+        capacity = self.root / "capacity"
+        capacity.mkdir()
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            self.assertEqual(gd.item_window(adm, path, 6), gd.idle_window(adm, 6))  # no token file: its own window
+            item = gd.Item(adm.id, os.fspath(path), gd.GIB, 3.0, "reclaimable", [])
+            self.assertFalse(gd.budget_only(adm, item, 6))
+            (capacity / "root-1.token").write_text("")
+            self.assertEqual(gd.item_window(adm, path, 6), gd.BUDGET_IDLE_HOURS)  # the token protocol holds it
+            self.assertTrue(gd.budget_only(adm, item, 6))
+        dd = gd.Family("xcode-derived-data", self.root, True, "", min_idle_hours=12)
+        slot = gd.Item(dd.id, os.fspath(self.root / "cmux-ci-media-slot0-base"), gd.GIB, 3.0, "reclaimable", [])
+        with mock.patch.object(gd, "media_tour_host", return_value=True):
+            self.assertFalse(gd.budget_only(dd, slot, 6))  # a warm tour slot goes only under the floor hold
+            self.assertEqual(gd.item_window(dd, Path(slot.path), 6), float("inf"))
+        self.assertTrue(gd.budget_only(dd, slot, 6))  # no media host: an ordinary DerivedData
+
+    def test_budget_only_items_take_fresh_process_evidence_at_apply(self) -> None:
+        for fid in ("xcode-derived-data", "journey-builds"):
+            with self.subTest(fid):
+                root = self.root / fid
+                fam = gd.Family(fid, root, True, "", min_idle_hours=12, build_output=True)
+                make(root / "warm", mib=1, age_hours=3)
+                gd.ACTIVITY_MODE, gd.BUDGET_WARM_DEVS = "pressure", frozenset({self.dev})
+                gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": gd.GIB, "families": {}}}
+                receipt = self.root.parent / f"{self.root.name}-{fid}-receipt.jsonl"
+                self.addCleanup(receipt.unlink, missing_ok=True)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    items = gd.survey([fam], 6, 0)
+                self.assertEqual([i.verdict for i in items], ["reclaimable"])
+                calls = []
+
+                def evidence(path=os.fspath(root / "warm")):  # a build opens it after the pass's first look
+                    calls.append(1)
+                    return [], ("" if len(calls) == 1 else f"xcodebuild -derivedDataPath {path}")
+                with mock.patch.object(gd, "process_evidence", side_effect=evidence), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {fam.id: fam}, receipt, None, 6)
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertTrue((root / "warm").exists())
+                self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_fleet_cas_cap_records_what_both_stores_hold_after_it(self) -> None:
+        root, prune, record = self.root / "xcode", self.root / "prune", self.root / "fleet-cas-bytes.json"
+        root.mkdir()
+        (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+        calls = self.root / "calls"
+        prune.write_text("import json, sys\n"
+                         f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                         "print(json.dumps({'node_store': 'removed 3 oldest files, 2.0 GiB', 'node_store_bytes': "
+                         f"{10 * gd.GIB}, 'node_store_freed_bytes': {2 * gd.GIB}, 'local_cas': 'within budget', "
+                         f"'local_cas_bytes': {3 * gd.GIB}, 'result': 'ok'}}))\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune, record=record), 2 * gd.GIB)
+        doc = gd.read_fleet_cas_record(record)
+        self.assertEqual((doc["dev"], doc["bytes"]), (root.stat().st_dev, 11 * gd.GIB))  # 10 - 2 + 3
+        self.assertLess(time.time() - doc["at"], 60)
+        # over the budget: --cap-only (no sweep, no gc) at 2.5% of the volume; with no new record, what it freed
+        # comes off "over"
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 5 * gd.GIB, "families": {}}}
+        with mock.patch.object(gd, "fleet_cas_node_cap", return_value=2 * gd.GIB) as cap, \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
+        self.assertEqual(cap.call_args.kwargs["cap_gib"], 2.5)
+        self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 3 * gd.GIB)
+        calls.unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.fleet_cas_node_cap(root, prune, cap_gib=2.5, record=record)
+        self.assertEqual(calls.read_text(), "--apply --cap-only --node-gib 2.5 --local-cas-gib 2.5\n")
+        gd.CACHE_BUDGET = {}  # not over: no capped run
+        with mock.patch.object(gd, "fleet_cas_node_cap") as cap:
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 0)
+        cap.assert_not_called()
+
+    def test_the_cas_cap_credits_what_the_stores_shrank_by_since_the_counted_record(self) -> None:
+        root, record = self.root / "xcode", self.root / "fleet-cas-bytes.json"
+        root.mkdir()
+        record.write_text(json.dumps({"at": time.time() - 600, "dev": self.dev, "bytes": 20 * gd.GIB}))
+        gd.ACTIVITY_MODE = "pressure"
+        gd.CACHE_BUDGET = {self.dev: {"used": 1, "budget": 1, "over": 30 * gd.GIB,
+                                      "families": {"fleet-cas": 20 * gd.GIB}}}
+
+        def cap(*args, **kw):  # freed 2 GiB, but a writer build had emptied its local CAS since: 5 GiB are left
+            record.write_text(json.dumps({"at": time.time(), "dev": self.dev, "bytes": 5 * gd.GIB}))
+            return 2 * gd.GIB
+        with mock.patch.object(gd, "fleet_cas_node_cap", side_effect=cap), \
+                mock.patch.object(gd, "FLEET_CAS_RECORD", record):
+            self.assertEqual(gd.fleet_cas_budget_cap({self.dev: self.fs}, root), 2 * gd.GIB)
+        self.assertEqual(gd.CACHE_BUDGET[self.dev]["over"], 15 * gd.GIB)  # 30 - (20 - 5)
+
+    def test_records_holding_infinity_or_nan_read_as_absent(self) -> None:
+        path = self.root / "record.json"
+        for body in ('{"at": 1e300, "dev": 1, "bytes": Infinity}', '{"at": NaN, "dev": 1, "bytes": 1}',
+                     '{"at": 1, "dev": Infinity, "bytes": 1}', '{"at": true, "dev": 1, "bytes": 1}', "[]", "x"):
+            path.write_text(body)
+            self.assertEqual(gd.read_fleet_cas_record(path), {}, body)
+        now = time.time()
+        for body in (f'{{"at": {now}, "left": {{"1": Infinity}}}}', '{"at": Infinity, "left": {}}',
+                     f'{{"at": {now}, "left": {{"1": NaN}}}}', '{"at": NaN, "left": {"1": 5}}'):
+            path.write_text(body)
+            self.assertEqual(gd.read_budget_left(path, now=now), {}, body)
+        # cache_budget_state never sees one: an infinite record is no record
+        path.write_text('{"at": 1, "dev": 1, "bytes": Infinity}')
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        self.assertEqual(gd.cache_budget_state([fam], {self.dev: self.fs}, {}, gd.read_fleet_cas_record(path)), {})
+
+
+
+class HeldReasonTest(unittest.TestCase):
+    """Every held item in a dry run says what holds it, its last use and whether it is stale (glaeda#2060 follow-up)."""
+
+    def test_a_recent_item_with_no_reason_names_its_window_and_owner(self) -> None:
+        fam = gd.Family(gd.TART_VMS, Path("/x"), True, "vm", owner="Tart", min_idle_hours=48)
+        hold = gd.hold_record(fam, "recent", [], 36.7, 48.0, False)
+        self.assertEqual(hold["by"], "idle 36.7h, inside its 48h window (owner: Tart)")
+        self.assertEqual((hold["last_use_hours"], hold["window_hours"], hold["stale"]), (36.7, 48.0, False))
+        self.assertIsNone(gd.hold_record(fam, "reclaimable", [], 99, 48.0, True))
+
+    def test_a_held_item_past_its_window_is_stale_and_names_its_holder(self) -> None:
+        fam = gd.Family("home-scratch", Path("/x"), True, "")
+        hold = gd.hold_record(fam, "in-use", ["named by /Users/x/.codex/config.toml"], 355.7, 1.0, True)
+        self.assertEqual(hold["by"], "named by /Users/x/.codex/config.toml")
+        self.assertTrue(hold["stale"])
+        report_only = gd.Family("cmux-git-mirror", Path("/x"), False, "", owner="cmux CI")
+        self.assertFalse(gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["stale"],
+                         "a report-only family is never stale: nothing may delete it")
+        self.assertIn("report-only", gd.hold_record(report_only, "report-only", [], 9, 1.0, True)["by"])
+
+    def test_the_summary_counts_nested_items_once_and_splits_stale_bytes(self) -> None:
+        items = [gd.Item("a", "/r/a", 10, 50, "in-use", ["open by a process"],
+                         hold={"by": "open by a process", "stale": True}),
+                 gd.Item("a", "/r/a/b", 4, 50, "in-use", [], hold={"by": "x", "stale": True}),
+                 gd.Item("c", "/r/c", 5, 1, "recent", [], hold={"by": "idle", "stale": False}),
+                 gd.Item("d", "/r/d", 7, 9, "reclaimable", [])]
+        summary = gd.held_summary(items)
+        self.assertEqual((summary["bytes"], summary["stale_bytes"]), (15, 10))
+        self.assertEqual(summary["by"][0], {"why": "a: open by a process", "bytes": 10})
+        gd.fill_holds([extra := gd.Item("xcode-apps", "/A/Xcode.app", 1, 0.0, "report-only", ["no pin"])])
+        self.assertEqual(extra.hold["by"], "no pin")
+
+
+class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
+    """A fleet lease no longer turns the budget off: only what its job names or has open stays (Leo, 2026-11-18)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.list = self.root / "fleet-reservations.json"
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z",
+                                         "aliases": {}, "reservations": [
+                                             {"id": "lease-1", "owner": "node:lane", "hosts": ["mini-a"],
+                                              "from": "2026-11-18T18:30:00Z", "until": "2026-11-18T20:30:00Z"}]}))
+        self.during = gd.reservation_time("2026-11-18T19:00:00Z")
+        self.addCleanup(gd.LEASE.clear)
+
+    def test_an_active_lease_records_when_it_began_and_a_failed_read_does_not(self) -> None:
+        why = gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json")
+        self.assertIn("lease-1", why)
+        self.assertEqual(gd.RESERVATION_SINCE, gd.reservation_time("2026-11-18T18:30:00Z"))
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json"))
+        self.assertIsNone(gd.RESERVATION_SINCE, "fails closed: floor-only, as before")
+
+    def test_a_lease_holds_what_it_names_never_what_runner_jobs_left_after_it_began(self) -> None:
+        """2026-11-21: a drain lease on a mini at 17 GiB free kept 26.5 GiB of SwiftPM scratch, unheld by any lock,
+        because runner jobs admitted before the lease finished after it began; every pass freed nothing."""
+        fleet = self.root / "fleet"
+        fam = gd.Family(gd.SPM_SCRATCH, fleet / "ci/spm-scratch", True, "")
+        job, left = make(fleet / "cache/job-a", age_hours=0), make(fleet / "ci/spm-scratch/71c65b48", age_hours=0.05)
+        marker = fleet / "reservation.json"
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": int(time.time()) - 3600,
+                                      "until": int(time.time()) + 3600, "owner": "node:lane",
+                                      "paths": [os.fspath(job)]}))
+        with mock.patch.object(gd, "FLEET_ROOT", fleet):
+            gd._LIVE_REFERENCES.clear()
+            self.addCleanup(gd._LIVE_REFERENCES.clear)
+            gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
+            self.assertEqual(gd.lease_holds(fam, left), "", "used since the lease began, named by nothing")
+            self.assertEqual(gd.lease_holds(fam, left, fresh=True), "", "apply's re-check agrees")
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job))
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job, fresh=True))
+            gd.LEASE.clear()
+            self.assertEqual(gd.lease_holds(fam, job), "", "no lease: nothing held by one")
+
+    def test_a_host_reservation_references_only_the_paths_it_names_never_the_fleet_root(self) -> None:
+        fleet = self.root / "fleet"
+        (fleet / "ci/source-packages").mkdir(parents=True)
+        job = fleet / "cache/job-a"
+        job.mkdir(parents=True)
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "since": int(time.time()) - 60, "until": int(time.time()) + 3600,
+            "owner": "node:lane", "paths": [os.fspath(fleet), os.fspath(job)]}))
+        gd._LIVE_REFERENCES.clear()
+        self.addCleanup(gd._LIVE_REFERENCES.clear)
+        refs = gd.live_artifact_references(fleet)
+        self.assertFalse(gd.artifact_referenced(fleet / "ci/source-packages", refs), refs)
+        self.assertTrue(gd.artifact_referenced(job, refs), refs)
+
+
+class BuildStateUnderBudgetTest(unittest.TestCase):
+    """The build state no family held (build-fleet slots and package stores, runner leftovers, home folders, aside
+    trees) is judged by staleness and counted by the host cache budget."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.fleet = self.root / "fleet"
+        self.runner = self.home / "actions-runner-glaeda-11"
+        (self.runner / "glaeda-hooks").mkdir(parents=True)
+        (self.runner / ".runner").write_text("{}")
+        for v in ("bin.2.338.0", "bin.2.338.2", "externals.2.338.0", "externals.2.338.2"):
+            (self.runner / v).mkdir()
+        (self.runner / "bin").symlink_to("bin.2.338.2")
+        (self.runner / "externals").symlink_to("externals.2.338.2")
+        for d in ("_work/_tool/Python", "_work/_update", "_diag", "_work/cmux"):
+            (self.runner / d).mkdir(parents=True, exist_ok=True)
+        (self.fleet / "xcode/next-release/DerivedData").mkdir(parents=True)
+        (self.fleet / "ci/source-packages").mkdir(parents=True)
+        (self.fleet / "ci-ios-packages/source-packages").mkdir(parents=True)
+        home = mock.patch.object(gd, "HOME", self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        gd._DISCOVERED.clear()
+
+    def fams(self) -> list:
+        return gd.build_state_families(self.home, self.fleet)
+
+    def test_the_families_find_each_kind_and_count_toward_the_budget(self) -> None:
+        fams = self.fams()
+        found = {(f.id, os.fspath(p.relative_to(self.root))) for f in fams for p in gd.candidates(f)}
+        self.assertLessEqual({
+            (gd.FLEET_RELEASE_DD, "fleet/xcode/next-release/DerivedData"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci/source-packages"),
+            (gd.FLEET_SOURCE_PACKAGES, "fleet/ci-ios-packages/source-packages"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/bin.2.338.0"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_tool"),
+            (gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/_update")}, found)
+        self.assertNotIn((gd.RUNNER_LEFTOVERS, "home/actions-runner-glaeda-11/_work/cmux"), found)
+        for f in fams:
+            self.assertIn(f.id, gd.BUDGET_FAMILY_IDS)
+            self.assertEqual(f.min_idle_hours, gd.BUILD_STATE_STALE_HOURS)
+        for fid in ("home-scratch", "retired-runner", gd.INTERRUPTED):
+            self.assertIn(fid, gd.BUDGET_FAMILY_IDS)
+
+    def test_the_current_runner_version_and_a_live_job_keep_theirs(self) -> None:
+        leftovers = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root == self.runner)
+        self.assertIn("current version", gd.build_state_held(leftovers, self.runner / "bin.2.338.2", ""))
+        self.assertEqual(gd.build_state_held(leftovers, self.runner / "bin.2.338.0", ""), "")
+        work = next(f for f in self.fams() if f.id == gd.RUNNER_LEFTOVERS and f.root.name == "_work")
+        job = f"{self.runner}/bin.2.338.2/Runner.Worker spawnclient 1 2\n"
+        self.assertIn("a job runs on actions-runner-glaeda-11",
+                      gd.build_state_held(work, self.runner / "_work/_tool", job))
+        self.assertEqual(gd.build_state_held(work, self.runner / "_work/_tool", ""), "")
+
+    def test_stale_means_hours_untouched_whatever_the_job_count(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        with mock.patch.object(gd, "jobs_since_use", return_value=500), mock.patch.object(gd, "ACTIVITY_MODE", "sweep"):
+            self.assertEqual(gd.item_due(fam, 4.2, 12.0), (False, None))
+            self.assertEqual(gd.item_due(fam, 12.5, 12.0), (True, None))
+
+    def test_a_held_slot_lock_keeps_the_release_build(self) -> None:
+        fam = next(f for f in self.fams() if f.id == gd.FLEET_RELEASE_DD)
+        dd = self.fleet / "xcode/next-release/DerivedData"
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "no lock file: no holder")
+        lock = self.fleet / "xcode/next-release/lock"
+        lock.write_text('{"pid": 999999999}')
+        self.assertEqual(gd.build_state_held(fam, dd, ""), "", "a dead pid holds nothing")
+        lock.write_text(json.dumps({"pid": os.getpid()}))
+        self.assertIn("live process", gd.build_state_held(fam, dd, ""))
+        lock.write_text("")
+        with open(lock) as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertIn("holds its slot lock", gd.build_state_held(fam, dd, ""))
+
+    def test_the_budget_gives_a_home_rooted_family_only_its_own_folders(self) -> None:
+        scratch = gd.Family("home-scratch", self.home, True, "", skip=("Library",), skip_prefixes=(".", "actions-runner"))
+        aside = gd.Family(gd.INTERRUPTED, self.home, True, "")
+        sizes = {os.fspath(self.home / "cu-rewrite-build"): 5, os.fspath(self.home / "Library/Caches/x"): 7,
+                 os.fspath(self.home / ".glaeda-disk-deleting-rig-10354"): 3,
+                 os.fspath(self.home / "actions-runner-glaeda-11/_diag"): 11}
+        by = gd._budget_dev_bytes([scratch, aside], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {"home-scratch": 5, gd.INTERRUPTED: 3}})
+
+
+class KeptAsideRestoreTest(unittest.TestCase):
+    """An aside tree kept for a git change goes back to its path once stale, for its family to judge again."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.aside = make(self.root / ".glaeda-disk-deleting-simsurface-rig-10354", age_hours=615)
+        self.marker = gd.mirror_keep_marker(self.aside)
+        self.marker.write_text("kept")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        self.fam = gd.Family(gd.INTERRUPTED, self.root, True, "")
+        gd._DISCOVERED.clear()
+
+    def test_its_origin_is_its_name_without_prefix_or_pid(self) -> None:
+        self.assertEqual(gd.aside_origin(self.aside), self.root / "simsurface-rig")
+        self.assertIsNone(gd.aside_origin(self.root / "simsurface-rig"))
+
+    def test_a_stale_one_goes_back_and_a_fresh_or_blocked_one_stays(self) -> None:
+        self.assertIn("stale", gd.kept_aside_stale(self.aside))
+        self.assertIn("stale", gd.keep_verdict(self.fam, self.aside), "the dry run says so")
+        os.utime(self.marker)
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "a marker touched lately: not stale")
+        t = time.time() - 615 * 3600
+        os.utime(self.marker, (t, t))
+        (self.root / "simsurface-rig").mkdir()
+        self.assertEqual(gd.kept_aside_stale(self.aside), "", "its path is taken: it stays aside")
+        (self.root / "simsurface-rig").rmdir()
+        receipt = self.root / "receipt.jsonl"
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam], receipt), 1)
+        self.assertTrue((self.root / "simsurface-rig/blob").is_file())
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(json.loads(receipt.read_text())["operation"], "restore-kept-aside")
+
+    def test_a_process_in_it_keeps_it_aside(self) -> None:
+        with mock.patch.object(gd, "process_evidence", return_value=([], f"vim {self.aside}/x\n")):
+            self.assertEqual(gd.restore_stale_kept_asides([self.fam]), 0)
+        self.assertTrue(self.aside.is_dir())
+
+
+class TartLimaReferencesTest(unittest.TestCase):
+    """Tart and Lima VMs something references stay uncapped with a reason naming what; the rest are stale and join
+    the host cache budget (Leo, 2026-11-18: "there are dozens if not hundreds of gb of build stuff that just keep
+    getting accumulated. it's too much"; glaeda#2060's budget freed 0 GiB on a 460 GiB mini whose ~100 GiB of VMs sat
+    outside it). The fixtures are that mini's: cumv15-1 running, cloned from cumv15-build, and cmux-linux-bake."""
+
+    ECID = "AAAAAAAAAAA="
+    LVM_LABEL = "ai.manaflow.cmux-linux-vm"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        self.home = self.root / "home"
+        self.home.mkdir()
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        keep_main_globals(stack)
+        stack.enter_context(mock.patch.object(gd, "HOME", self.home))
+        stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
+        stack.enter_context(mock.patch.dict(gd._LAUNCHD_INSTALLED, {}, clear=True))
+        stack.enter_context(mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False))  # a test turns it on itself
+        gd._DISCOVERED.clear()
+        self.addCleanup(gd._DISCOVERED.clear)
+
+    def age(self, tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for name in filenames + dirnames:
+                os.utime(os.path.join(dirpath, name), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def tart_vm(self, name: str, hours: float, ecid: str | None = None) -> Path:
+        vm = self.home / ".tart/vms" / name
+        vm.mkdir(parents=True)
+        config = {"os": "darwin", **({"ecid": ecid} if ecid else {})}
+        (vm / "config.json").write_text(json.dumps(config))
+        (vm / "disk.img").write_bytes(b"\0" * 4096)
+        (vm / "nvram.bin").write_bytes(b"\0" * 64)
+        self.age(vm, hours)
+        return vm
+
+    def lima_vm(self, name: str, hours: float, yaml: str = "vmType: vz\n", disk: bytes = b"\0" * 4096) -> Path:
+        vm = self.home / ".lima" / name
+        vm.mkdir(parents=True)
+        (vm / "lima.yaml").write_text(yaml)
+        (vm / "diffdisk").write_bytes(disk)
+        self.age(vm, hours)
+        return vm
+
+    def claim(self, vm: Path, owner: str | None, hours: float) -> None:
+        doc = {"why": "the Linux worker VMs base image (build-fleet/mini-ops/linux-vm)"}
+        if owner is not None:
+            doc["owner"] = owner
+        (vm / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+        self.age(vm, hours)
+
+    def lock(self, vm: Path) -> None:
+        """Hold the VM's config.json lock the way `tart run` does (its PIDLock)."""
+        holder = subprocess.Popen([sys.executable, "-I", "-c",
+                                   "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                                   "fcntl.lockf(fd, fcntl.LOCK_EX)\n"
+                                   "print('locked', flush=True)\n"
+                                   "time.sleep(60)\n", os.fspath(vm / "config.json")],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+
+    def fam(self, fid: str) -> gd.Family:
+        return next(f for f in gd.default_families() if f.id == fid)
+
+    def survey(self, *fids: str) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {Path(i.path).name: i for i in gd.survey([self.fam(f) for f in fids], 12, 0)}
+
+    def test_the_measured_mini_keeps_its_clone_source_and_its_configured_base_with_reasons(self) -> None:
+        build = self.tart_vm("cumv15-build", 36.7, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)  # `tart clone cumv15-build cumv15-1`, then `tart run`
+        self.lock(running)
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["cumv15-1"].verdict, "in-use", items["cumv15-1"].reasons)
+            self.assertIn("tart runs it (its config.json lock is held)", items["cumv15-1"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", items["cumv15-build"].reasons)
+            self.assertIn("clone source of running VM cumv15-1", items["cumv15-build"].reasons)
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept")
+            why = "; ".join(items["cmux-linux-bake"].reasons)
+            self.assertIn(f"launchd job {self.LVM_LABEL} is installed", why)
+            self.assertIn("the Linux worker VMs' base", why)
+            # referenced VMs are no cache: none of their bytes count toward the budget, however old
+            sizes = {os.fspath(build): 29 * gd.GIB, os.fspath(running): 30 * gd.GIB, os.fspath(bake): 40 * gd.GIB}
+            fams = [self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)]
+            self.assertEqual(gd._budget_dev_bytes(fams, sizes), {})
+
+    def test_a_persons_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """Leo, 2026-11-22: "it's the fleet. they dont have anything protected"."""
+        forever = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(forever, "leo", 26 * 24)
+        bare = self.lima_vm("no-owner", 26 * 24)
+        self.claim(bare, None, 26 * 24)
+        dated = self.lima_vm("leo-dated", 26 * 24)
+        (dated / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() + 3 * 3600}))
+        self.age(dated, 26 * 24)
+        lapsed = self.lima_vm("leo-lapsed", 26 * 24)
+        (lapsed / gd.ROLE_KEEP_MARKER).write_text(json.dumps({"owner": "leo", "until": time.time() - 60}))
+        self.age(lapsed, 26 * 24)
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "reclaimable", items["leo-scratch"].reasons)
+        self.assertIn("claim by leo on a fleet mini is stale: it names no until", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["no-owner"].verdict, "reclaimable", items["no-owner"].reasons)
+        self.assertEqual(items["leo-dated"].verdict, "kept", items["leo-dated"].reasons)
+        self.assertIn("claimed by leo until", items["leo-dated"].reasons[-1])
+        self.assertEqual(items["leo-lapsed"].verdict, "reclaimable", items["leo-lapsed"].reasons)
+        self.assertIn("its until has passed", items["leo-lapsed"].reasons[-1])
+        with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+            items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "off a fleet mini a person's claim still holds")
+        policy = self.root / "disk-policy.json"
+        policy.write_text(json.dumps({"fleet_claims_expire": False}))
+        self.assertEqual(gd.disk_policy(policy)["fleet_claims_expire"], False, "one host can turn it off")
+
+    def test_a_launchd_jobs_claim_on_a_fleet_mini_holds_only_until_its_until(self) -> None:
+        """RFD 0028 rule 1, no protected VMs: the Linux VM supervisor's slot record (until = stopped + 30 min) is
+        a claim like a person's on a fleet mini; the base stays by name and a running slot by its ha.pid."""
+        now = time.time()
+
+        def slot(name: str, until: float | None) -> Path:
+            path = self.lima_vm(name, 26 * 24)
+            doc: dict[str, object] = {"owner": self.LVM_LABEL, "why": "Linux worker VM slot", "state": "stopped"}
+            if until is not None:
+                doc["until"] = until
+            (path / gd.ROLE_KEEP_MARKER).write_text(json.dumps(doc))
+            self.age(path, 26 * 24)
+            return path
+
+        slot("cmux21-lvm-1", now + 600)  # stopped 20 min ago: inside its bound
+        slot("cmux21-lvm-2", now - 60)  # stopped 31 min ago
+        slot("cmux21-lvm-3", None)  # an old supervisor's claim, no until
+        bake = self.lima_vm("cmux-linux-bake", 26 * 24)
+        self.claim(bake, self.LVM_LABEL, 26 * 24)
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=lambda label: label == self.LVM_LABEL):
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", True):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-1"].verdict, "kept", items["cmux21-lvm-1"].reasons)
+            self.assertIn(f"claimed by {self.LVM_LABEL} until", items["cmux21-lvm-1"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "reclaimable", items["cmux21-lvm-2"].reasons)
+            self.assertIn("its until has passed", items["cmux21-lvm-2"].reasons[-1])
+            self.assertEqual(items["cmux21-lvm-3"].verdict, "reclaimable", items["cmux21-lvm-3"].reasons)
+            self.assertIn("it names no until", items["cmux21-lvm-3"].reasons[-1])
+            self.assertEqual(items["cmux-linux-bake"].verdict, "kept", items["cmux-linux-bake"].reasons)
+            self.assertIn("the Linux worker VMs' base", "; ".join(items["cmux-linux-bake"].reasons))
+            with mock.patch.object(gd, "FLEET_CLAIMS_EXPIRE", False):
+                items = self.survey(gd.LIMA_VMS)
+            self.assertEqual(items["cmux21-lvm-2"].verdict, "kept", "off a fleet mini an installed job's claim holds")
+
+    def test_a_stopped_clone_an_orphaned_clone_and_a_stale_claim_are_stale_and_say_why(self) -> None:
+        base = self.tart_vm("ubase", 30 * 24, self.ECID)
+        clone = self.tart_vm("vm0", 26 * 24, self.ECID)  # stopped since 2026-10-19 (cmux23), cloned from ubase
+        orphan = self.tart_vm("vm5", 26 * 24, "BBBBBBBBBBB=")  # its source is gone
+        young = self.tart_vm("vm6", 10, "CCCCCCCCCCC=")  # stale, but inside the 48 h window while under budget
+        gone_job = self.lima_vm("cmux-old-lvm-1", 26 * 24)
+        self.claim(gone_job, "ai.manaflow.cmux-retired-vm", 26 * 24)
+        person = self.lima_vm("leo-scratch", 26 * 24)
+        self.claim(person, "leo", 26 * 24)
+        unknowable = self.lima_vm("cmux21-lvm-0", 26 * 24)
+        self.claim(unknowable, self.LVM_LABEL, 26 * 24)
+        installed = {"ai.manaflow.cmux-retired-vm": False, self.LVM_LABEL: None}
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["ubase"].verdict, "kept", items["ubase"].reasons)
+        self.assertIn("clone source of VM vm0", items["ubase"].reasons)
+        self.assertEqual(items["vm0"].verdict, "reclaimable", items["vm0"].reasons)
+        self.assertTrue(items["vm0"].reasons[-1].startswith("stale: a stopped clone of ubase"), items["vm0"].reasons)
+        self.assertEqual(items["vm5"].verdict, "reclaimable", items["vm5"].reasons)
+        self.assertIn("stale: nothing references it", items["vm5"].reasons[-1])
+        self.assertEqual(items["vm6"].verdict, "recent")
+        self.assertIn("stale: nothing references it", items["vm6"].reasons[-1], "a recent VM says why too")
+        self.assertEqual(items["cmux-old-lvm-1"].verdict, "reclaimable", items["cmux-old-lvm-1"].reasons)
+        self.assertIn("claim by ai.manaflow.cmux-retired-vm is stale: no such launchd job",
+                      items["cmux-old-lvm-1"].reasons[-1])
+        self.assertEqual(items["leo-scratch"].verdict, "kept", "a person's claim still holds")
+        self.assertIn("claimed by leo", items["leo-scratch"].reasons[-1])
+        self.assertEqual(items["cmux21-lvm-0"].verdict, "kept", "a job launchd cannot be asked about keeps its claim")
+        # every Tart/Lima item names what references it or why it is stale
+        for name, item in items.items():
+            self.assertTrue(item.reasons, name)
+        # the stale ones count toward the budget, the referenced ones do not
+        sizes = {os.fspath(p): 10 * gd.GIB for p in (base, clone, orphan, young, gone_job, person, unknowable)}
+        sizes[os.fspath(clone / "disk.img")] = 9 * gd.GIB  # inside a counted VM: counted once
+        with mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            by = gd._budget_dev_bytes([self.fam(gd.TART_VMS), self.fam(gd.LIMA_VMS)], sizes)
+        self.assertEqual(by, {self.home.stat().st_dev: {gd.TART_VMS: 30 * gd.GIB, gd.LIMA_VMS: 10 * gd.GIB}})
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "launchd_job_installed", side_effect=installed.get):
+            gd.apply(list(items.values()), {f: self.fam(f) for f in (gd.TART_VMS, gd.LIMA_VMS)}, receipt, None, 12)
+        for vm in (clone, orphan, gone_job):
+            self.assertFalse(vm.exists(), receipt.read_text())
+        for vm in (base, young, person, unknowable):
+            self.assertTrue(vm.exists())
+
+    def test_over_the_budget_a_stale_vm_goes_past_an_hour_and_a_referenced_one_stays(self) -> None:
+        base = self.tart_vm("cumv15-build", 3, self.ECID)
+        running = self.tart_vm("cumv15-1", 0.5, self.ECID)
+        self.lock(running)
+        stale = self.tart_vm("aside-1", 3, "BBBBBBBBBBB=")
+        lima_stale = self.lima_vm("cmux-old-lvm-2", 3)
+        dev = self.home.stat().st_dev
+        self.assertIn(gd.TART_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertIn(gd.LIMA_VMS, gd.BUDGET_FAMILY_IDS)
+        self.assertLessEqual(gd.BUDGET_WARM_FAMILY_IDS, gd.BUDGET_FAMILY_IDS)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "BUDGET_WARM_DEVS", frozenset({dev})):
+            items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+            self.assertEqual(items["aside-1"].verdict, "reclaimable", items["aside-1"].reasons)
+            self.assertTrue(gd.budget_only(self.fam(gd.TART_VMS), items["aside-1"], 12))
+            self.assertEqual(items["cmux-old-lvm-2"].verdict, "reclaimable", items["cmux-old-lvm-2"].reasons)
+            self.assertEqual(items["cumv15-build"].verdict, "kept", "referenced: no budget takes it")
+            self.assertEqual(items["cumv15-1"].verdict, "in-use")
+        # under the budget the 48 h window holds
+        items = self.survey(gd.TART_VMS, gd.LIMA_VMS)
+        self.assertEqual(items["aside-1"].verdict, "recent")
+        self.assertTrue(base.exists() and stale.exists() and lima_stale.exists())
+
+    def test_a_lima_instance_named_as_another_ones_source_is_referenced(self) -> None:
+        base = self.lima_vm("cmux-linux-bake-v2", 26 * 24)
+        self.lima_vm("cmux21-lvm-1", 26 * 24, yaml=f"images:\n- location: {self.home}/.lima/cmux-linux-bake-v2/basedisk\n")
+        backing = f"{self.home}/.lima/cmux-linux-bake-v1/basedisk".encode()
+        header = bytearray(gd.QCOW2_MAGIC + (3).to_bytes(4, "big") + (512).to_bytes(8, "big")
+                           + len(backing).to_bytes(4, "big"))
+        disk = bytes(header) + b"\0" * (512 - len(header)) + backing + b"\0" * 64
+        v1 = self.lima_vm("cmux-linux-bake-v1", 26 * 24)
+        self.lima_vm("cmux21-lvm-2", 26 * 24, disk=disk)
+        old = self.lima_vm("cmux-linux-bake-v0", 26 * 24)  # an old base no instance names any more
+        self.assertEqual(gd.lima_named_instances(self.home / ".lima/cmux21-lvm-2"), {"cmux-linux-bake-v1"})
+        items = self.survey(gd.LIMA_VMS)
+        self.assertEqual(items[base.name].verdict, "kept", items[base.name].reasons)
+        self.assertIn("clone source of VM cmux21-lvm-1", items[base.name].reasons)
+        self.assertEqual(items[v1.name].verdict, "kept")
+        self.assertIn("clone source of VM cmux21-lvm-2", items[v1.name].reasons)
+        self.assertEqual(items[old.name].verdict, "reclaimable")
+        self.assertEqual(items["cmux21-lvm-1"].verdict, "reclaimable")
+        self.assertIn("stale: a stopped clone of cmux-linux-bake-v2", items["cmux21-lvm-1"].reasons[-1])
+
+    def test_never_delete_still_wins(self) -> None:
+        self.tart_vm("vm0", 26 * 24)
+        with mock.patch.object(gd, "NEVER_DELETE", (*gd.NEVER_DELETE, ".tart/vms/vm0")):
+            self.assertEqual(gd.candidates(self.fam(gd.TART_VMS)), [])
+
+    def test_launchd_job_installed_reads_plists_then_launchctl(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "x.plist").write_bytes(plistlib.dumps({"Label": self.LVM_LABEL}))
+        fake = self.root / "launchctl"
+        with mock.patch.object(gd, "LAUNCHCTL", os.fspath(fake)):
+            self.assertTrue(gd.launchd_job_installed(self.LVM_LABEL), "a plist naming the label")
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "no launchctl: cannot tell")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find service \\"$2\\" in domain" >&2\nexit 113\n')
+            fake.chmod(0o755)
+            self.assertIs(gd.launchd_job_installed("ai.manaflow.gone"), False)
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\necho "Could not find domain for port" >&2\nexit 1\n')
+            self.assertIsNone(gd.launchd_job_installed("ai.manaflow.gone"), "an unreadable domain is no answer")
+            gd._LAUNCHD_INSTALLED.clear()
+            fake.write_text('#!/bin/sh\ncase "$2" in gui/*) exit 0;; esac\nexit 113\n')
+            self.assertTrue(gd.launchd_job_installed("ai.manaflow.gone"), "loaded without a plist we read")
+
+
+class EvictLockQueueTest(unittest.TestCase):
+    """evict.lock's bounded hold and fair queue. A fleet mini, 2026-11-18 05:31 to 10:22: the runner hook's DISK_BOUND
+    ran pass after pass, each taking evict.lock, while 35 floor evictions and 27 LaunchAgent, launchd and build-worker
+    runs skipped as eviction_busy, about as often as they ran."""
+
+    _main_run = GlaedaDiskTest._main_run
+    _queue = GlaedaDiskTest._queue
+    receipt = GlaedaDiskTest.receipt
+    tearDown = GlaedaDiskTest.tearDown
+
+    def setUp(self) -> None:
+        GlaedaDiskTest.setUp(self)
+        for name in ("EVICT_LOCK", "EVICT_OWNER", "_EVICT_TICKET", "_EVICT_RANK", "_EVICT_HANDLE", "_EVICT_TAKEN_AT",
+                     "_EVICT_HALTS"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+        gd.EVICT_LOCK, gd.EVICT_OWNER = self.root / "evict.lock", self.root / "evict.owner.json"
+        gd._EVICT_TICKET, gd._EVICT_RANK, gd._EVICT_HANDLE = None, 1, None
+        self.waiters = gd.evict_waiters_dir()
+        run = mock.patch.dict(gd.RUN, clear=True)
+        run.start()
+        self.addCleanup(run.stop)
+
+    def sleeper(self) -> subprocess.Popen:
+        """A live process of this test's own, standing in for a waiting run."""
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child
+
+    def dead_pid(self) -> int:
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        return child.pid
+
+    def ticket(self, rank: int, pid: int, age_s: float = 0.0) -> str:
+        self.waiters.mkdir(parents=True, exist_ok=True)
+        name = f"{rank}-{int((time.time() - age_s) * 1e9):020d}-{pid}.ticket"
+        (self.waiters / name).write_text("{}")
+        return name
+
+    def test_the_queue_serves_floor_waiters_first_then_first_come_and_skips_dead_tickets(self) -> None:
+        live = self.sleeper().pid
+        early = self.ticket(1, live, age_s=10)
+        floor = self.ticket(0, live, age_s=5)
+        late = self.ticket(1, live, age_s=1)
+        dead = self.ticket(1, self.dead_pid(), age_s=3)
+        stale = self.ticket(1, live, age_s=gd.EVICT_TICKET_STALE_S + 10)
+        self.assertEqual(gd.evict_waiters(), [floor, early, late], "a floor waiter goes ahead; then FIFO")
+        self.assertFalse((self.waiters / dead).exists(), "a dead waiter's ticket is cleared")
+        self.assertTrue((self.waiters / stale).exists(), "a stale one (pid reused) is only ignored")
+        mine = self.waiters / late
+        self.assertEqual(gd.evict_queue_ahead(mine), [floor, early])
+        self.assertEqual(gd.evict_queue_ahead(None), [floor, early, late], "a run with no ticket is behind all")
+
+    def test_a_queued_acquire_never_jumps_a_live_waiter(self) -> None:
+        self.ticket(1, self.sleeper().pid, age_s=1)
+        self.assertIsNone(gd.acquire_evict_lock(queued=True), "the free lock is the waiter's turn")
+        handle = gd.acquire_evict_lock()  # drain and runner-cache-profile runs: the lock alone decides, as before
+        self.assertIsNotNone(handle)
+        gd.release_evict_lock(handle)
+        gd._EVICT_RANK = 0  # a floor run's ticket goes ahead of the waiting LaunchAgent's
+        mine = gd.take_evict_ticket()
+        self.assertEqual(json.loads(mine.read_text())["floor"], True)
+        handle = gd.acquire_evict_lock(queued=True)
+        self.assertIsNotNone(handle, "first in line: its turn")
+        gd.release_evict_lock(handle)
+        gd.drop_evict_ticket()
+        self.assertFalse(mine.exists())
+        self.assertIsNone(gd._EVICT_TICKET)
+
+    def test_the_holder_yields_between_items_only_past_its_slice_with_a_waiter(self) -> None:
+        gd._EVICT_HANDLE, gd._EVICT_HALTS = object(), 0
+        gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "the first deletion's check never yields")
+        self.assertEqual(gd.evict_yield_halt(), "", "past the slice, but nobody waits")
+        self.ticket(1, self.sleeper().pid)
+        why = gd.evict_yield_halt()
+        self.assertTrue(why.startswith(gd.EVICT_YIELD_MARK), why)
+        self.assertEqual(gd.RUN["evict_yielded"], 1)
+        self.assertEqual(gd.evict_yield_halt(), gd.EVICT_YIELD_MARK, "once it yields, every later step stops")
+        self.assertEqual(gd.with_evict_yield(None)(), gd.EVICT_YIELD_MARK)
+        gd.RUN.clear()
+        gd._EVICT_HALTS, gd._EVICT_TAKEN_AT = 1, time.monotonic()
+        self.assertEqual(gd.evict_yield_halt(), "", "within its slice the holder keeps deleting")
+        self.assertEqual(gd.with_evict_yield(lambda: "busy host")(), "busy host", "the caller's halt still stops it")
+        gd._EVICT_RANK, gd._EVICT_TAKEN_AT = 0, time.monotonic() - gd.EVICT_SLICE_S - 1
+        self.assertEqual(gd.evict_yield_halt(), "", "a floor holder does not yield to a run the floor does not need")
+        self.ticket(0, self.sleeper().pid)
+        self.assertTrue(gd.evict_yield_halt().startswith(gd.EVICT_YIELD_MARK), "it yields to another floor run")
+        gd.RUN.clear()
+        gd._EVICT_HANDLE = None
+        self.assertEqual(gd.evict_yield_halt(), "", "after the release (the gc, the repacks) there is nothing to yield")
+
+    def test_only_a_bounded_run_waits_and_with_half_its_bound(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.RUN_DEADLINE_ENV, None)
+            self.assertEqual(gd.queue_wait_until(True), 0.0, "no bound: it skips at once, as before")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 100)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(15 < left <= 20, f"half of the 40 s left before the margin: {left}")
+            self.assertEqual(gd.queue_wait_until(False), 0.0)
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}):  # the LaunchAgent's
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(385 < left <= 390, f"half of its 780 s left: {left}")
+            self.assertGreater(left, gd.EVICT_SLICE_S, "still longer than a holder's slice")
+        with mock.patch.dict(os.environ, {gd.RUN_DEADLINE_ENV: repr(time.time() + 3600)}):
+            left = gd.queue_wait_until(True) - time.monotonic()
+            self.assertTrue(gd.EVICT_WAIT_FLOOR_S - 5 < left <= gd.EVICT_WAIT_FLOOR_S, f"capped: {left}")
+        self.assertGreater(gd.EVICT_WAIT_FLOOR_S, gd.EVICT_SLICE_S, "a waiter outlasts a holder's whole slice")
+
+    def test_a_launchagent_run_waits_its_turn_and_its_run_line_says_how_long(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "eviction_lock_is_held", side_effect=[True, True, False]), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual(row["skipped"], None, "it waited in the queue and ran instead of skipping")
+        self.assertEqual((row["evict_queue_position"], row["evict_floor_wait"]), (1, None))
+        self.assertIsInstance(row["evict_wait_s"], float)
+        self.assertIn("evict.lock queue: this run's turn came", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "its ticket is gone once served")
+        survey.assert_called()
+
+    def test_a_queued_run_whose_bound_runs_out_skips_as_busy_and_says_where_it_stood(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 60.2)}
+        with p_lock, p_pending, lock.open("a") as busy, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.01), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(busy, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["evict_queue_position"]), ("eviction_busy", 1))
+        self.assertIsNotNone(row["evict_wait_s"])
+        self.assertIn("wait in the queue (place 1) ended with it still evicting", self.said)
+        self.assertEqual(os.listdir(self.waiters), [], "a waiter that leaves takes its ticket with it")
+        survey.assert_not_called()
+
+    def test_a_newcomer_with_no_bound_does_not_take_a_free_lock_a_waiter_is_due(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        self.ticket(1, self.sleeper().pid)
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd.time, "sleep") as slept, \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"], rows[-1]["evict_wait_s"]), (0, "eviction_busy", None))
+        slept.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_bounded_waiter_behind_an_older_one_runs_once_that_one_is_gone(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        older = self.sleeper()
+        self.ticket(1, older.pid, age_s=1)
+        import threading
+        leave = threading.Timer(0.3, lambda: (older.kill(), older.wait()))
+        leave.start()
+        self.addCleanup(leave.cancel)
+        env = {gd.CALLER_ENV: "disk-pressure LaunchAgent", gd.RUN_DEADLINE_ENV: repr(time.time() + 840)}
+        with p_lock, p_pending, mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd, "EVICT_WAIT_POLL_S", 0.02), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        row = rows[-1]
+        self.assertEqual((status, row["skipped"], row["evict_queue_position"]), (0, None, 2))
+        self.assertGreaterEqual(row["evict_wait_s"], 0.2, "it waited for the older waiter, not just for the lock")
+        survey.assert_called()
+
+    def test_a_pass_yields_through_its_halt_and_says_so_for_the_hooks_bound(self) -> None:
+        _, _, p_lock, p_pending = self._queue()
+        seen = []
+
+        def reap(receipt, halt=None, **kw):  # a step main() hands its halt to after the families' deletions
+            gd._EVICT_TAKEN_AT = time.monotonic() - gd.EVICT_SLICE_S - 1
+            self.ticket(0, self.sleeper().pid)
+            seen.extend([halt(), halt()])
+            return 0
+        with p_lock, p_pending, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "saturation_halt", return_value=lambda: ""), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", side_effect=reap), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            for name in (gd.HOOK_PASS_ENV, gd.RUN_DEADLINE_ENV):
+                os.environ.pop(name, None)
+            status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(seen[0], "", "the first item always goes")
+        self.assertTrue(seen[1].startswith(gd.EVICT_YIELD_MARK), seen)
+        self.assertEqual(rows[-1]["evict_yielded"], 1)
+        self.assertIn(f"{gd.EVICT_YIELD_MARK}: 1 waiting", self.said)
+
+    def test_a_run_that_yielded_leaves_the_hooks_claimed_triggers_for_the_next_pass(self) -> None:
+        for yielded, kept in ((2, True), (None, False)):
+            with self.subTest(yielded=yielded):
+                claimed = self.root / "hook-pass.pending.claimed"
+                claimed.touch()
+                fd = os.open(self.root / "hook-pass.lock", os.O_RDWR | os.O_CREAT, 0o600)
+
+                def impl(args):
+                    gd.RUN["evict_yielded"] = yielded
+                    return 0
+                with mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), mock.patch.object(gd, "_HOOK_PASS_FD", fd), \
+                        mock.patch.object(gd, "_main_impl", side_effect=impl), \
+                        mock.patch.object(gd, "launch_background_census"), \
+                        mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}):
+                    self.assertEqual(gd._logged_main(["--pressure", "--apply"]), 0)
+                self.assertEqual(claimed.exists(), kept)
+
+    def test_the_hooks_bound_reads_the_same_queue_and_yield_words(self) -> None:
+        text = (ROOT / "scripts/glaeda-cmux-runner-hook").read_text()
+        self.assertIn(f'b"{gd.EVICT_YIELD_MARK}"', text, "DISK_BOUND keeps its trigger on this exact phrase")
+        self.assertIn(f'"{gd.EVICT_WAITERS}"', text, "DISK_BOUND looks for waiters where glaeda-disk puts them")
+        self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
+
+
+class LaneVmFamiliesTest(unittest.TestCase):
+    """A Linux lane VM's own scratch, one item per session or tree: a dead acpmux session's TMPDIR, an abandoned
+    /tmp/wt-* worktree and /tmp/bsz go once nothing holds them and nothing below changed for 6 h; a live, unknown,
+    open or recent one stays, and a dry run deletes nothing (a lane VM at 100%, 4.2 GB free of 495 GB, 0.0G
+    reclaimable in 141 GiB)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        self.saved = (gd.HOME, gd.DARWIN, gd.ROLE, gd._ACPMUX_ROWS, gd._SESSION_ENV)
+        gd.HOME, gd.DARWIN, gd.ROLE = self.home, False, "devbox"
+        gd._DISCOVERED.clear()
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        self.acpmux_home = self.home / ".acpmux"
+        self.acpmux_home.mkdir()
+        self.daemon = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "8ca84dc7"
+        self.daemon.mkdir(parents=True)
+        (self.daemon / ".home").write_text(str(self.acpmux_home))
+        other = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "b816f1eb"  # a test daemon's root: never ours
+        other.mkdir()
+        (other / ".home").write_text(str(self.base / "elsewhere/acpmux"))
+        self.rows: list[dict] | None = []
+        self.env_ids: tuple[frozenset[str], frozenset[str]] | None = (frozenset(), frozenset())
+        for name, fn in (("acpmux_rows", lambda fresh=False: self.rows),
+                         ("session_env", lambda fresh=False: self.env_ids)):
+            patcher = mock.patch.object(gd, name, side_effect=fn)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        envp = mock.patch.dict(os.environ, {"ACPMUX_HOME": str(self.acpmux_home)})
+        envp.start()
+        self.addCleanup(envp.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.DARWIN, gd.ROLE, gd._ACPMUX_ROWS, gd._SESSION_ENV = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    @staticmethod
+    def age(tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def session(self, sid: str, hours: float = 8.0) -> Path:
+        d = self.daemon / sid
+        out = d / "claude-1000/-home-x/abc/tasks"
+        out.mkdir(parents=True)
+        (out / "b1.output").write_bytes(b"o" * 4096)
+        self.age(d, hours)
+        return d
+
+    def lane(self, fid: str | None = None) -> list[gd.Family]:
+        return [f for f in gd.lane_vm_families(self.fake_tmp, os.getuid()) if fid is None or f.id == fid]
+
+    def acpmux_family(self) -> gd.Family:
+        fams = self.lane(gd.ACPMUX_SESSION_TMP)
+        self.assertEqual([f.root for f in fams], [self.daemon])  # only the root whose .home is ours
+        return fams[0]
+
+    def survey(self, fams: list[gd.Family], opened: list[str] | None = None, cmds: str = "") -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            # the pressure pass's window: max(0.5 h, the families' 6 h)
+            return {Path(i.path).name: i for i in gd.survey(fams, 0.5, 0)}
+
+    def apply(self, fams: list[gd.Family], items: list[gd.Item], opened: list[str] | None = None,
+              cmds: str = "", targets: dict[int, int] | None = None) -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)), \
+                mock.patch.object(gd, "command_lines", return_value=cmds or "ps"):
+            gd.apply(items, {f.id: f for f in fams}, receipt, targets, 0.5)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_a_dead_and_old_session_goes_and_live_unknown_or_recent_ones_stay(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        live = self.session("01a1e755-8220-725d-9347-29e5487b1770")
+        idle = self.session("01a1dbe9-997f-77e7-a6f1-87affeec5631")
+        unknown = self.session("01a1eed5-2368-7099-8c2d-b13b2ee2d8b2")
+        recent = self.session("01a1ed10-95d5-73d0-b783-fde207bce6cd")
+        # its top is old, but a task output five levels down was written an hour ago
+        os.utime(recent / "claude-1000/-home-x/abc/tasks/b1.output", (time.time() - 3600,) * 2)
+        self.rows = [
+            {"sessionId": dead.name, "status": "closed", "name": "restart-to-chat-fast", "cwd": "/home/x"},
+            {"sessionId": live.name, "status": "running", "name": "gh-budget-split", "cwd": "/home/x"},
+            {"sessionId": idle.name, "status": "idle", "name": "quiet", "cwd": "/home/x"},
+            {"sessionId": recent.name, "status": "closed", "name": "just-closed", "cwd": "/home/x"},
+        ]
+        fam = self.acpmux_family()
+        items = self.survey([fam])
+        self.assertEqual(items[dead.name].verdict, "reclaimable", items[dead.name].reasons)
+        self.assertEqual(items[live.name].verdict, "in-use")
+        self.assertIn("acpmux session gh-budget-split is running", items[live.name].reasons)
+        self.assertEqual(items[idle.name].verdict, "in-use")  # idle is alive: its next prompt resumes it
+        self.assertEqual(items[unknown.name].verdict, "in-use")
+        self.assertIn("a session acpmux does not list: liveness unknown", items[unknown.name].reasons)
+        self.assertEqual(items[recent.name].verdict, "recent")
+        self.assertGreaterEqual(items[dead.name].idle_hours, 7.9)
+        self.assertLess(items[recent.name].idle_hours, 1.1)
+        self.apply([fam], list(items.values()))
+        self.assertFalse(dead.exists())
+        for kept in (live, idle, unknown, recent):
+            self.assertTrue(kept.exists(), kept)
+        self.assertTrue((self.daemon / ".home").exists())  # the daemon's own marker is never an item
+
+    def test_a_dry_run_lists_the_plan_with_sizes_and_deletes_nothing(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        self.rows = [{"sessionId": dead.name, "status": "closed", "cwd": "/home/x"}]
+        wt = self.fake_tmp / "wt-rd"
+        (wt / "target").mkdir(parents=True)
+        (wt / "target/big").write_bytes(b"x" * 8192)
+        self.age(wt, 30)
+        fams = self.lane()
+        items = self.survey(fams)
+        self.assertEqual(items[dead.name].verdict, "reclaimable")
+        self.assertEqual(items["wt-rd"].verdict, "reclaimable", items["wt-rd"].reasons)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report(list(items.values()), [], 50, 0.5, fams={f.id: f for f in fams})
+        self.assertIn(str(dead), out.getvalue())
+        self.assertIn(str(wt), out.getvalue())
+        self.assertTrue(dead.exists())
+        self.assertTrue(wt.exists())
+        self.assertFalse((self.home / ".receipt.jsonl").exists())
+
+    def wt_checkout(self, name: str, hours: float, tagged: bool = True, repo: str = "cmux") -> Path:
+        checkout = self.home / ".wt/checkouts" / repo / name
+        (checkout / "src").mkdir(parents=True)
+        (checkout / ".git").write_text("gitdir: /nowhere\n")
+        (checkout / "src/main.rs").write_text("fn main() {}\n")
+        target = checkout / "cmux-tui/target"
+        (target / "debug/deps").mkdir(parents=True)
+        (target / "debug/deps/libbig.rlib").write_bytes(b"x" * 8192)
+        if tagged:
+            (target / "CACHEDIR.TAG").write_bytes(
+                gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n")
+        self.age(checkout, hours)
+        return checkout
+
+    def test_an_idle_wt_worktrees_cargo_target_goes_and_a_live_worktrees_stays(self) -> None:
+        # fs-agent-lane-2, 2026-11-22: 178G under ~/.wt that no family reached ("unwalked"), 0 B reclaimable
+        idle = self.wt_checkout("lane--idle", 8)
+        opened = self.wt_checkout("lane--open", 8)
+        session = self.wt_checkout("lane--session", 8)
+        named = self.wt_checkout("lane--named", 8)
+        recent = self.wt_checkout("lane--recent", 1)
+        untagged = self.wt_checkout("lane--untagged", 8, tagged=False)
+        spare = self.wt_checkout(".wt-spare-abc", 8)
+        self.rows = [{"sessionId": "s1", "status": "idle", "name": "lane-session", "cwd": str(session / "src")}]
+        fams = self.lane(gd.WT_CARGO_TARGET)
+        self.assertEqual(len(fams), 1)
+        targets = gd.wt_cargo_targets(fams[0].root)
+        self.assertEqual(sorted(targets), sorted(c / "cmux-tui/target" for c in (idle, opened, session, named, recent)))
+        self.assertNotIn(untagged / "cmux-tui/target", targets)
+        self.assertNotIn(spare / "cmux-tui/target", targets)
+        cmds = f"cargo test --manifest-path {named}/cmux-tui/Cargo.toml"
+        with mock.patch.object(gd, "process_evidence", return_value=([str(opened / "src")], cmds)):
+            items = {Path(i.path).parent.parent.name: i for i in gd.survey(fams, 0.5, 0)}
+        self.assertEqual(items["lane--idle"].verdict, "reclaimable", items["lane--idle"].reasons)
+        self.assertEqual(items["lane--open"].verdict, "in-use")
+        self.assertIn("its worktree is open by a process (cwd or open file)", items["lane--open"].reasons)
+        self.assertEqual(items["lane--session"].verdict, "in-use")
+        self.assertIn("the cwd of open acpmux session lane-session", items["lane--session"].reasons)
+        self.assertEqual(items["lane--named"].verdict, "in-use")
+        self.assertIn("its worktree is named by a running command", items["lane--named"].reasons)
+        self.assertEqual(items["lane--recent"].verdict, "recent")
+        self.apply(fams, list(items.values()), [str(opened / "src")], cmds)
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertTrue((idle / "src/main.rs").exists())  # the worktree, its sources and git stay
+        self.assertTrue((idle / ".git").exists())
+        for kept in (opened, session, named, recent):
+            self.assertTrue((kept / "cmux-tui/target").exists(), kept)
+
+    def test_an_unreadable_session_list_or_process_table_keeps_every_session(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        fam = self.acpmux_family()
+        self.rows = None
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertTrue(any(r.startswith("acpmux session list unreadable: liveness unknown (") for r in item.reasons),
+                        item.reasons)
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        self.env_ids = None
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "in-use")
+        self.assertIn("process environments unreadable: liveness unknown", item.reasons)
+        self.assertTrue(dead.exists())
+
+    def test_a_closed_session_whose_process_still_runs_stays(self) -> None:
+        by_env = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        by_tmpdir = self.session("01a1c350-4f01-74c1-9295-f7e4b811ee44")
+        by_cmd = self.session("01a1d758-6831-7544-9381-9fd12e523a82")
+        by_file = self.session("01a1ddee-d636-772d-9bab-75e3316f7af2")
+        self.rows = [{"sessionId": d.name, "status": "closed"} for d in (by_env, by_tmpdir, by_cmd, by_file)]
+        self.env_ids = (frozenset({by_env.name}), frozenset({str(by_tmpdir)}))
+        fam = self.acpmux_family()
+        opened = [str(by_file / "claude-1000/-home-x/abc/tasks/b1.output")]
+        items = self.survey([fam], opened=opened, cmds=f"claude --resume {by_cmd.name}\n")
+        self.assertIn("a running process belongs to the session (ACPMUX_SESSION_ID)", items[by_env.name].reasons)
+        self.assertIn("a running process's TMPDIR is in it", items[by_tmpdir.name].reasons)
+        self.assertIn("a running command names its session id", items[by_cmd.name].reasons)
+        self.assertIn("open by a process", items[by_file.name].reasons)
+        self.assertEqual({i.verdict for i in items.values()}, {"in-use"})
+
+    def test_apply_reads_liveness_again_before_each_delete(self) -> None:
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        fam = self.acpmux_family()
+        items = self.survey([fam])
+        self.assertEqual(items[dead.name].verdict, "reclaimable")
+        self.rows = [{"sessionId": dead.name, "status": "running"}]  # resumed since the survey
+        receipt = self.apply([fam], list(items.values()))
+        self.assertTrue(dead.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_a_closed_sessions_folder_goes_whole_as_acpmux_purges_it(self) -> None:
+        # a lane VM's closed sessions held test fixtures no bundle can hold: an empty `git init` with files in it
+        dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
+        repo = dead / "autoland-web-subareas-3736ej4a/repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        self.age(dead, 8)
+        self.rows = [{"sessionId": dead.name, "status": "closed"}]
+        fam = self.acpmux_family()
+        item = self.survey([fam])[dead.name]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply([fam], [item])
+        self.assertFalse(dead.exists())
+
+    def test_a_worktree_or_bsz_clone_with_unpushed_work_is_bundled_first(self) -> None:
+        bsz = self.fake_tmp / "bsz"
+        repo = bsz / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "only here"], check=True, env=self.env)
+        self.age(bsz, 8)
+        fams = self.lane(gd.TMP_BSZ)
+        item = self.survey(fams)["bsz"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(bsz.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def test_tmp_worktrees_go_when_idle_and_unheld_and_are_pruned_from_their_repository(self) -> None:
+        origin = self.base / "origin"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True, env=self.env)
+        (origin / "f").write_text("x")
+        subprocess.run(["git", "-C", str(origin), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(origin), "commit", "-qm", "c"], check=True, env=self.env)
+        trees = {}
+        for name in ("wt-rd", "wt-cwd", "wt-session", "wt-fresh"):
+            trees[name] = self.fake_tmp / name
+            subprocess.run(["git", "-C", str(origin), "worktree", "add", "-q", "-b", name, str(trees[name])],
+                           check=True, env=self.env)
+            (trees[name] / "target/debug").mkdir(parents=True)
+            (trees[name] / "target/debug/big").write_bytes(b"x" * 8192)
+            self.age(trees[name], 30)
+        os.utime(trees["wt-fresh"] / "target/debug/big", (time.time() - 600,) * 2)  # a build ten minutes ago
+        self.rows = [{"sessionId": "s", "status": "idle", "name": "lane-a", "cwd": str(trees["wt-session"] / "sub")}]
+        fams = self.lane(gd.TMP_WORKTREES)
+        items = self.survey(fams, opened=[str(trees["wt-cwd"])])
+        self.assertEqual(items["wt-rd"].verdict, "reclaimable", items["wt-rd"].reasons)
+        self.assertEqual(items["wt-cwd"].verdict, "in-use")
+        self.assertEqual(items["wt-session"].verdict, "in-use")
+        self.assertIn("the cwd of open acpmux session lane-a", items["wt-session"].reasons)
+        self.assertIn(items["wt-fresh"].verdict, ("recent", "git-checkout"))  # young: not due, so never reclaimable
+        self.apply(fams, list(items.values()), opened=[str(trees["wt-cwd"])])
+        self.assertFalse(trees["wt-rd"].exists())
+        for name in ("wt-cwd", "wt-session", "wt-fresh"):
+            self.assertTrue(trees[name].exists(), name)
+        listed = subprocess.run(["git", "-C", str(origin), "worktree", "list", "--porcelain"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertNotIn(str(trees["wt-rd"]), listed)  # pruned from its repository
+        refs = subprocess.run(["git", "-C", str(origin), "for-each-ref"], capture_output=True, text=True,
+                              check=True).stdout
+        self.assertIn("refs/heads/wt-rd", refs)  # its branch stays
+
+    def test_bsz_goes_by_age_and_no_open_file(self) -> None:
+        bsz = self.fake_tmp / "bsz"
+        (bsz / "tools").mkdir(parents=True)
+        (bsz / "tools/symmap.py").write_text("print(1)")
+        (bsz / "syms.txt").write_bytes(b"s" * 8192)
+        self.age(bsz, 30)
+        fams = self.lane(gd.TMP_BSZ)
+        self.assertEqual(self.survey(fams, opened=[str(bsz / "syms.txt")])["bsz"].verdict, "in-use")
+        self.assertEqual(self.survey(fams, cmds=f"python3 {bsz}/tools/symmap.py\n")["bsz"].verdict, "in-use")
+        item = self.survey(fams)["bsz"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(bsz.exists())
+
+    def test_never_delete_paths_and_another_daemons_root_are_never_items(self) -> None:
+        for name in ("wt-chromium", "wt-cmux-browser-fleet", "bsz-depot_tools"):
+            (self.fake_tmp / name).mkdir()
+            self.age(self.fake_tmp / name, 30)
+        other = self.fake_tmp / f"acpmux-{os.getuid()}" / "t" / "b816f1eb" / "01a1eefa-23f5-7346-99e8-ed3e7c5b03ba"
+        other.mkdir()
+        self.age(other, 30)
+        self.rows = [{"sessionId": other.name, "status": "closed"}]
+        self.assertEqual([p for f in self.lane() for p in gd.candidates(f)], [])
+
+    def test_the_tmp_family_leaves_these_trees_to_their_own_families_on_linux(self) -> None:
+        with mock.patch.object(gd, "acpmux_daemon_roots", return_value=[]):
+            fams = {f.id: f for f in gd.default_families("devbox")}
+        tmp = fams["tmp"]
+        self.assertIn(f"acpmux-{os.getuid()}", tmp.skip)
+        self.assertEqual(sorted(tmp.skip_prefixes), ["bsz", "wt-"])
+        self.assertIn(gd.TMP_WORKTREES, fams)
+        self.assertIn(gd.TMP_BSZ, fams)
+        if "claude-scratchpad" in fams:  # only where /tmp/claude-<uid> exists
+            self.assertTrue(fams["claude-scratchpad"].deep_mtime)
+            self.assertEqual(fams["claude-scratchpad"].min_idle_hours, gd.LANE_SESSION_IDLE_HOURS)
+        gd.DARWIN = True
+        with mock.patch.object(gd, "darwin_user_tmp", return_value=None), \
+                mock.patch.object(gd, "darwin_code_sign_clones", return_value=None):
+            mac = {f.id: f for f in gd.default_families("devbox")}
+        self.assertNotIn(gd.TMP_WORKTREES, mac)  # a Mac's /tmp keeps its old rules
+        self.assertNotIn(gd.TMP_BSZ, mac)
+
+    def test_a_claude_scratch_folder_of_a_live_acpmux_session_stays(self) -> None:
+        root = self.fake_tmp / f"claude-{os.getuid()}"
+        live = root / "-home-x" / "01a1e755-8234-76eb-8439-d16cefbe14fa"
+        dead = root / "-home-x" / "11111111-d130-4269-bec8-dfbd1005913a"
+        for d in (live, dead):
+            (d / "tasks").mkdir(parents=True)
+            (d / "tasks/b.output").write_bytes(b"o" * 4096)
+        self.age(root, 30)
+        self.rows = [{"sessionId": "01a1e755-8220-725d-9347-29e5487b1770", "agentSessionId": live.name,
+                      "status": "ready", "name": "gh-budget-split"},
+                     {"sessionId": "01a1d212-4250-7272-94b4-33a324d4aed3", "agentSessionId": dead.name,
+                      "status": "closed"}]
+        fam = gd.Family("claude-scratchpad", root, True, "scratch", depth=2, git_disposable=True, nested_git=True,
+                        min_idle_hours=gd.LANE_SESSION_IDLE_HOURS, mirror_idle_hours=gd.LANE_SESSION_IDLE_HOURS,
+                        deep_mtime=True)
+        with mock.patch.object(gd, "claude_session_active", return_value=False):
+            items = self.survey([fam])
+        self.assertEqual(items[live.name].verdict, "in-use")
+        self.assertEqual(items[dead.name].verdict, "reclaimable", items[dead.name].reasons)
+
+    def test_deep_mtime_reads_a_walk_it_cannot_finish_as_now(self) -> None:
+        tree = self.fake_tmp / "deep"
+        (tree / "a/b/c/d/e").mkdir(parents=True)
+        (tree / "a/b/c/d/e/f").write_text("x")
+        self.age(tree, 30)
+        self.assertLess(gd.deep_newest_mtime(tree), time.time() - 29 * 3600)
+        self.assertGreater(gd.deep_newest_mtime(tree, budget=3), time.time() - 60)
+        os.utime(tree / "a/b/c/d/e/f", (time.time(),) * 2)
+        self.assertGreater(gd.deep_newest_mtime(tree), time.time() - 60)
+
+    def test_pressure_takes_the_least_recently_modified_first_and_stops_at_the_target(self) -> None:
+        older = self.session("01a1c350-4f01-74c1-9295-f7e4b811ee44", hours=90)
+        newer = self.session("01a1d212-4250-7272-94b4-33a324d4aed3", hours=10)
+        self.rows = [{"sessionId": d.name, "status": "closed"} for d in (older, newer)]
+        fam = self.acpmux_family()
+        items = list(self.survey([fam]).values())
+        self.assertEqual({i.verdict for i in items}, {"reclaimable"})
+        dev = self.daemon.stat().st_dev
+        # free reaches the target once one item is gone
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda p: (0 if older.exists() and newer.exists()
+                                                                        else 1, 1)):
+            self.apply([fam], items, targets={dev: 1})
+        self.assertFalse(older.exists())  # least recently modified first
+        self.assertTrue(newer.exists())  # and the pass stopped at the target
+
+    def home_tree(self, name: str, entry: str, hours: float, size: int = 8192) -> Path:
+        p = self.home / name / entry
+        p.mkdir(parents=True)
+        (p / "blob").write_bytes(b"x" * size)
+        self.age(p, hours)
+        return p
+
+    def test_lab_trees_and_builder_output_in_home_go_by_age_and_no_holder(self) -> None:
+        old_tmp = self.home_tree("lab-tmp", "run-a", 8)
+        new_tmp = self.home_tree("lab-tmp", "run-b", 1)
+        held = self.home_tree("lab-tmp", "run-c", 8)
+        target = self.home_tree("lab-target", "debug", 8)
+        (target.parent / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55")
+        data = self.home_tree("lab-data", "set", 8)
+        tag = self.home_tree("out", "nightly-linux", 8)
+        envargs = self.home / "out/nightly-linux.envargs"
+        envargs.write_text("-e X=1\n")
+        work = self.home_tree("out", ".work", 80)  # worktree_reclaim's pressure cache: never ours
+        self.age(envargs, 8)
+        fams = self.lane()
+        self.assertTrue(gd.LANE_HOME_FAMILY_IDS <= {f.id for f in fams})
+        self.assertTrue(all(f.id in gd.SESSION_HOLD_FAMILY_IDS for f in fams if f.id in gd.LANE_HOME_FAMILY_IDS))
+        items = self.survey(fams, opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertEqual(items[p.name].verdict, "reclaimable", (p, items[p.name].reasons))
+        self.assertEqual(items[new_tmp.name].verdict, "recent")
+        self.assertEqual(items[held.name].verdict, "in-use")
+        self.assertNotIn(".work", items)
+        self.assertNotIn("CACHEDIR.TAG", [n for n, i in items.items() if i.verdict == "reclaimable"])
+        self.apply(fams, list(items.values()), opened=[str(held / "blob")])
+        for p in (old_tmp, target, data, tag, envargs):
+            self.assertFalse(p.exists(), p)
+        for p in (new_tmp, held, work):
+            self.assertTrue(p.exists(), p)
+
+    def test_a_lab_tree_held_by_a_live_session_or_process_env_stays(self) -> None:
+        cwd = self.home_tree("lab-tmp", "lane-cwd", 30)
+        envd = self.home_tree("lab-tmp", "lane-env", 30)
+        self.rows = [{"sessionId": "s", "status": "ready", "name": "lab-lane", "cwd": str(cwd / "sub")}]
+        self.env_ids = (frozenset(), frozenset({str(envd / "t")}))
+        items = self.survey(self.lane("home-lab-tmp"))
+        self.assertIn("the cwd of open acpmux session lab-lane", items[cwd.name].reasons)
+        self.assertIn("a running process's TMPDIR is in it", items[envd.name].reasons)
+        self.rows = None
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 2: daemon socket not found"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        reasons = self.survey(self.lane("home-lab-tmp"))[cwd.name].reasons
+        self.assertIn("acpmux session list unreadable: liveness unknown "
+                      "(`acpmux ls` exited 2: daemon socket not found)", reasons)
+
+    def test_git_work_in_a_lab_tree_waits_12_hours_and_is_archived_first(self) -> None:
+        repo = self.home / "lab-data/repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "only here"], check=True, env=self.env)
+        self.age(repo, 8)
+        fams = self.lane("home-lab-data")
+        self.assertNotEqual(self.survey(fams)["repo"].verdict, "reclaimable")  # 8 h: under the 12 h git-work rule
+        self.age(repo, 13)
+        item = self.survey(fams)["repo"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(repo.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
+
+    def wt_mirror(self, where: Path) -> Path:
+        """A bare mirror the way `wt` lays one out (.wt-mirrors/<owner>/<repo>.git), with one commit on main."""
+        src = self.base / "src"
+        if not src.exists():
+            subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True, env=self.env)
+            (src / "f").write_text("x")
+            subprocess.run(["git", "-C", str(src), "add", "f"], check=True, env=self.env)
+            subprocess.run(["git", "-C", str(src), "commit", "-qm", "c"], check=True, env=self.env)
+        mirror = where / ".wt-mirrors/manaflow-ai/cmux.git"
+        mirror.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", str(src), str(mirror)], check=True, env=self.env)
+        return mirror
+
+    def test_a_mirror_with_a_linked_worktree_outside_keeps_the_whole_item_on_every_path(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        checkout = self.home / "Projects/checkouts/cmux/lane--base-red-next-checks"
+        checkout.parent.mkdir(parents=True)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "lane/x", str(checkout)],
+                       check=True, env=self.env)
+        self.age(wt, 30)
+        fams = self.lane(gd.TMP_WORKTREES)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        why = next(r for r in item.reasons if r.startswith("a repository in it is used from outside"))
+        self.assertIn(str(checkout), why)
+        self.assertNotIn("its checkouts are mirrors", " ".join(item.reasons))
+        # an item judged reclaimable earlier is still kept by apply's fresh check
+        stale = gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None, item.platform)
+        self.apply(fams, [stale])
+        self.assertTrue(mirror.is_dir())
+        self.assertTrue((checkout / "f").exists())
+        # the same mirror once its outside worktree is gone (and pruned) goes
+        subprocess.run(["git", "-C", str(mirror), "worktree", "remove", "--force", str(checkout)], check=True,
+                       env=self.env)
+        self.age(wt, 30)
+        item = self.survey(fams)["wt-rd"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.apply(fams, [item])
+        self.assertFalse(wt.exists())
+
+    def test_a_record_naming_a_tree_inside_the_item_or_one_that_is_gone_does_not_hold_it(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "in", str(wt / "inside")],
+                       check=True, env=self.env)
+        gone = self.base / "gone-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "gone", str(gone)],
+                       check=True, env=self.env)
+        shutil.rmtree(gone)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_an_alternates_user_outside_keeps_the_item(self) -> None:
+        wt = self.fake_tmp / "wt-rd"
+        mirror = self.wt_mirror(wt)
+        user = self.home / "Projects/checkouts/cmux/lane--borrower"
+        subprocess.run(["git", "clone", "-q", "--shared", str(mirror), str(user)], check=True, env=self.env)
+        self.assertTrue((user / ".git/objects/info/alternates").exists())
+        why = gd.git_used_from_outside(wt, fresh=True)
+        self.assertIn(f"{user} (a checkout borrows its objects (alternates))", why)
+        other = self.home / "Projects/.wt-mirrors/o/borrower.git"
+        other.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", "--bare", "--shared", str(mirror), str(other)], check=True, env=self.env)
+        shutil.rmtree(user)
+        self.assertIn(f"{other} (a wt mirror borrows its objects (alternates))", gd.git_used_from_outside(wt, fresh=True))
+        shutil.rmtree(other)
+        self.assertEqual(gd.git_used_from_outside(wt, fresh=True), "")
+
+    def test_a_closed_sessions_tmpdir_holding_a_used_mirror_is_kept_despite_its_plain_delete(self) -> None:
+        sid = "01a1d212-4250-7272-94b4-33a324d4aed3"
+        d = self.session(sid)
+        mirror = self.wt_mirror(d)
+        outside = self.base / "outside-tree"
+        subprocess.run(["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "o", str(outside)],
+                       check=True, env=self.env)
+        self.age(d, 30)
+        self.rows = [{"sessionId": sid, "status": "closed"}]
+        fam = self.acpmux_family()
+        item = self.survey([fam])[sid]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        self.apply([fam], [gd.Item(item.family, item.path, item.bytes, item.idle_hours, "reclaimable", [], None,
+                                   item.platform)])
+        self.assertTrue(mirror.is_dir())
+
+    def test_a_walk_too_large_to_finish_keeps_the_item(self) -> None:
+        tree = self.fake_tmp / "bsz"
+        (tree / "a").mkdir(parents=True)
+        for n in range(5):
+            (tree / "a" / str(n)).write_text("x")
+        self.assertIn("too large", gd.git_used_from_outside(tree, fresh=True, budget=3))
+
+    def test_no_home_family_for_a_tree_that_is_missing_or_a_link(self) -> None:
+        (self.home / "lab-tmp").symlink_to(self.base)
+        ids = {f.id for f in self.lane()}
+        self.assertFalse(ids & gd.LANE_HOME_FAMILY_IDS)
+
+
+class AcpmuxListOverReachTest(unittest.TestCase):
+    """`reach HOST 'glaeda-disk ...'` is a non-interactive ssh shell: PATH /usr/bin:/bin, no acpmux relay. There
+    acpmux printed "other machines' sessions are not listed: cannot run the relay listing" on stderr, the reader took
+    stderr with stdout, its JSON failed to parse, and every lane VM item came out "acpmux session list unreadable"
+    (gcp-agent-lane-2, 2026-11-18: /tmp/bsz and /tmp/wt-rd, 0 reclaimable)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR)
+        gd.HOME = self.home
+        gd._ACPMUX_ROWS = False
+        self.bin = self.home / ".local/bin"
+        self.bin.mkdir(parents=True)
+        (self.home / ".acpmux").mkdir()
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home)}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS, gd.ACPMUX_ROWS_ERROR = self.saved
+        self.tmp.cleanup()
+
+    def fake_acpmux(self, body: str) -> Path:
+        exe = self.bin / "acpmux"
+        exe.write_text("#!/bin/sh\n" + body)
+        exe.chmod(0o755)
+        return exe
+
+    def test_a_relay_warning_on_stderr_does_not_spoil_the_list(self) -> None:
+        argv_log = self.home / "argv"
+        self.fake_acpmux(f'echo "$@" > {argv_log}\n'
+                         'echo "acpmux: other machines\' sessions are not listed: cannot run the relay '
+                         'listing \\"lane-gh\\"" >&2\n'
+                         'echo \'{"sessions": [{"sessionId": "a", "status": "closed", "peer": null},'
+                         ' {"sessionId": "b", "status": "ready", "peer": "huge-blue"}]}\'\n')
+        self.assertIsNone(shutil.which("acpmux"))  # not on the bare PATH: found in ~/.local/bin
+        rows = gd.acpmux_rows(fresh=True)
+        self.assertEqual(rows, [{"sessionId": "a", "status": "closed", "peer": None}])  # no peer's rows
+        self.assertEqual(gd.ACPMUX_ROWS_ERROR, "")
+        self.assertIn("--machine local", argv_log.read_text())
+
+    def test_a_failed_list_names_the_command_its_exit_code_and_stderr(self) -> None:
+        exe = self.fake_acpmux('echo "acpmux: cannot reach the daemon at /x/acpmux.sock" >&2\nexit 3\n')
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn(f"`{exe} ls --json --machine local", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("exited 3: acpmux: cannot reach the daemon at /x/acpmux.sock", gd.ACPMUX_ROWS_ERROR)
+        self.fake_acpmux("echo not json\n")
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("printed no JSON", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn("not json", gd.ACPMUX_ROWS_ERROR)
+
+    def test_no_program_anywhere_is_named_with_where_it_looked(self) -> None:
+        self.assertIsNone(gd.acpmux_rows(fresh=True))
+        self.assertIn("no acpmux program on PATH (/usr/bin:/bin)", gd.ACPMUX_ROWS_ERROR)
+        self.assertIn(str(self.bin / "acpmux"), gd.ACPMUX_ROWS_ERROR)
+        shutil.rmtree(self.home / ".acpmux")
+        self.assertEqual(gd.acpmux_rows(fresh=True), [])  # acpmux not used here: nothing to keep for it
+
+    def test_acpmux_bin_wins_over_path(self) -> None:
+        named = self.home / "named-acpmux"
+        named.write_text("#!/bin/sh\necho '{\"sessions\": []}'\n")
+        named.chmod(0o755)
+        with mock.patch.dict(os.environ, {"ACPMUX_BIN": str(named)}):
+            self.assertEqual(gd.acpmux_exe(), str(named))
+            self.assertEqual(gd.acpmux_rows(fresh=True), [])
+
+
+class OwnedElsewhereTest(unittest.TestCase):
+    """What other tools own on a Linux lane VM is named with its size, the owner's reasons and its commands, and
+    glaeda-disk deletes nothing there (a lane VM, 2026-11-18: ~/Projects/checkouts 104.6G and ~/.acpmux 56.5G kept with
+    no word on who frees them)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd._ACPMUX_ROWS)
+        gd.HOME = self.home
+        state = self.home / gd.WORKTREE_RECLAIM_STATE_REL
+        state.mkdir(parents=True)
+        gib = 1 << 30
+        (state / "checkout-keep-report.json").write_text(json.dumps({"at": time.time() - 1800, "rows": [
+            {"path": "a", "bytes": 11 * gib, "reasons": ["wt reclaim: owner liveness unknown here"]},
+            {"path": "b", "bytes": 9 * gib, "reasons": ["wt reclaim: owner liveness unknown here; 1 dirty files"]},
+            {"path": "c", "bytes": 2 * gib, "reasons": ["wt reclaim: owner session is running; live owner"]},
+        ], "total_bytes": 22 * gib}))
+        (state / "log.jsonl").write_text(
+            json.dumps({"kind": "summary", "mode": "pressure", "at": "2026-11-18T19:51:33+0000", "freed_gb": 0.0}) + "\n"
+            + json.dumps({"kind": "pressure_build", "path": "x"}) + "\n")
+        tool = self.home / gd.WORKTREE_RECLAIM_TOOL_REL
+        tool.parent.mkdir(parents=True)
+        tool.write_text("")
+        self.store = self.home / ".acpmux/sessions"
+        for sid in ("01a1d212-4250-7272-94b4-33a324d4aed3", "01a1e755-8220-725d-9347-29e5487b1770"):
+            (self.store / sid / "events").mkdir(parents=True)
+            (self.store / sid / "events/0").write_bytes(b"e" * 65536)
+        envp = mock.patch.dict(os.environ, {"ACPMUX_HOME": str(self.home / ".acpmux")})
+        envp.start()
+        self.addCleanup(envp.stop)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd._ACPMUX_ROWS = self.saved
+        self.tmp.cleanup()
+
+    def test_it_names_what_the_checkout_and_acpmux_reclaimers_keep_and_how_to_run_them(self) -> None:
+        rows = [{"sessionId": "01a1d212-4250-7272-94b4-33a324d4aed3", "status": "closed"},
+                {"sessionId": "01a1e755-8220-725d-9347-29e5487b1770", "status": "running"}]
+        with mock.patch.object(gd, "acpmux_rows", return_value=rows):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("keep 22.0G in 3 (their keep report, 0.5h old)", text)
+        self.assertRegex(text, r"20\.0G\s+2\s+wt reclaim: owner liveness unknown here\n")
+        self.assertIn("worktree_reclaim's last pass: pressure at 2026-11-18T19:51:33+0000, freed 0.0 GB", text)
+        self.assertIn(f"acpmux store {self.store}: 1 closed sessions hold", text)
+        self.assertIn("acpmux_store_reclaim takes only", text)
+        self.assertIn("dry run: python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py plan", text)
+        self.assertIn("apply:   python3 ~/Projects/leo-workspace/tools/worktree_reclaim.py pressure", text)
+        self.assertTrue(all(p.exists() for p in self.store.iterdir()))  # report only
+
+    def test_a_pass_skipped_for_the_lock_says_it_did_not_run_beside_the_last_that_ran(self) -> None:
+        log = self.home / gd.WORKTREE_RECLAIM_STATE_REL / "log.jsonl"
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"kind": "summary", "mode": "pressure", "at": "2026-11-21T21:40:00+0000",
+                                 "skipped": "locked", "ran": False,
+                                 "why": "did not run: the cleaner lock is held by pid 7 (disk_hygiene.py run)"}) + "\n")
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("worktree_reclaim's last attempt: pressure at 2026-11-21T21:40:00+0000 did not run (did not run: "
+                      "the cleaner lock is held by pid 7 (disk_hygiene.py run)); the last pass that ran: pressure at "
+                      "2026-11-18T19:51:33+0000, freed 0.0 GB", text)
+        self.assertNotIn("(locked)", text)
+        log.write_text(json.dumps({"kind": "summary", "mode": "pressure", "at": "T", "skipped": "locked"}) + "\n")
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("did not run (skipped: locked); no pass that ran in the log's last 1 MiB", text)
+
+    def test_an_unreadable_session_list_is_named_not_guessed(self) -> None:
+        gd.ACPMUX_ROWS_ERROR = "`acpmux ls` exited 3: no daemon"
+        self.addCleanup(setattr, gd, "ACPMUX_ROWS_ERROR", "")
+        with mock.patch.object(gd, "acpmux_rows", return_value=None):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("its closed sessions are unknown: `acpmux ls` exited 3: no daemon", text)
+
+    def test_a_supervised_store_is_acpmux_store_reclaims(self) -> None:
+        sup = self.home / ".acpmux-supervised"
+        sup.mkdir()
+        with mock.patch.dict(os.environ, {"ACPMUX_HOME": str(sup)}):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("acpmux_store_reclaim archives and purges its closed sessions", text)
+
+    def test_no_keep_report_says_who_writes_it(self) -> None:
+        (self.home / gd.WORKTREE_RECLAIM_STATE_REL / "checkout-keep-report.json").unlink()
+        with mock.patch.object(gd, "acpmux_rows", return_value=[]):
+            text = "\n".join(gd.owned_elsewhere_lines())
+        self.assertIn("no keep report (hygiene_reconciler writes", text)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads every folder")
+    def test_an_unreadable_census_row_says_who_owns_what_it_could_not_read(self) -> None:
+        tree = self.home / "lane-scratch"
+        (tree / "x/locked").mkdir(parents=True)
+        me = gd.pwd_name(os.getuid())
+        try:
+            (tree / "x/locked").chmod(0)
+            why = gd.unreadable_why(str(tree))
+            self.assertIn(f"{tree}/x/locked is owned by {me}, mode 0000", why)
+            tree.chmod(0)
+            self.assertEqual(gd.unreadable_why(str(tree)), f"owned by {me}, mode 0000")
+            row = gd.census_coverage_row({"complete": True, "at": 0, "rows": {str(tree): [5, "unreadable", False]}})
+            self.assertEqual(row["children"][0]["why"], f"owned by {me}, mode 0000")
+        finally:
+            tree.chmod(0o755)
+            (tree / "x/locked").chmod(0o755)
+        self.assertIn("cannot stat", gd.unreadable_why(str(self.home / "gone")))
+
+
+
+class QueuedDiskWantTest(unittest.TestCase):
+    """QUEUED_WANT: the fleet worker's live fleet-disk.want-<pid> markers set the pressure target."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cap = Path(self.tmp.name)
+
+    def write(self, pid: int, body: object, age: float = 0.0, name: str | None = None) -> Path:
+        marker = self.cap / (name or f"fleet-disk.want-{pid}")
+        marker.write_text(body if isinstance(body, str) else json.dumps(body))
+        if age:
+            at = time.time() - age
+            os.utime(marker, (at, at))
+        return marker
+
+    def test_largest_live_fresh_want(self) -> None:
+        self.write(os.getpid(), {"schema": "cmux-fleet-disk-want/v1", "since": 1, "want_bytes": 30 * gd.GIB})
+        self.write(os.getppid(), {"since": 1, "want_bytes": 50 * gd.GIB})
+        self.assertEqual(gd.queued_disk_want(self.cap), 50 * gd.GIB)
+
+    def test_stale_dead_and_malformed_markers_are_no_want(self) -> None:
+        self.write(os.getpid(), {"since": 1, "want_bytes": 90 * gd.GIB}, age=gd.QUEUED_WANT_FRESH_S + 5)
+        self.write(2 ** 31 - 2, {"since": 1, "want_bytes": 80 * gd.GIB})  # no such process
+        self.write(os.getppid(), {"since": 1, "want_bytes": True})
+        self.write(0, {"want_bytes": 70 * gd.GIB}, name=f"fleet-disk.want-{os.getpid()}.tmp")
+        self.write(0, "not json", name="fleet-disk.want-x")
+        self.assertEqual(gd.queued_disk_want(self.cap), 0)
+        self.assertEqual(gd.queued_disk_want(self.cap / "missing"), 0)
+
+
+class StaleTmpScratchTest(unittest.TestCase):
+    """Top-level /tmp scratch no class owns (Leo, 2026-11-21: "evict stale scratch dirs: /tmp entries older than N h
+    that no live process holds open or has as its cwd"): a stale, unheld tree goes; a fresh one, one a process has
+    as its cwd or holds an open fd in, one whose holders cannot all be read, and a protected name stay."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        saved = (gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS,
+                 gd._SUDO_READS, gd.NESTED_KEEP)
+        gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME = self.home, False, "devbox", False
+        gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd._SUDO_READS = True, None, False
+        gd.NESTED_KEEP = self.home / ".nested-keep.json"
+        gd._DISCOVERED.clear()
+
+        def restore() -> None:
+            (gd.HOME, gd.DARWIN, gd.ROLE, gd.STALE_TMP_CTIME, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS,
+             gd._SUDO_READS, gd.NESTED_KEEP) = saved
+            gd._DISCOVERED.clear()
+        self.addCleanup(restore)
+        self.addCleanup(self.tmp.cleanup)
+        # the holder proof reads only this test process's /proc entry: every other process is out of scope here
+        real = gd.proc_links
+        patcher = mock.patch.object(gd, "proc_links", side_effect=lambda proc="/proc", only=None:
+                                    real(proc, only={os.getpid()}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def age(tree: Path, hours: float) -> None:
+        t = time.time() - hours * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+
+    def scratch(self, name: str, hours: float = 19.0) -> Path:
+        d = self.fake_tmp / name
+        (d / "deep/er").mkdir(parents=True)
+        (d / "deep/er/blob").write_bytes(b"x" * (2 * 1024 * 1024))
+        self.age(d, hours)
+        return d
+
+    def families(self) -> list[gd.Family]:
+        fams = [f for f in gd.default_families("devbox") if f.id in ("tmp", gd.STALE_TMP_SCRATCH)]
+        return [replace(f, root=self.fake_tmp) for f in fams]
+
+    def survey(self, fams: list[gd.Family]) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(["/nonexistent"], "ps")):
+            return {Path(i.path).name: i for i in gd.survey(fams, 0.5, 0)}
+
+    def apply(self, fams: list[gd.Family], items: list[gd.Item]) -> str:
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=(["/nonexistent"], "ps")), \
+                mock.patch.object(gd, "command_lines", return_value="ps"):
+            gd.apply(items, {f.id: f for f in fams}, receipt, None, 0.5, all_families=fams)
+        return receipt.read_text() if receipt.exists() else ""
+
+    def test_a_stale_unheld_entry_goes_through_the_deletion_path_with_a_receipt(self) -> None:
+        stale = self.scratch("hq-bootstrap-test-2327741")
+        fams = self.families()
+        self.assertIn(gd.STALE_TMP_SCRATCH, [f.id for f in fams])
+        items = self.survey(fams)
+        item = items["hq-bootstrap-test-2327741"]
+        self.assertEqual((item.family, item.verdict), (gd.STALE_TMP_SCRATCH, "reclaimable"), item.reasons)
+        self.assertEqual(sum(1 for i in items.values() if i.path == str(stale)), 1)  # not judged by "tmp" too
+        receipt = self.apply(fams, list(items.values()))
+        self.assertFalse(stale.exists())
+        rec = [json.loads(line) for line in receipt.splitlines()]
+        self.assertTrue(any(r["family"] == gd.STALE_TMP_SCRATCH and r["path"] == str(stale) for r in rec), rec)
+
+    def test_a_fresh_entry_stays(self) -> None:
+        old_top = self.scratch("tmp.TIZHFrNfa4")
+        os.utime(old_top / "deep/er/blob", (time.time() - 3600,) * 2)  # its top is old, a file below is not
+        young = self.scratch("tmp.s2t7C9arjn", hours=3.0)
+        items = self.survey(self.families())
+        self.assertEqual(items["tmp.TIZHFrNfa4"].family, gd.STALE_TMP_SCRATCH)
+        self.assertEqual(items["tmp.TIZHFrNfa4"].verdict, "recent")
+        self.assertEqual(items["tmp.s2t7C9arjn"].family, "tmp")  # young at its top: the generic family's
+        self.assertTrue(old_top.exists() and young.exists())
+
+    def test_a_just_changed_ctime_keeps_it_whatever_its_mtime(self) -> None:
+        gd.STALE_TMP_CTIME = True
+        d = self.scratch("codex-windows-clippy-repo")  # mtime 19 h back, ctime now (utime itself sets it)
+        self.assertFalse(gd.stale_tmp_claims(d))
+        self.assertGreater(gd.deep_newest_mtime(d, ctime=True), time.time() - 60)
+
+    def test_an_entry_a_process_has_as_its_cwd_stays(self) -> None:
+        held = self.scratch("cwd-held")
+        here = os.getcwd()
+        os.chdir(held / "deep")
+        try:
+            items = self.survey(self.families())
+        finally:
+            os.chdir(here)
+        self.assertEqual(items["cwd-held"].verdict, "in-use")
+        self.assertIn("held by a process (its cwd, root or an open file is inside)", items["cwd-held"].reasons)
+
+    def test_an_entry_a_process_holds_an_open_fd_in_stays_even_when_it_opens_after_the_survey(self) -> None:
+        held = self.scratch("fd-held")
+        fams = self.families()
+        items = self.survey(fams)
+        self.assertEqual(items["fd-held"].verdict, "reclaimable")
+        with open(held / "deep/er/blob", "rb"):  # opened between the survey and the delete: apply re-reads /proc
+            gd._STALE_HOLDERS = None
+            receipt = self.apply(fams, list(items.values()))
+        self.assertTrue(held.exists())
+        self.assertIn("changed:in-use", receipt)
+
+    def test_an_incomplete_holder_proof_holds_it(self) -> None:
+        self.scratch("unprovable")
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])):
+            items = self.survey(self.families())
+        self.assertEqual(items["unprovable"].verdict, "in-use")
+        self.assertIn("not proven unheld: 1 processes' open files unreadable", items["unprovable"].reasons)
+
+    def test_without_a_complete_proof_there_is_no_stale_family(self) -> None:
+        gd._STALE_TMP_ENABLED = None
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])):
+            self.assertFalse(gd.stale_tmp_enabled())
+        gd._STALE_TMP_ENABLED = None
+        with mock.patch.object(gd, "proc_links", return_value=([], ["1"])), \
+                mock.patch.object(gd, "sudo_reads", return_value=True):
+            self.assertTrue(gd.stale_tmp_enabled())
+
+    def test_protected_names_stay(self) -> None:
+        names = [".X11-unix", "acpmux-peer-scratch-1000-x", f"claude-{os.getuid()}", "systemd-private-abc",
+                 "tmux-1000", "ssh-XXXXabc", "acae-1", "wt-mirror"]
+        for name in names:
+            self.scratch(name)
+        mirrors = self.scratch("layout-root")
+        (mirrors / ".wt-mirrors").mkdir()
+        self.age(mirrors, 19.0)
+        fam = [f for f in self.families() if f.id == gd.STALE_TMP_SCRATCH][0]
+        self.assertEqual(gd.candidates(fam), [])
+        items = self.survey(self.families())
+        self.assertFalse(any(i.family == gd.STALE_TMP_SCRATCH for i in items.values()), items)
+
+    def test_a_nested_checkout_with_unpushed_work_stays(self) -> None:
+        d = self.scratch("mktemp-checkout")
+        repo = d / "deep/repo"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+        (repo / "f").write_text("work")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "unpushed"], check=True, env=env)
+        self.age(d, 19.0)
+        items = self.survey(self.families())
+        self.assertEqual(items["mktemp-checkout"].family, gd.STALE_TMP_SCRATCH)
+        self.assertNotEqual(items["mktemp-checkout"].verdict, "reclaimable", items["mktemp-checkout"].reasons)
+
+    def test_the_real_proc_read_sees_this_process_cwd_and_open_fd(self) -> None:
+        d = self.scratch("real-proc")
+        with open(d / "deep/er/blob", "rb"):
+            links, denied = gd._proc_ns["proc_links"](only={os.getpid()})
+        self.assertEqual(denied, [])
+        self.assertIn(str(d / "deep/er/blob"), links)
+        self.assertIn(os.getcwd(), links)
+
+class DarwinStaleTmpScratchTest(unittest.TestCase):
+    """On a Mac the tmp-stale-scratch holder proof is one bounded lsof listing that must cover every live process a
+    login session started (cmux16, 2026-11-22: 95% full with finished jobs' scratch in /private/tmp, which the
+    family never took because its proof read /proc)."""
+
+    # pid ppid uid ruid stat: launchd, a root daemon and its root child, cmux's shell, a sudo it ran and sudo's
+    # root child, a zombie, another person's session
+    PS = """    1     0     0     0 Ss
+  112     1     0     0 Ss
+  375   112     0     0 S
+  500     1   501   501 S
+  501   500     0   501 S
+  502   501     0     0 S
+  503   500   501   501 Z
+  600     1   502   502 S
+"""
+
+    def setUp(self) -> None:
+        saved = (gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME, dict(gd.POLICY))
+
+        def restore() -> None:
+            gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME = saved[:4]
+            gd.POLICY.clear()
+            gd.POLICY.update(saved[4])
+        self.addCleanup(restore)
+        gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = True, None, None
+
+    def lsof(self, pids: list[int], paths: dict[int, list[str]] | None = None) -> str:
+        out = []
+        for pid in pids:
+            out += [f"p{pid}", "cbash", *(f"n{p}" for p in (paths or {}).get(pid, ["/"]))]
+        return "\n".join(out) + "\n"
+
+    def run_proof(self, lsof_out: str, lsof_code: int = 0, after: str | None = None,
+                  alive: bool = True) -> tuple[list[str], int]:
+        ps = [(0, self.PS), (0, self.PS if after is None else after)]  # ps before and after the listing
+        with mock.patch.object(gd, "_owned_query", side_effect=ps), \
+                mock.patch.object(gd, "_owned_query_split", return_value=(lsof_code, lsof_out, "")), \
+                mock.patch.object(gd, "pid_alive", return_value=alive):
+            return gd.darwin_holder_links()
+
+    def test_the_session_processes_are_the_ones_a_login_account_started(self) -> None:
+        pids = gd.darwin_session_pids(gd.darwin_processes(self.PS))
+        self.assertEqual(pids, {500, 501, 502, 600})  # not launchd, its daemons or a zombie; sudo's child is in
+
+    def test_a_listing_that_covers_every_session_process_proves_it(self) -> None:
+        paths, unread = self.run_proof(self.lsof([500, 501, 502, 600], {500: ["/private/tmp/held/x"]}))
+        self.assertEqual(unread, 0)
+        self.assertIn("/private/tmp/held/x", paths)
+
+    def test_a_session_process_lsof_could_not_read_holds_everything(self) -> None:
+        _, unread = self.run_proof(self.lsof([500, 600]), lsof_code=1)  # sudo (501) and its root child unread
+        self.assertEqual(unread, 2)
+
+    def test_a_process_that_exited_or_turned_zombie_during_the_listing_was_not_missed(self) -> None:
+        after = self.PS.replace("  502   501     0     0 S", "  502   501     0     0 Z").replace(
+            "  501   500     0   501 S\n", "")
+        _, unread = self.run_proof(self.lsof([500, 600]), after=after)
+        self.assertEqual(unread, 0)
+        _, unread = self.run_proof(self.lsof([500, 600]), alive=False)
+        self.assertEqual(unread, 0)
+
+    def test_a_failed_or_empty_listing_is_incomplete(self) -> None:
+        self.assertEqual(self.run_proof(self.lsof([500, 501, 502, 600]), lsof_code=2), ([], 1))
+        self.assertEqual(self.run_proof(""), ([], 1))
+
+    def test_the_family_exists_on_a_mac_only_when_the_proof_is_complete(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 0)):
+            self.assertTrue(gd.stale_tmp_enabled())
+        gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = None, None
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 3)):
+            self.assertFalse(gd.stale_tmp_enabled())
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/x")),
+                             "not proven unheld: 3 processes' open files unreadable")
+
+    def test_a_path_lsof_lists_holds_its_top_level_entry(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/private/tmp/held/deep/f"], 0)):
+            self.assertIn("held by a process", gd.stale_scratch_held(Path("/private/tmp/held")))
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/free")), "")
+
+    def test_the_window_is_6_h_on_a_mac_and_12_h_on_linux(self) -> None:
+        self.assertEqual(gd.stale_tmp_hours(), 6.0)
+        gd.DARWIN = False
+        self.assertEqual(gd.stale_tmp_hours(), 12.0)
+        gd.DARWIN = True
+        gd.POLICY["stale_tmp_scratch_hours_macos"] = 0
+        self.assertFalse(gd.stale_tmp_enabled())
+
+    def test_an_mtime_stamped_past_its_ctime_counts_as_its_ctime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "typing-bench"
+            (d / "app").mkdir(parents=True)
+            f = d / "app/cmux DEV"
+            f.write_bytes(b"x")
+            ahead = time.time() + 8 * 3600
+            os.utime(f, (ahead, ahead))
+            newest = gd.deep_newest_mtime(d, ctime=True)
+            self.assertLessEqual(newest, time.time() + 1)  # its ctime (the utime just now), not 8 h from now
+            self.assertGreaterEqual(newest, time.time() - 60)  # and a real change (that utime) still counts
+            self.assertGreaterEqual(gd.deep_newest_mtime(d), ahead - 1)  # mtime alone still counts it
+
+
+class CensusSudoTest(unittest.TestCase):
+    """The census measures a directory it cannot read with `sudo -n du` where sudo needs no password, so the
+    accounting gap is real (Leo, 2026-11-21: "make it count the unreadable dirs with sudo"); without sudo it keeps
+    du's lower bound as "unreadable", as before."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(os.path.realpath(self.tmp.name)) / "vol"
+        self.root.mkdir()
+        self.state = Path(self.tmp.name) / "census.json"
+        saved = (gd.DARWIN, gd.CENSUS_STATE, gd._SUDO_READS)
+        gd.DARWIN, gd.CENSUS_STATE = False, self.state
+        locked = self.root / "locked"
+        (locked / "inner").mkdir(parents=True)
+        (locked / "inner/blob").write_bytes(os.urandom(64 * 1024))
+        (self.root / "open").mkdir()
+        os.chmod(locked, 0)
+        self.locked = locked
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: os.chmod(locked, 0o755))
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "CENSUS_STATE", saved[1]),
+                                 setattr(gd, "_SUDO_READS", saved[2])))
+
+    def run_census(self) -> dict:
+        return gd.census_pass([self.root], set(), None, now=50.0, path=self.state)
+
+    def test_sudo_measures_an_unreadable_dir_as_measured_not_gap(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = True
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=f"123456\t{argv[-1]}\n", stderr="")
+        with mock.patch.object(gd.subprocess, "run", side_effect=fake_run):
+            state = self.run_census()
+        row = state["rows"][str(self.locked)]
+        self.assertEqual(row, [123456, "unclassified", True])
+        self.assertIn(str(self.locked), state["sudo_measured"])
+        argv = calls[-1]
+        self.assertEqual(argv[:2], ["sudo", "-n"])
+        self.assertIn("timeout", argv)
+        self.assertEqual(argv[-4:], ["-xs", "-B1", "--", str(self.locked)], argv)
+
+    def test_without_sudo_the_old_lower_bound_stays(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = False
+        state = self.run_census()
+        row = state["rows"][str(self.locked)]
+        self.assertEqual(row[1:], ["unreadable", False])
+        self.assertNotIn("sudo_measured", state)
+
+    def test_a_refused_sudo_keeps_the_lower_bound_and_a_later_remeasure_fills_it(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        gd._SUDO_READS = False
+        state = self.run_census()
+        self.assertTrue(state["complete"])
+        gd._SUDO_READS = True
+        self.assertTrue(gd.census_sudo_pending({**state, "sudo_tried": []}))
+        state["sudo_tried"] = []
+        with mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 0, stdout=f"4096\t{argv[-1]}\n", stderr="")):
+            self.assertEqual(gd.census_sudo_remeasure(state, path=self.state), 1)
+        self.assertEqual(state["rows"][str(self.locked)], [4096, "unclassified", True])
+        self.assertFalse(gd.census_sudo_pending(state))
+        with mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="sudo: a password is required")):
+            self.assertIsNone(gd._census_sudo_du(self.locked, 5))
+
+
+
+class CargoStaleArtifactsTest(unittest.TestCase):
+    """cargo-stale-artifacts: stale units inside a live Cargo target go, the newest per crate stem, open files,
+    build/ and the top-level binaries stay (an agent lane VM, 2026-11-22: a live worktree's target/debug at 137 GiB)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.receipt = self.root / "receipts.jsonl"
+        wt = self.root / ".wt/checkouts/cmux/lane--live/cmux-tui"
+        (wt / "src").mkdir(parents=True)
+        self.target = wt / "target"
+        self.debug = self.target / "debug"
+        for d in ("deps", "incremental", "build/foo-0123456789abcdef/out", ".fingerprint"):
+            (self.debug / d).mkdir(parents=True)
+        (self.target / "CACHEDIR.TAG").write_text(
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n")
+        (self.debug / ".cargo-lock").write_text("")
+        self.files: dict[str, Path] = {}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def put(self, rel: str, hours: float, data: bytes = b"x" * 8192) -> Path:
+        p = self.debug / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.name.startswith("s-") or rel.startswith("incremental/") and rel.count("/") == 1:
+            p.mkdir(exist_ok=True)
+            (p / "query-cache.bin").write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p / "query-cache.bin", (when, when))
+            os.utime(p, (when, when))
+        else:
+            p.write_bytes(data)
+            when = time.time() - hours * 3600
+            os.utime(p, (when, when))
+        return p
+
+    def sweep(self, apply: bool = True, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], apply=apply,
+                                          stale_hours=6.0, **kw)
+
+    def fixture(self) -> dict[str, Path]:
+        f = {}
+        # four test binaries of acpmux: the three past the window go, the newest (2h, "recent" below) stays
+        f["old_bin"] = self.put("deps/acpmux-1111111111111111", 30)
+        f["old_bin_d"] = self.put("deps/acpmux-1111111111111111.d", 30)
+        f["mid_bin"] = self.put("deps/acpmux-2222222222222222", 10)
+        f["new_bin"] = self.put("deps/acpmux-3333333333333333", 8)
+        # acpmux's library: one unit, old, but the newest of its stem (lib), so it stays
+        f["lib_rlib"] = self.put("deps/libacpmux-4444444444444444.rlib", 40)
+        f["lib_rmeta"] = self.put("deps/libacpmux-4444444444444444.rmeta", 40)
+        f["lib_d"] = self.put("deps/acpmux-4444444444444444.d", 40)
+        # a stale library unit of serde beside a newer one: the old one goes whole
+        f["serde_old"] = self.put("deps/libserde-5555555555555555.rlib", 20)
+        f["serde_old_meta"] = self.put("deps/libserde-5555555555555555.rmeta", 20)
+        f["serde_new"] = self.put("deps/libserde-6666666666666666.rlib", 1)
+        # the newest acpmux test binary
+        f["recent"] = self.put("deps/acpmux-7777777777777777", 2)
+        # incremental: two old crate dirs of acpmux, the newest stays
+        f["inc_old"] = self.put("incremental/acpmux-1abcdefgh2ij", 30)
+        f["inc_new"] = self.put("incremental/acpmux-3klmnopqr4st", 20)
+        # never touched: build/, the top-level binary, .fingerprint, a name no pattern matches
+        f["build"] = self.put("build/foo-0123456789abcdef/out/gen.rs", 99)
+        f["top"] = self.put("acpmux", 99)
+        f["fingerprint"] = self.put(".fingerprint/acpmux-1111111111111111", 99)
+        f["odd"] = self.put("deps/notes.txt", 99)
+        return f
+
+    def test_stale_units_go_and_the_newest_per_stem_stays(self) -> None:
+        f = self.fixture()
+        res = self.sweep()
+        gone = {n for n, p in f.items() if not p.exists()}
+        self.assertEqual(gone, {"old_bin", "old_bin_d", "mid_bin", "new_bin", "serde_old", "serde_old_meta",
+                                "inc_old"})
+        self.assertEqual((res["targets"], res["units"]), (1, 5))
+        self.assertGreater(res["bytes"], 0)
+        self.assertEqual(list(res["by_target"]), [os.fspath(self.target)])
+        rec = json.loads(self.receipt.read_text().splitlines()[-1])
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.CARGO_STALE_FAMILY, "reclaimed", 5))
+
+    def test_a_used_within_the_window_unit_stays_beside_a_newer_one(self) -> None:
+        f = self.fixture()
+        self.put("deps/acpmux-8888888888888888", 1)  # newest now; "recent" (2h) is inside the 6h window
+        self.sweep()
+        self.assertTrue(f["recent"].exists())
+        self.assertFalse(f["new_bin"].exists())
+
+    def test_a_dry_run_counts_and_removes_nothing(self) -> None:
+        f = self.fixture()
+        res = self.sweep(apply=False)
+        self.assertEqual(res["units"], 5)
+        self.assertTrue(all(p.exists() for p in f.values()))
+        self.assertFalse(self.receipt.exists())
+
+    def test_a_recent_atime_keeps_an_old_unit(self) -> None:
+        f = self.fixture()
+        old = time.time() - 30 * 3600
+        os.utime(f["old_bin"], (time.time(), old))  # read just now (a test run), written long ago
+        self.sweep()
+        self.assertTrue(f["old_bin"].exists())
+        self.assertTrue(f["old_bin_d"].exists(), "a unit goes whole or not at all")
+        self.assertFalse(f["mid_bin"].exists())
+
+    def test_an_open_file_keeps_its_unit(self) -> None:
+        f = self.fixture()
+        with f["mid_bin"].open("rb"):
+            res = self.sweep()
+            self.assertTrue(f["mid_bin"].exists())
+        self.assertEqual(res["kept"].get("open in a process"), 1)
+        self.assertFalse(f["old_bin"].exists())
+
+    def test_a_cargo_build_holding_the_lock_keeps_the_profile(self) -> None:
+        f = self.fixture()
+        with (self.debug / ".cargo-lock").open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            pid = os.fork()
+            if pid == 0:  # another process's flock, as cargo's would be
+                try:
+                    res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=6.0)
+                    os._exit(0 if res["units"] == 0 else 1)
+                except BaseException:
+                    os._exit(2)
+            _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
+
+    def test_targets_are_found_through_wt_checkouts_and_links_are_not_followed(self) -> None:
+        elsewhere = self.root / "elsewhere/target"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "CACHEDIR.TAG").write_text("# This file is a cache directory tag created by cargo.\n")
+        (self.root / ".wt/checkouts/cmux/lane--live/link").symlink_to(elsewhere.parent)
+        found = gd.find_cargo_targets([self.root / ".wt/checkouts"])
+        self.assertEqual(found, [self.target])
+
+    def test_policy_roots_reach_lane_worktrees(self) -> None:
+        self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])
+        self.assertIn(self.root / ".wt/checkouts", gd.cargo_stale_roots(self.root))
+        self.assertEqual(gd.POLICY_DEFAULTS["cargo_stale_hours"], 6.0)
+
+    def test_zero_hours_turns_it_off(self) -> None:
+        f = self.fixture()
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=0)
+        self.assertEqual(res["units"], 0)
+        self.assertTrue(all(p.exists() for p in f.values()))
+class PressureHeldBytesTest(unittest.TestCase):
+    """Leo, 2026-11-22: "5 Mac minis that stopped taking work because their disks are low. find the useful solutions to
+    prevent these" / "fleet's own cleanup tools, which never delete VMs or protected folders. this is not good enough.
+    it's the fleet. they dont have anything protected." cmux17 and cmux23 read 0 bytes reclaimable at 1.4 GiB free
+    while the live worker's cmux-tui-target, each root's newest seed and two unused simulator runtimes held ~57 GiB."""
+
+    PINNED = ("PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED", "PRESSURE_SIM_RUNTIMES")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        # a test that ran main() may leave them set: each test here turns on only the rule it reads
+        for name in self.PINNED:
+            stack.enter_context(mock.patch.object(gd, name, False))
+        stack.enter_context(mock.patch.object(gd, "process_evidence", return_value=([], "")))
+        stack.enter_context(mock.patch.object(gd, "command_lines", return_value=""))
+        stack.enter_context(mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False))
+        stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
+        gd._DISCOVERED.clear()
+        self.addCleanup(gd._DISCOVERED.clear)
+
+    def age(self, path: Path, hours: float) -> Path:
+        t = time.time() - hours * 3600
+        for p in sorted(path.rglob("*"), reverse=True):
+            os.utime(p, (t, t), follow_symlinks=False)
+        os.utime(path, (t, t))
+        return path
+
+    def cargo_target(self, path: Path, hours: float = 2.0) -> Path:
+        (path / "debug/.fingerprint").mkdir(parents=True)
+        (path / "debug/cmux-tui").write_bytes(b"\0" * 1024 * 1024)
+        (path / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n"
+                                           "# This file is a cache directory tag created by cargo.\n")
+        return self.age(path, hours)
+
+    def verdicts(self, fams: list) -> dict[tuple[str, str], gd.Item]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return {(i.family, Path(i.path).name): i for i in gd.survey(fams, 1.0, 0)}  # a pressure pass's window
+
+    def receipt(self) -> Path:
+        return self.root / "receipt.jsonl"
+
+    def test_the_live_workers_cargo_target_is_build_output_under_pressure(self) -> None:
+        cache = self.root / "cache"
+        target = self.cargo_target(cache / "cmux-tui-target")
+        self.cargo_target(cache / "linked-target")
+        (cache / "workspaces" / "k" / "src" / ".git").mkdir(parents=True)  # the worker's clone: not build output
+        self.age(cache / "workspaces", 2.0)
+        (cache / "tagless").mkdir()  # a directory with no cargo marker
+        (cache / "tagless" / "debug").mkdir()
+        self.age(cache / "tagless", 2.0)
+        (cache / "with-git").mkdir()
+        self.cargo_target(cache / "with-git" / "t")
+        (cache / "with-git" / ".git").mkdir()
+        self.age(cache / "with-git", 2.0)
+        hq = gd.hq_cache_family(cache)
+        artifacts = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True,
+                              reference_root=self.root, platform="macos")
+        with mock.patch.object(gd, "owner_retired", return_value=False), \
+                mock.patch.object(gd, "family_git_state", return_value="unchecked"):
+            off = self.verdicts([hq, artifacts])
+            self.assertEqual(off[(hq.id, "cmux-tui-target")].verdict, "report-only", "the worker is loaded")
+            self.assertEqual(off[("fleet-artifacts", "cmux-tui-target")].verdict, "unchecked")
+            with mock.patch.object(gd, "PRESSURE_WORKER_BUILD_OUTPUT", True):
+                on = self.verdicts([hq, artifacts])
+                for fid in (hq.id, "fleet-artifacts"):
+                    item = on[(fid, "cmux-tui-target")]
+                    self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+                    self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, item.reasons)
+                self.assertEqual(on[(hq.id, "workspaces")].verdict, "report-only", "a clone stays the worker's")
+                self.assertEqual(on[(hq.id, "tagless")].verdict, "report-only", "only cargo's own marker counts")
+                self.assertEqual(on[(hq.id, "with-git")].verdict, "report-only", "version control of its own")
+                # a running cargo names its target dir, an open file holds it: both still keep it
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([], f"rustc --out-dir {target}/debug/deps\n")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use")
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([os.fspath(target / "debug/cmux-tui")], "")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use")
+                items = [on[(hq.id, "cmux-tui-target")]]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {hq.id: hq}, self.receipt(), None, 1.0, all_families=[hq])
+            self.assertFalse(target.exists(), "apply's own recheck lets it go too")
+            self.assertTrue((cache / "workspaces" / "k" / "src" / ".git").is_dir())
+            rec = [json.loads(line) for line in self.receipt().read_text().splitlines()]
+            self.assertEqual([r["outcome"] for r in rec], ["reclaimed"])
+            self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, rec[0]["reasons"])
+
+    def test_the_newest_seed_goes_under_pressure_only_when_nothing_holds_it(self) -> None:
+        seeds = self.root / "ci" / "seeds"
+        old = make(seeds / "seed-old", age_hours=60)
+        newest = make(seeds / "seed-new", age_hours=30)
+        fam = gd.Family("cmux-seeds", seeds, True, "fetch", build_output=True, platform="macos")
+        off = self.verdicts([fam])
+        self.assertEqual(off[(fam.id, "seed-old")].verdict, "reclaimable")
+        self.assertEqual(off[(fam.id, "seed-new")].verdict, "kept")
+        self.assertIn("its root's newest current seed", off[(fam.id, "seed-new")].reasons)
+        with mock.patch.object(gd, "PRESSURE_NEWEST_SEED", True):
+            on = self.verdicts([fam])
+            self.assertEqual(on[(fam.id, "seed-new")].verdict, "reclaimable", on[(fam.id, "seed-new")].reasons)
+            self.assertIn(gd.PRESSURE_NEWEST_SEED_REASON, on[(fam.id, "seed-new")].reasons)
+            self.assertNotIn(gd.PRESSURE_NEWEST_SEED_REASON, on[(fam.id, "seed-old")].reasons)
+            with mock.patch.object(gd, "process_evidence", return_value=([os.fspath(newest / "blob")], "")):
+                self.assertEqual(self.verdicts([fam])[(fam.id, "seed-new")].verdict, "in-use", "a job adopting it")
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.apply([on[(fam.id, "seed-new")]], {fam.id: fam}, self.receipt(), None, 1.0, all_families=[fam])
+        self.assertFalse(newest.exists())
+        self.assertTrue(old.exists())
+
+    def runner(self, state: Path, n: int, labels: list[str]) -> None:
+        rdir = self.root / "runners" / f"r{n}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / ".runner").write_text("{}")
+        receipt = state / f"instance-{n}" / "receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"mode": "install", "runnerDir": str(rdir),
+                                       "registration": {"labels": ["self-hosted", "glaeda-mini", *labels]}}))
+
+    def test_a_simulator_job_host_is_read_from_enrolled_runner_labels(self) -> None:
+        state = self.root / "state"
+        self.assertIsNone(gd.sim_job_host(state), "no runner enrolled: unknown, nothing goes")
+        self.runner(state, 1, ["glaeda-std-xcode-26.6"])
+        self.assertIs(gd.sim_job_host(state), False)
+        self.runner(state, 2, [gd.IOS_SIM_RUNNER_LABEL])
+        self.assertIs(gd.sim_job_host(state), True)
+        shutil.rmtree(state / "instance-2")
+        (state / "instance-0").mkdir()
+        (state / "instance-0" / "receipt.json").write_text("{not json")
+        self.assertIsNone(gd.sim_job_host(state), "an unreadable receipt: unknown")
+
+    def test_the_glaeda_runner_label_for_simulators_is_the_installers(self) -> None:
+        spec = importlib.util.spec_from_file_location("glaeda_fleet_labels", ROOT / "scripts" / "glaeda_fleet_labels.py")
+        labels = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(labels)
+        self.assertEqual(gd.IOS_SIM_RUNNER_LABEL, labels.IOS_SIM_LABEL)
+
+    def test_unrouted_simulator_runtimes_go_even_their_platforms_newest(self) -> None:
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
+        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+
+        def rt(version, used, deletable=True):
+            return {"runtimeIdentifier": f"ios-{version}", "platformIdentifier": "iphonesimulator",
+                    "version": version, "deletable": deletable, "lastUsedAt": used, "sizeBytes": 16 * gd.GIB}
+        runtimes = {"A": rt("26.5", old), "B": rt("26.2", old), "C": rt("26.1", new), "E": rt("17.0", old, False)}
+        devices = {"devices": {"ios-26.2": [{"state": "Shutdown"}]}}
+        routed = {i.path: i.verdict for i in gd.runtime_items(runtimes, devices, now)}
+        self.assertEqual(routed, {"A": "kept", "B": "kept", "C": "recent", "E": "kept"})
+        items = {i.path: i for i in gd.runtime_items(runtimes, devices, now, unrouted=True)}
+        self.assertEqual({p: i.verdict for p, i in items.items()},
+                         {"A": "reclaimable", "B": "reclaimable", "C": "recent", "E": "kept"})
+        self.assertIn(gd.UNROUTED_RUNTIME_REASON, items["A"].reasons)
+        devices["devices"]["ios-26.2"][0]["state"] = "Booted"
+        self.assertNotIn("reclaimable", {i.verdict for i in gd.runtime_items(runtimes, devices, now, unrouted=True)})
+
+    def test_apply_runtimes_asks_again_and_stops_at_the_target(self) -> None:
+        item = lambda p: gd.Item("simulator-runtimes", p, 16 * gd.GIB, 700.0, "reclaimable", [], platform="macos")
+        items = [item("A"), item("B")]
+        ran = []
+
+        def run(argv, **kw):
+            ran.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        short = iter([True, False])
+        with mock.patch.object(gd, "simulator_runtimes", side_effect=lambda unrouted=False: items if unrouted else []), \
+                mock.patch.object(gd, "sim_job_host", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            released = gd.apply_runtimes(items, self.receipt(), unrouted=True, below_target=lambda: next(short))
+        self.assertEqual((ran, released), (["A"], 16 * gd.GIB), "the target was met after the first")
+        self.assertEqual(json.loads(self.receipt().read_text().splitlines()[0])["sweep"], "pressure")
+        ran.clear()
+        with mock.patch.object(gd, "simulator_runtimes", side_effect=lambda unrouted=False: items if unrouted else []), \
+                mock.patch.object(gd, "sim_job_host", return_value=None), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.apply_runtimes(items, self.receipt(), unrouted=True), 0)
+        self.assertEqual(ran, [], "a mini that may take a simulator job now keeps them")
+
+    def test_main_turns_each_rule_on_only_for_an_unreserved_fleet_mini_under_pressure(self) -> None:
+        dd = make(self.root / "dd" / "x", age_hours=0.01)
+        fam = gd.Family("xcode-derived-data", dd.parent, True, "rebuild")
+        seen: list[tuple[bool, bool, bool]] = []
+        survey = gd.survey
+
+        def watch(*args, **kwargs):
+            seen.append((gd.PRESSURE_WORKER_BUILD_OUTPUT, gd.PRESSURE_NEWEST_SEED, gd.PRESSURE_SIM_RUNTIMES))
+            return survey(*args, **kwargs)
+
+        def run(args: list[str], free_gib: float, policy: dict) -> tuple[bool, bool, bool] | None:
+            seen.clear()
+            with mock.patch.object(gd, "default_families", return_value=[fam]), \
+                    mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), 228 * gd.GIB)), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "IDLE_STAMP", self.root / "idle.last"), \
+                    mock.patch.object(gd, "simulator_runtimes", return_value=[]), \
+                    mock.patch.object(gd, "survey", side_effect=watch), mock.patch.dict(gd.POLICY, policy), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                gd.main(args)
+            return seen[0] if seen else None
+
+        base = ["--pressure", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "10", "--target", "20",
+                "--receipt", os.fspath(self.receipt())]
+        darwin = gd.DARWIN
+        self.assertEqual(run(base, 1.4, {}), (True, True, darwin))
+        self.assertEqual(run(base, 1.4, {"pressure_worker_build_output": False, "pressure_newest_seed": False,
+                                         "pressure_sim_runtimes": False}), (False, False, False))
+        self.assertEqual(run(base, 1.4, {"pressure_newest_seed": False}), (True, False, darwin))
+        self.assertEqual(run([*base, "--role", "devbox"], 1.4, {}), (False, False, False))
+        self.assertIn(run([*base, "--idle"], 100, {}), (None, (False, False, False)), "no pressure: an idle sweep")
+        for name in self.PINNED:
+            self.assertFalse(getattr(gd, name), "main leaves them off after its run")
+
+    def test_policy_keys_default_on_and_a_host_turns_each_off(self) -> None:
+        for key in ("pressure_worker_build_output", "pressure_newest_seed", "pressure_sim_runtimes"):
+            self.assertIs(gd.POLICY_DEFAULTS[key], True)
+            path = self.root / f"{key}.json"
+            path.write_text(json.dumps({key: False}))
+            self.assertIs(gd.disk_policy(path)[key], False)
+
+
+class RunnerAccountsTest(unittest.TestCase):
+    """RUNNER_ACCOUNTS: a pool or dedicated runner account's home is counted and reclaimed by a pass run as it."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.users = self.root / "Users"
+        self.users.mkdir()
+        saved = {k: getattr(gd, k) for k in ("DARWIN", "_RUNNER_ACCOUNTS_ENABLED", "RUNNER_ACCOUNT_MODE",
+                                             "USERS_ROOT", "RUNNER_HYGIENE_DAEMONS", "RUNNER_ACCOUNTS_STATE",
+                                             "HOME")}
+        self.addCleanup(lambda: [setattr(gd, k, v) for k, v in saved.items()])
+        gd.DARWIN, gd._RUNNER_ACCOUNTS_ENABLED, gd.RUNNER_ACCOUNT_MODE = True, True, False
+        gd.USERS_ROOT = self.users
+        gd.RUNNER_HYGIENE_DAEMONS = self.root / "LaunchDaemons"
+        gd.RUNNER_HYGIENE_DAEMONS.mkdir()
+        gd.RUNNER_ACCOUNTS_STATE = self.root / "state" / "runner-accounts.json"
+        gd.HOME = self.users / "fleet"
+        gd.HOME.mkdir()
+
+    def entry(self, name: str, uid: int, home: Path | None = None, gid: int = 20) -> pwd.struct_passwd:
+        home = self.users / name if home is None else home
+        home.mkdir(parents=True, exist_ok=True)
+        return pwd.struct_passwd((name, "*", uid, gid, "", os.fspath(home), "/bin/zsh"))
+
+    def test_candidates_are_other_non_admin_login_accounts_without_their_own_hygiene_job(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        own = self.entry("fleet", 501)
+        admin = self.entry("ops", 503)
+        hygiene = self.entry("person", 504)
+        (gd.RUNNER_HYGIENE_DAEMONS / f"{gd.RUNNER_HYGIENE_LABEL}.504.plist").write_text("")
+        daemon = self.entry("_svc", 300)
+        shared = self.entry("shared", 505, self.users / "Shared")
+        elsewhere = self.entry("away", 506, self.root / "var" / "away")
+        with mock.patch.object(gd, "_account_is_admin", side_effect=lambda e: e.pw_name == "ops"):
+            got = gd.runner_account_candidates([pool, own, admin, hygiene, daemon, shared, elsewhere], own_uid=501)
+        self.assertEqual([e.pw_name for e in got], ["cmux-pr-runner"])
+
+    def test_no_candidates_off_macos_by_policy_or_inside_a_runner_account_pass(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        with mock.patch.object(gd, "_account_is_admin", return_value=False):
+            self.assertEqual(len(gd.runner_account_candidates([pool], own_uid=501)), 1)
+            gd.RUNNER_ACCOUNT_MODE = True
+            self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+            gd.RUNNER_ACCOUNT_MODE, gd.DARWIN = False, False
+            self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+            gd.DARWIN = True
+            with mock.patch.dict(gd.POLICY, {"runner_accounts": False}):
+                self.assertEqual(gd.runner_account_candidates([pool], own_uid=501), [])
+
+    def test_argv_keeps_the_mode_and_drops_this_runs_own_outputs(self) -> None:
+        got = gd.runner_account_argv(["--dead", "--apply", "--json", "--receipt", "/tmp/r.json",
+                                      "--root-override=/x", "--runner-caches", "--top", "0"])
+        self.assertEqual(got, ["--runner-account", "--dead", "--apply", "--top", "0"])
+
+    def test_sudo_refused_is_named_not_reached(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 1, b"", b"sudo: a password is required\n"))
+        row = gd.run_runner_account(pool, ["--pressure", "--apply"], run=run)
+        self.assertEqual(row["state"], "not reached")
+        self.assertIn("password", row["why"])
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:6], [gd.SUDO, "-n", "-u", "cmux-pr-runner", "-H", "/bin/sh"])
+
+    def test_pass_runs_as_the_account_and_its_summary_is_counted(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        line = gd.RUNNER_ACCOUNT_LINE + json.dumps({"state": "ran", "reclaimed_bytes": 40 * gd.GIB,
+                                                     "home_bytes": 150 * gd.GIB, "runners": 2})
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            if argv[5] == "/bin/sh":
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return subprocess.CompletedProcess(argv, 0, f"progress\n{line}\n".encode(), b"")
+        with mock.patch.object(gd, "runner_account_candidates", return_value=[pool]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rows = gd.delegate_runner_accounts(["--dead", "--apply"], run=run)
+        self.assertEqual(rows[0]["state"], "ran")
+        self.assertEqual(rows[0]["reclaimed_bytes"], 40 * gd.GIB)
+        self.assertIn("runner account cmux-pr-runner: ran: reclaimed", out.getvalue())
+        install, pass_ = calls
+        self.assertEqual(install[1]["input"], Path(gd.__file__).read_bytes())
+        self.assertEqual(pass_[0][:5], [gd.SUDO, "-n", "-u", "cmux-pr-runner", "-H"])
+        self.assertIn("--runner-account", pass_[0])
+        self.assertEqual(pass_[0][-2:], ["--dead", "--apply"])
+        self.assertEqual(pass_[1]["timeout"], gd.RUNNER_ACCOUNT_TIMEOUT_S)
+        state = json.loads(gd.RUNNER_ACCOUNTS_STATE.read_text())
+        self.assertEqual(state[pool.pw_dir]["bytes"], 150 * gd.GIB)
+
+    def test_a_pass_past_its_bound_is_a_timeout_row(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+
+        def run(argv, **kw):
+            if argv[5] == "/bin/sh":
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        row = gd.run_runner_account(pool, ["--apply"], run=run)
+        self.assertEqual(row["state"], "timeout")
+
+    def test_a_home_without_enrolled_runners_deletes_nothing(self) -> None:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[]), \
+                mock.patch.object(gd, "_logged_main") as logged, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.runner_account_main(["--runner-account", "--dead", "--apply"]), 0)
+        logged.assert_not_called()
+        self.assertIn('"not a runner account"', out.getvalue())
+
+    def test_a_runner_account_pass_runs_the_full_pass_and_reports_its_home(self) -> None:
+        def logged(args):
+            gd.RUN.clear()
+            gd.RUN["released"] = 5 * gd.GIB
+            self.assertEqual(args, ["--dead", "--apply"])
+            self.assertTrue(gd.RUNNER_ACCOUNT_MODE)
+            return 0
+        with mock.patch.object(gd, "enrolled_runners", return_value=[gd.HOME / "actions-runner"]), \
+                mock.patch.object(gd, "_logged_main", side_effect=logged), \
+                mock.patch.object(gd, "du_bytes", return_value=90 * gd.GIB), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gd.runner_account_main(["--runner-account", "--dead", "--apply"]), 0)
+        summary = json.loads(out.getvalue().splitlines()[-1][len(gd.RUNNER_ACCOUNT_LINE):])
+        self.assertEqual((summary["state"], summary["reclaimed_bytes"], summary["home_bytes"]),
+                         ("ran", 5 * gd.GIB, 90 * gd.GIB))
+
+    def test_a_hook_pass_never_delegates(self) -> None:
+        with mock.patch.object(gd, "_main_impl", side_effect=lambda a: gd.RUN.update(apply=True) or 0), \
+                mock.patch.object(gd, "delegate_runner_accounts", return_value=[]) as delegate, \
+                mock.patch.object(gd, "write_run_line"), mock.patch.object(gd, "release_hook_pass"), \
+                mock.patch.object(gd, "release_full_disk_reserve", return_value=0), \
+                mock.patch.object(gd, "refill_full_disk_reserve"), \
+                mock.patch.object(gd, "launch_background_census"):
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}):
+                gd._logged_main(["--pressure", "--apply"])
+            delegate.assert_not_called()
+            with mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: ""}):
+                gd._logged_main(["--pressure", "--apply", "--need", "20"])
+                delegate.assert_not_called()
+                gd._logged_main(["--pressure", "--apply"])
+            delegate.assert_called_once_with(["--pressure", "--apply"])
+
+    def test_accounting_counts_a_runner_account_home_its_pass_sized(self) -> None:
+        pool = self.entry("cmux-pr-runner", 502)
+        dev = Path(pool.pw_dir).stat().st_dev
+        fs = gd.Fs(dev, str(self.root), 2 * gd.GIB, 200 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = gd.ACCOUNTING
+        gd.ACCOUNTING = self.root / "accounting.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "ACCOUNTING", saved), gd._ACCOUNTING_MEM.clear(),
+                                  gd._ACCOUNTING_COVERAGE_MEM.clear()))
+
+        def account(now):
+            with mock.patch.object(gd, "fixed_measurement_roots", return_value=[]), \
+                    mock.patch.object(gd, "accounting_coverage", return_value=[]), \
+                    mock.patch.object(gd, "census_for", return_value=None), \
+                    mock.patch.object(gd, "root_census_for", return_value=None), \
+                    mock.patch.object(gd, "apfs_sibling_volumes", return_value=None), \
+                    mock.patch.object(gd, "sim_runtime_row", return_value=None), \
+                    mock.patch.object(gd, "apfs_container_capacity", return_value=None), \
+                    mock.patch.object(gd.time, "time", return_value=now):
+                gd._ACCOUNTING_MEM.clear()
+                gd._ACCOUNTING_COVERAGE_MEM.clear()
+                return gd.filesystem_accounting([fs], [])[0]
+        now = time.time()
+        before = account(now)
+        gd.save_runner_account_sizes([{"account": "cmux-pr-runner", "home": pool.pw_dir,
+                                       "home_bytes": 150 * gd.GIB}], now=now)
+        after = account(now)
+        self.assertEqual(after["measured"] - before["measured"], 150 * gd.GIB)
+        self.assertEqual(before["accounting_gap"] - after["accounting_gap"], 150 * gd.GIB)
+        scope = [row for row in after["coverage"] if row["scope"] == gd.RUNNER_ACCOUNT_SCOPE]
+        self.assertEqual(scope[0]["children"][0]["account"], "cmux-pr-runner")
+        stale = account(now + gd.RUNNER_ACCOUNT_SIZE_MAX_AGE_S + 1)
+        self.assertEqual(stale["measured"], before["measured"])
+
+
+
+class UndeclaredGrowthTest(unittest.TestCase):
+    """The checker (declared-disk-persistence design section 3): used - base - registered caches - job volumes."""
+
+    G = gd.GIB
+
+    def check(self, rows, *, used, volumes=None, gap=0, base=0, caches=(), sizes=None, alarm=5):
+        return gd.undeclared_growth(used * self.G, [(Path(p), n * self.G, "keep") for p, n in rows], volumes,
+                                    gap * self.G, "apfs invisible", base * self.G, [(c, Path(r)) for c, r in caches],
+                                    lambda root: None if sizes is None else sizes.get(str(root)), alarm * self.G)
+
+    def test_used_less_base_caches_and_job_volumes_is_undeclared(self):
+        got = self.check([("/Users/Shared/dd", 50), ("/opt/junk", 20), ("/private/var/folders", 7)], used=200,
+                         volumes=[{"name": "cmux-job-1", "bytes": 3 * self.G}, {"name": "Preboot", "bytes": self.G}],
+                         base=120, caches=[("derived-data", "/Users/Shared/dd")])
+        self.assertEqual(got["declared"], 50 * self.G)
+        self.assertEqual(got["job_volumes"], 3 * self.G)
+        self.assertEqual(got["job_volume_count"], 1)
+        self.assertEqual(got["undeclared"], 27 * self.G)
+        self.assertTrue(got["alarm"])
+        self.assertEqual([t["path"] for t in got["top"]], ["/opt/junk", "/private/var/folders"])
+
+    def test_never_below_zero_and_quiet_under_the_threshold(self):
+        got = self.check([("/opt/a", 1)], used=100, base=120)
+        self.assertEqual(got["undeclared"], 0)
+        self.assertFalse(got["alarm"])
+        self.assertFalse(self.check([], used=124, base=120)["alarm"])
+
+    def test_a_cache_inside_a_wider_row_is_sized_and_taken_out_of_that_row(self):
+        got = self.check([("/Users/Shared", 90)], used=90, caches=[("derived-data", "/Users/Shared/dd")],
+                         sizes={"/Users/Shared/dd": 60 * self.G})
+        self.assertEqual(got["caches"], {"derived-data": 60 * self.G})
+        self.assertEqual(got["top"], [{"path": "/Users/Shared", "bytes": 30 * self.G, "owner": gd.census_owner("/Users/Shared")}])
+
+    def test_an_unsizable_cache_is_named_not_silently_zero(self):
+        got = self.check([("/Users/Shared", 10)], used=10, caches=[("derived-data", "/Users/Shared/dd")])
+        self.assertEqual(got["unsized_caches"], ["derived-data"])
+
+    def test_unattributed_gap_is_a_top_row_and_other_homes_are_redacted(self):
+        got = self.check([("/Users/someone-else/big", 8)], used=20, gap=12)
+        self.assertEqual(got["top"][0]["path"], "(no directory: apfs invisible)")
+        self.assertEqual(got["top"][1]["path"], "private-user-data")
+
+    def test_findings_only_past_the_alarm_and_name_the_fix(self):
+        quiet = {"mount": "/", "undeclared": self.check([], used=1)}
+        loud = {"mount": "/", "undeclared": self.check([("/opt/junk", 20)], used=20)}
+        self.assertEqual(gd.undeclared_findings([quiet, {"mount": "/x", "undeclared": {"error": "nope"}}]), [])
+        [finding] = gd.undeclared_findings([quiet, loud])
+        self.assertEqual((finding["id"], finding["severity"], finding["path"]), ("undeclared_growth", "warn", "/opt/junk"))
+        self.assertIn("20.0 GiB undeclared growth on /", finding["evidence"])
+        self.assertIn("disk-registry.toml", finding["evidence"])
+
+    def test_reads_the_shipped_registry_beside_itself(self):
+        with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "1", "GLAEDA_DISK_REGISTRY_FILE":
+                                          os.fspath(ROOT / "config" / "disk-registry.toml")}), \
+                mock.patch.dict(gd._DISK_REGISTRY_MEM, clear=True):
+            got = gd.undeclared_for_volume(300 * self.G, [(Path("/opt/junk"), 10 * self.G, "keep")], None, 0, "x")
+        self.assertEqual(got["base"], 120 * self.G)
+        self.assertEqual(got["alarm_bytes"], 5 * self.G)
+        self.assertEqual(got["undeclared"], 180 * self.G)
+        with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "0"}):
+            self.assertIsNone(gd.undeclared_for_volume(1, [], None, 0, "x"))
+
+    def test_a_broken_registry_shows_as_an_error_not_zero_growth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "r.toml"
+            bad.write_text('schema = "glaeda-disk-registry/v1"\n[checker]\nnope = 1\n')
+            with mock.patch.dict(os.environ, {gd.CHECKER_ENV: "1", "GLAEDA_DISK_REGISTRY_FILE": os.fspath(bad)}), \
+                    mock.patch.dict(gd._DISK_REGISTRY_MEM, clear=True):
+                got = gd.undeclared_for_volume(1, [], None, 0, "x")
+        self.assertIn("registry not loaded", got["error"])
+
+
+class CmuxStandsDownTest(unittest.TestCase):
+    """cmuxterm-hq docs/design/glaeda-into-cmux.md move 2: `glaeda-disk --role devbox` skips the build caches cmux's
+    worktree care cleans (manaflow-ai/cmux#50468) when cmux's `worktrees.cleanBuildCaches` is on, and says so."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        for name, value in (("HOME", self.home), ("ROLE", "devbox"), ("process_evidence", lambda: ([], ""))):
+            patcher = mock.patch.object(gd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.dd = self.home / "Library/Developer/Xcode/DerivedData"
+        make(self.dd / "proj-abc", mib=2)
+
+    def settings(self, text: str, name: str = "cmux-next.json") -> Path:
+        path = self.home / ".config/cmux" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def verdicts(self) -> dict[str, tuple[str, list[str]]]:
+        fams = [gd.Family("xcode-derived-data", self.dd, True, "rebuilds", build_output=True)]
+        return {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey(fams, 24, 1 << 20)}
+
+    def test_derived_data_stays_for_cmux_only_with_the_setting_on(self) -> None:
+        self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")  # no settings file: glaeda acts
+        self.settings('{"worktrees": {"cleanBuildCaches": false}}')
+        self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")
+        self.settings('{"worktrees": {"cleanBuildCaches": true}}')
+        verdict, reasons = self.verdicts()["proj-abc"]
+        self.assertEqual(verdict, "kept")
+        self.assertIn(gd.CMUX_OWNED_REASON, reasons)
+        with mock.patch.object(gd, "ROLE", "fleet-mini"):  # a fleet host is glaeda's whatever the setting
+            self.assertEqual(self.verdicts()["proj-abc"][0], "reclaimable")
+
+    def test_the_setting_reads_as_cmux_reads_it(self) -> None:
+        self.assertFalse(gd.cmux_build_caches_on())
+        self.settings('// c\n{"worktrees.cleanBuildCaches": true, /* flat key */ "x": "a//b,}",}', "cmux.json")
+        self.assertTrue(gd.cmux_build_caches_on())  # classic file before the app's first launch copies it
+        self.settings('﻿{"worktrees": {"cleanBuildCaches": false,},}')
+        self.assertFalse(gd.cmux_build_caches_on())  # cmux-next.json wins over classic
+        self.settings('{"worktrees": {"cleanBuildCaches": tru')
+        self.assertFalse(gd.cmux_build_caches_on())  # unreadable: off, as cmux keeps its caches then
+        self.settings('{"worktrees": {"cleanBuildCaches": "true"}}')
+        self.assertFalse(gd.cmux_build_caches_on())
+        other = self.home / "elsewhere.json"
+        other.write_text('{"worktrees": {"cleanBuildCaches": true}}')
+        with mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": "~/elsewhere.json"}):
+            self.assertTrue(gd.cmux_build_caches_on())  # the override alone
+        with mock.patch.dict(os.environ, {"CMUX_NEXT_CONFIG_FILE": os.fspath(self.home / "none.json")}):
+            self.assertFalse(gd.cmux_build_caches_on())
+
+    def test_only_cmux_cache_roots_and_what_is_inside_them(self) -> None:
+        for rel in gd.CMUX_OWNED_CACHE_ROOTS:
+            self.assertTrue(gd.cmux_owned_cache(self.home / rel), rel)
+            self.assertTrue(gd.cmux_owned_cache(self.home / rel / "child"), rel)
+        for rel in (".npm", ".bun", "Library/Caches", "Library/Caches/org.swift.swiftpm-other", ".cache/go-build",
+                    "Library/Developer/Xcode"):
+            self.assertFalse(gd.cmux_owned_cache(self.home / rel), rel)
+
+    def test_the_report_says_cmux_acts(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report([], [], 0, 24)
+        self.assertNotIn("cmux acts here", out.getvalue())
+        self.settings('{"worktrees": {"cleanBuildCaches": true}}')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gd.report([], [], 0, 24)
+        self.assertIn("cmux acts here (worktrees.cleanBuildCaches on)", out.getvalue())
+        self.assertIn("~/Library/Developer/Xcode/DerivedData", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

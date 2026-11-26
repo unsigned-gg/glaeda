@@ -11,6 +11,12 @@ Examples::
     glaeda-runner-hygiene --user cmux
     sudo glaeda-runner-hygiene --user cmux --apply
     sudo glaeda-runner-hygiene --user cmux --uninstall --apply
+    glaeda-runner-hygiene --user cmux --check    is the installed job what --apply of this source leaves (JSON)
+    sudo glaeda-runner-hygiene --root-census --apply    the host's root census alone, with no account enrolled
+    glaeda-runner-hygiene --root-census --check  is the host's root census what --apply of this source leaves (JSON)
+
+The root glaeda-daemon-heal pass runs --check and then --apply from its verified copy of the stable release, so
+the pinned snapshot follows stable with no hand step (docs/RUNNER_ACCOUNT_HYGIENE.md).
 """
 
 from __future__ import annotations
@@ -45,6 +51,18 @@ INTERVAL = 15 * 60
 MIN_UID = 500  # macOS system accounts are below this boundary.
 LAUNCHCTL_TIMEOUT = 10
 MANAGED_COMMENT = "glaeda-runner-hygiene managed plist v1"
+ROOT_UID = 0  # the owner an install must have (tests patch it with their own uid)
+# The host's root census (glaeda-disk --root-census): one per host, installed and kept current with every enrolled
+# account's job, so a CI mini's accounting sizes every folder of every account (other homes, /private/var, /Library,
+# guarded folders) instead of reporting them unreadable. It runs as root, read-only: du, listdir and lstat, and one
+# JSON doc under /Library/Application Support/glaeda/root-census. Its snapshot is pinned and root-owned like the
+# account's. CI minis have it: every enrolled account's job keeps it, and on a CI mini where no account was ever
+# enrolled (the lent CI minis, 2026-11-18: none had it) root daemon-heal keeps it with --root-census. A devbox has none.
+CENSUS_LABEL = f"{LABEL_PREFIX}.root-census"
+CENSUS_DIR_NAME = "root-census"
+CENSUS_INTERVAL = 30 * 60
+CENSUS_COMMENT = "glaeda-runner-hygiene managed root census v1"
+OK_INSTALL = {"missing", "managed", "repairable"}  # _managed_install notes --apply may proceed from
 
 
 class HygieneError(RuntimeError):
@@ -70,6 +88,41 @@ class Install:
     plist: Path
     label: str
     launchctl: Path
+
+    @property
+    def census_dir(self) -> Path:
+        return self.root / CENSUS_DIR_NAME
+
+    @property
+    def census_snapshot(self) -> Path:
+        return self.census_dir / DISK_NAME
+
+    @property
+    def census_plist(self) -> Path:
+        return self.plist.parent / f"{CENSUS_LABEL}.plist"
+
+
+@dataclasses.dataclass(frozen=True)
+class Census:
+    """The host's root census alone, with no account: what --root-census installs and checks. It has every attribute
+    the census functions read from an Install, so both go through the same checks."""
+    python: Path
+    source: Path
+    root: Path
+    daemons: Path
+    launchctl: Path
+
+    @property
+    def census_dir(self) -> Path:
+        return self.root / CENSUS_DIR_NAME
+
+    @property
+    def census_snapshot(self) -> Path:
+        return self.census_dir / DISK_NAME
+
+    @property
+    def census_plist(self) -> Path:
+        return self.daemons / f"{CENSUS_LABEL}.plist"
 
 
 def _absolute_real(path: Path, label: str) -> Path:
@@ -258,6 +311,19 @@ def build_install(account_name: str, source: Path | None = None, python: Path | 
                    _launchctl(launchctl))
 
 
+def build_census(source: Path | None = None, python: Path | None = None, root: Path = INSTALL_ROOT,
+                 daemons: Path = LAUNCH_DAEMONS, launchctl: Path | None = None) -> Census:
+    """The host's root census with no account: the same source, python, path and launchctl checks as an account's."""
+    source_path = _source(source or DEFAULT_SOURCE)
+    python_path = resolve_python(python)
+    root = _absolute_real(root, "install root") if root.exists() else root
+    if root.exists() and root.is_symlink():
+        raise HygieneError(f"install root must not be a symlink: {root}")
+    _existing_parent_chain(root)
+    daemons = _absolute_real(daemons, "LaunchDaemons directory") if daemons.exists() else daemons
+    return Census(python_path, source_path, root, daemons, _launchctl(launchctl))
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -291,6 +357,71 @@ def plist_bytes(install: Install) -> bytes:
     return plistlib.dumps(plist_for(install), fmt=plistlib.FMT_XML, sort_keys=False)
 
 
+def census_plist_for(install: Install) -> dict:
+    """The host's root census job: no UserName, so launchd runs it as root, in the system domain (no login session,
+    so no privacy prompt can reach a screen). Read-only by construction: glaeda-disk --root-census deletes nothing."""
+    return {
+        "Label": CENSUS_LABEL,
+        "Comment": CENSUS_COMMENT,
+        "ProgramArguments": [os.fspath(install.python), "-I", os.fspath(install.census_snapshot), "--root-census"],
+        "StartInterval": CENSUS_INTERVAL,
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "Nice": 19,
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+    }
+
+
+def census_plist_bytes(install: Install) -> bytes:
+    return plistlib.dumps(census_plist_for(install), fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def _managed_census(install: Install) -> str:
+    """"missing", "managed", or why the census plist or directory is not ours to replace."""
+    plist, directory = install.census_plist, install.census_dir
+    if os.path.lexists(directory):
+        if directory.is_symlink() or not directory.is_dir():
+            return "root census directory is not a real directory"
+        if {p.name for p in directory.iterdir()} - {DISK_NAME}:
+            return "root census directory contains unrelated files"
+        if install.census_snapshot.is_symlink():
+            return "root census snapshot is a symlink"
+    if not os.path.lexists(plist):
+        return "missing"
+    if plist.is_symlink():
+        return "root census plist is a symlink"
+    try:
+        content = plistlib.loads(plist.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        return f"unreadable root census plist: {exc}"
+    if not isinstance(content, dict) or content.get("Comment") != CENSUS_COMMENT or content.get("Label") != CENSUS_LABEL:
+        return "existing root census plist is not a glaeda-runner-hygiene plist"
+    if "UserName" in content:
+        return "existing root census plist was edited"
+    return "managed"
+
+
+def census_stale(install: Install, want: str) -> list[str]:
+    """Why the host's root census is not what --apply of this source leaves ([] when it is)."""
+    note = _managed_census(install)
+    if note not in {"missing", "managed"}:
+        raise HygieneError(note)
+    stale = []
+    if not install.census_snapshot.is_file():
+        stale.append("root census snapshot missing")
+    elif _sha256(install.census_snapshot) != want:
+        stale.append("root census snapshot is not this source")
+    if note == "missing":
+        stale.append("root census plist missing")
+    elif install.census_plist.read_bytes() != census_plist_bytes(install):
+        stale.append("root census plist is not this release's")
+    if not stale and not service_loaded(install, CENSUS_LABEL):
+        stale.append("root census daemon not loaded")
+    return stale
+
+
 def _managed_plist(install: Install) -> tuple[bool, str]:
     if not os.path.lexists(install.plist):
         return False, "missing"
@@ -304,15 +435,30 @@ def _managed_plist(install: Install) -> tuple[bool, str]:
         return False, "existing plist is not a glaeda-runner-hygiene plist"
     if content.get("Label") != install.label or content.get("UserName") != install.account.name:
         return False, "existing plist belongs to another account or label"
-    if content != plist_for(install):
+    if content != plist_for(install) and _recorded_plist_sha256(install) != _sha256(install.plist):
+        # A plist an older release wrote (its manifest records these bytes) is ours to replace; any other is an edit.
         return False, "existing plist was edited"
     try:
         st = install.plist.stat()
     except OSError as exc:
         return False, f"cannot stat existing plist: {exc}"
-    if st.st_uid != 0 or st.st_gid != _root_gid() or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    if st.st_uid != ROOT_UID or st.st_gid != _root_gid() or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         return False, "existing plist is not root-owned and protected"
     return True, "managed"
+
+
+def _recorded_plist_sha256(install: Install) -> object:
+    """The plist digest the manifest recorded at the last --apply; _managed_install checks the manifest itself."""
+    with contextlib.suppress(OSError, ValueError):
+        doc = json.loads(install.manifest.read_text())
+        return doc.get("plist_sha256") if isinstance(doc, dict) else None
+    return None
+
+
+def _device_bound(recorded: object, install_device: int, daemons_device: int) -> bool:
+    """Whether the install directory is still on the filesystem its manifest was written for: the recorded st_dev,
+    or, since a reboot renumbers it, the filesystem of the LaunchDaemons directory whose daemon runs the snapshot."""
+    return recorded == install_device or install_device == daemons_device
 
 
 def _managed_install(install: Install) -> tuple[bool, str]:
@@ -324,24 +470,26 @@ def _managed_install(install: Install) -> tuple[bool, str]:
         directory_stat = install.install_dir.stat()
     except OSError as exc:
         return False, f"cannot stat install directory: {exc}"
-    if (directory_stat.st_uid != 0 or directory_stat.st_gid != _root_gid()
+    if (directory_stat.st_uid != ROOT_UID or directory_stat.st_gid != _root_gid()
             or (directory_stat.st_mode & 0o777) != 0o755):
         return False, "install directory is not root-owned and protected"
     names = {p.name for p in install.install_dir.iterdir()}
     if names - {DISK_NAME, MANIFEST_NAME}:
         return False, "install directory contains unrelated files"
-    if MANIFEST_NAME not in names or DISK_NAME not in names:
+    if MANIFEST_NAME not in names:
         return False, "install directory is incomplete"
-    for item in (install.snapshot, install.manifest):
+    # Under a valid root-owned manifest, a missing snapshot is repairable (an interrupted --apply); --apply rewrites it.
+    snapshot_present = DISK_NAME in names
+    for item in (install.snapshot, install.manifest) if snapshot_present else (install.manifest,):
         if item.is_symlink() or not item.is_file():
             return False, "install snapshot contains a symlink or non-file"
     try:
-        snapshot_stat = install.snapshot.stat()
         manifest_stat = install.manifest.stat()
-        if (snapshot_stat.st_uid != 0 or manifest_stat.st_uid != 0 or
+        snapshot_stat = install.snapshot.stat() if snapshot_present else manifest_stat
+        if (snapshot_stat.st_uid != ROOT_UID or manifest_stat.st_uid != ROOT_UID or
                 snapshot_stat.st_gid != _root_gid() or manifest_stat.st_gid != _root_gid()):
             return False, "install snapshot is not root-owned"
-        if (snapshot_stat.st_mode & 0o777) != 0o555 or (manifest_stat.st_mode & 0o777) != 0o444:
+        if ((snapshot_stat.st_mode & 0o777) != 0o555 and snapshot_present) or (manifest_stat.st_mode & 0o777) != 0o444:
             return False, "install snapshot has unsafe permissions"
         if (snapshot_stat.st_mode | manifest_stat.st_mode) & (stat.S_IWGRP | stat.S_IWOTH):
             return False, "install snapshot is writable by another account"
@@ -358,15 +506,20 @@ def _managed_install(install: Install) -> tuple[bool, str]:
         return False, "install manifest points at another interpreter"
     try:
         device = install.install_dir.stat().st_dev
+        daemons_device = install.plist.parent.stat().st_dev
     except OSError as exc:
         return False, f"cannot stat install device: {exc}"
-    if manifest.get("device") != device:
+    # macOS renumbers APFS st_dev across boots, so the recorded number goes stale on every reboot and then refused
+    # every reinstall and uninstall (2026-10-27: 16777232 recorded, 16777230 after a restart, same volume). The
+    # binding that holds is today's: the snapshot lives on the filesystem of the LaunchDaemon that runs it.
+    if not _device_bound(manifest.get("device"), device, daemons_device):
         return False, "install manifest is bound to another filesystem"
-    if manifest.get("sha256") != _sha256(install.snapshot):
-        return False, "install snapshot digest does not match its manifest"
-    if (not install.plist.is_file()
-            or manifest.get("plist_sha256") != _sha256(install.plist)):
-        return False, "install plist digest does not match its manifest"
+    # Only root can write these root-owned, protected files, so bytes that differ from the manifest are an --apply
+    # that did not finish (snapshot swapped before the plist and manifest), not someone else's: repairable, and
+    # --apply rewrites all three. A plist that is not ours is refused separately by _managed_plist.
+    if (not snapshot_present or manifest.get("sha256") != _sha256(install.snapshot)
+            or not install.plist.is_file() or manifest.get("plist_sha256") != _sha256(install.plist)):
+        return True, "repairable"
     return True, "managed"
 
 
@@ -380,8 +533,8 @@ def launchctl_run(install: Install, *args: str) -> subprocess.CompletedProcess[s
         raise HygieneError(f"launchctl {' '.join(args)} failed: {exc}") from exc
 
 
-def service_loaded(install: Install) -> bool:
-    result = launchctl_run(install, "print", f"system/{install.label}")
+def service_loaded(install: Install, label: str | None = None) -> bool:
+    result = launchctl_run(install, "print", f"system/{label or install.label}")
     if result.returncode == 0:
         return True
     detail = (result.stderr or "").lower()
@@ -456,7 +609,7 @@ def plan(install: Install, uninstall: bool = False) -> dict:
     if uninstall:
         if plist_note not in {"missing", "managed"}:
             raise HygieneError(plist_note)
-        if install_note not in {"missing", "managed"}:
+        if install_note not in OK_INSTALL:
             raise HygieneError(install_note)
         if managed_plist and not managed_install:
             raise HygieneError("managed plist has no matching install manifest")
@@ -466,14 +619,44 @@ def plan(install: Install, uninstall: bool = False) -> dict:
                 "install_dir": os.fspath(install.install_dir) if managed_install else None}
     if plist_note not in {"missing", "managed"}:
         raise HygieneError(plist_note)
-    if install_note not in {"missing", "managed"}:
+    if install_note not in OK_INSTALL:
         raise HygieneError(install_note)
     return {"state": "planned", "operation": "install", "uid": install.account.uid,
             "user": install.account.name, "home": os.fspath(install.account.home),
             "label": install.label, "snapshot": os.fspath(install.snapshot),
             "plist": os.fspath(install.plist), "python": os.fspath(install.python),
             "sha256": _sha256(install.source), "loaded": loaded,
-            "program_arguments": plist_for(install)["ProgramArguments"]}
+            "program_arguments": plist_for(install)["ProgramArguments"],
+            "root_census": {"label": CENSUS_LABEL, "plist": os.fspath(install.census_plist),
+                            "snapshot": os.fspath(install.census_snapshot), "state": _managed_census(install),
+                            "program_arguments": census_plist_for(install)["ProgramArguments"]}}
+
+
+def check(install: Install) -> dict:
+    """Read-only: is the installed job byte for byte what --apply of this source leaves, and loaded? An install
+    that is not ours (edited plist, unrelated files) is refused here as --apply refuses it, never reported stale."""
+    _managed_plist_ok, plist_note = _managed_plist(install)
+    _managed_ok, install_note = _managed_install(install)
+    if plist_note not in {"missing", "managed"}:
+        raise HygieneError(plist_note)
+    if install_note not in OK_INSTALL:
+        raise HygieneError(install_note)
+    want = _sha256(install.source)
+    stale = [] if install_note != "repairable" else ["an earlier --apply did not finish"]
+    if install_note == "missing" or not install.snapshot.is_file():
+        stale.append("snapshot missing")
+    elif _sha256(install.snapshot) != want:
+        stale.append("snapshot is not this source")
+    if plist_note == "missing":
+        stale.append("plist missing")
+    elif install.plist.read_bytes() != plist_bytes(install):
+        stale.append("plist is not this release's")
+    if not stale and not service_loaded(install):
+        stale.append("daemon not loaded")
+    stale += census_stale(install, want)
+    return {"state": "stale" if stale else "current", "stale": stale, "uid": install.account.uid,
+            "user": install.account.name, "label": install.label, "sha256": want,
+            "installed": _sha256(install.snapshot) if install.snapshot.is_file() else None}
 
 
 def _require_root() -> None:
@@ -489,12 +672,12 @@ def apply_install(install: Install) -> dict:
     managed_install, install_note = _managed_install(install)
     if plist_note not in {"missing", "managed"}:
         raise HygieneError(plist_note)
-    if install_note not in {"missing", "managed"}:
+    if install_note not in OK_INSTALL:
         raise HygieneError(install_note)
     if managed_install:
-        for item in (install.snapshot, install.manifest):
+        for item in (p for p in (install.snapshot, install.manifest) if p.exists()):
             st = item.stat()
-            if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if st.st_uid != ROOT_UID or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise HygieneError(f"existing install file is not root-owned and protected: {item}")
     install.install_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     os.chown(install.install_dir, 0, _root_gid())
@@ -504,10 +687,8 @@ def apply_install(install: Install) -> dict:
     except OSError as exc:
         raise HygieneError(f"cannot read glaeda-disk source: {install.source}: {exc}") from exc
     digest = _sha256_bytes(source_bytes)
-    existing_digest = None
-    if managed_install:
-        with contextlib.suppress(OSError, ValueError):
-            existing_digest = json.loads(install.manifest.read_text()).get("sha256")
+    # The bytes on disk, not the manifest's record: after an interrupted --apply the two differ.
+    existing_digest = _sha256(install.snapshot) if managed_install and install.snapshot.is_file() else None
     if existing_digest != digest:
         if install.snapshot.exists():
             _immutable(install.snapshot, False)
@@ -516,7 +697,8 @@ def apply_install(install: Install) -> dict:
     expected = plist_bytes(install)
     changed = not install.plist.exists() or install.plist.read_bytes() != expected
     if changed:
-        if managed_plist and service_loaded(install):
+        # A job of ours (its plist, or its validated install with the plist gone) may still be loaded: boot it out.
+        if (managed_plist or managed_install) and service_loaded(install):
             result = launchctl_run(install, "bootout", f"system/{install.label}")
             if result.returncode not in (0, 113):
                 raise HygieneError(f"launchctl bootout failed: {result.stderr.strip()[-200:]}")
@@ -532,9 +714,100 @@ def apply_install(install: Install) -> dict:
             raise HygieneError(f"launchctl bootstrap failed: {result.stderr.strip()[-200:]}")
         if not service_loaded(install):
             raise HygieneError("launchctl bootstrap returned success but the daemon is not loaded")
+    apply_census(install, source_bytes, digest)
     return {"state": "applied", "operation": "install", "uid": install.account.uid,
             "user": install.account.name, "label": install.label, "sha256": digest,
             "snapshot": os.fspath(install.snapshot), "plist": os.fspath(install.plist), "loaded": True}
+
+
+def apply_census(install: Install, source_bytes: bytes, digest: str) -> None:
+    """Install or refresh the host's root census: its pinned snapshot of this source and its root LaunchDaemon."""
+    note = _managed_census(install)
+    if note not in {"missing", "managed"}:
+        raise HygieneError(note)
+    install.census_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    os.chown(install.census_dir, 0, _root_gid())
+    os.chmod(install.census_dir, 0o755)
+    snapshot = install.census_snapshot
+    if not snapshot.is_file() or _sha256(snapshot) != digest:
+        if snapshot.exists():
+            _immutable(snapshot, False)
+        _atomic_write(snapshot, source_bytes, 0o555)
+        _immutable(snapshot, True)
+    expected = census_plist_bytes(install)
+    plist = install.census_plist
+    changed = not plist.exists() or plist.read_bytes() != expected
+    if changed:
+        if note == "managed" and service_loaded(install, CENSUS_LABEL):
+            result = launchctl_run(install, "bootout", f"system/{CENSUS_LABEL}")
+            if result.returncode not in (0, 113):
+                raise HygieneError(f"launchctl bootout of the root census failed: {result.stderr.strip()[-200:]}")
+        _atomic_write(plist, expected, 0o644)
+    if changed or not service_loaded(install, CENSUS_LABEL):
+        result = launchctl_run(install, "bootstrap", "system", os.fspath(plist))
+        if result.returncode:
+            raise HygieneError(f"launchctl bootstrap of the root census failed: {result.stderr.strip()[-200:]}")
+        if not service_loaded(install, CENSUS_LABEL):
+            raise HygieneError("launchctl bootstrap returned success but the root census is not loaded")
+
+
+def census_plan(census: Census) -> dict:
+    """Read-only and launchctl-free, like plan(): what --root-census --apply would install."""
+    note = _managed_census(census)
+    if note not in {"missing", "managed"}:
+        raise HygieneError(note)
+    return {"state": "planned", "operation": "root-census", "label": CENSUS_LABEL, "census": note,
+            "plist": os.fspath(census.census_plist), "snapshot": os.fspath(census.census_snapshot),
+            "sha256": _sha256(census.source), "program_arguments": census_plist_for(census)["ProgramArguments"]}
+
+
+def check_census(census: Census) -> dict:
+    """Read-only, like check(): is the host's root census what --root-census --apply of this source leaves."""
+    want = _sha256(census.source)
+    stale = census_stale(census, want)
+    return {"state": "stale" if stale else "current", "stale": stale, "label": CENSUS_LABEL, "sha256": want,
+            "installed": _sha256(census.census_snapshot) if census.census_snapshot.is_file() else None}
+
+
+def apply_root_census(census: Census) -> dict:
+    """Install or refresh the host's root census on its own, so a CI mini with no enrolled account still has it.
+    The same root-owned path checks as an account's --apply, then apply_census (which refuses a plist or directory
+    that is not ours)."""
+    _require_root()
+    _check_root_install_path(census.root, True)
+    _check_root_install_path(census.daemons, True)
+    try:
+        source_bytes = census.source.read_bytes()
+    except OSError as exc:
+        raise HygieneError(f"cannot read glaeda-disk source: {census.source}: {exc}") from exc
+    digest = _sha256_bytes(source_bytes)
+    if not census.root.exists():  # the root an account's enrollment checks later: root-owned, writable by root only
+        census.root.mkdir(mode=0o755, parents=True)
+        os.chown(census.root, 0, _root_gid())
+        os.chmod(census.root, 0o755)
+    apply_census(census, source_bytes, digest)
+    return {"state": "applied", "operation": "root-census", "label": CENSUS_LABEL, "sha256": digest,
+            "snapshot": os.fspath(census.census_snapshot), "plist": os.fspath(census.census_plist), "loaded": True}
+
+
+def uninstall_census(install: Install) -> bool:
+    """Remove the host's root census once no enrolled account's job is left; True when it was removed."""
+    with contextlib.suppress(OSError):
+        if any(d.name.isdigit() and (d / MANIFEST_NAME).is_file() for d in install.root.iterdir()):
+            return False
+    if _managed_census(install) not in {"missing", "managed"}:
+        return False  # not ours: left as it is
+    if os.path.lexists(install.census_plist) and service_loaded(install, CENSUS_LABEL):
+        result = launchctl_run(install, "bootout", f"system/{CENSUS_LABEL}")
+        if result.returncode not in (0, 113):
+            raise HygieneError(f"launchctl bootout of the root census failed: {result.stderr.strip()[-200:]}")
+    install.census_plist.unlink(missing_ok=True)
+    if install.census_snapshot.exists():
+        _immutable(install.census_snapshot, False)
+        install.census_snapshot.unlink()
+    with contextlib.suppress(OSError):
+        install.census_dir.rmdir()
+    return True
 
 
 def apply_uninstall(install: Install) -> dict:
@@ -545,11 +818,11 @@ def apply_uninstall(install: Install) -> dict:
     managed_install, install_note = _managed_install(install)
     if plist_note not in {"missing", "managed"}:
         raise HygieneError(plist_note)
-    if install_note not in {"missing", "managed"}:
+    if install_note not in OK_INSTALL:
         raise HygieneError(install_note)
     if managed_plist and not managed_install:
         raise HygieneError("managed plist has no matching install manifest")
-    if managed_plist and service_loaded(install):
+    if (managed_plist or managed_install) and service_loaded(install):
         result = launchctl_run(install, "bootout", f"system/{install.label}")
         if result.returncode not in (0, 113):
             raise HygieneError(f"launchctl bootout failed: {result.stderr.strip()[-200:]}")
@@ -558,21 +831,27 @@ def apply_uninstall(install: Install) -> dict:
     if managed_plist:
         install.plist.unlink()
     if managed_install:
-        _immutable(install.snapshot, False)
+        if install.snapshot.exists():
+            _immutable(install.snapshot, False)
         install.snapshot.unlink(missing_ok=True)
         install.manifest.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             install.install_dir.rmdir()
+    census_removed = uninstall_census(install)
     return {"state": "applied", "operation": "uninstall", "uid": install.account.uid,
-            "user": install.account.name, "label": install.label}
+            "user": install.account.name, "label": install.label, "root_census_removed": census_removed}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--user", "--account", dest="user", required=True,
+    parser.add_argument("--user", "--account", dest="user",
                         help="named non-system macOS account to clean")
+    parser.add_argument("--root-census", action="store_true",
+                        help="the host's root census alone, with no account: plan, --check or --apply")
     parser.add_argument("--apply", action="store_true", help="perform the planned install/removal")
     parser.add_argument("--uninstall", action="store_true", help="plan/remove the managed job")
+    parser.add_argument("--check", action="store_true",
+                        help="report whether the installed job is this source's (read-only, JSON)")
     parser.add_argument("--source", "--disk-source", type=Path, default=None,
                         help="glaeda-disk source to pin (default: beside this script)")
     parser.add_argument("--python", type=Path, default=None, help="absolute python3 to pin")
@@ -582,13 +861,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if platform.system() != "Darwin":
         parser.error("runner account hygiene is macOS-only")
+    if args.check and (args.apply or args.uninstall):
+        parser.error("--check is read-only and only checks an install")
     if args.uninstall and args.source is not None:
         parser.error("--source is only valid for install")
+    if args.root_census and (args.user or args.uninstall):
+        parser.error("--root-census takes no --user and no --uninstall (the last account's --uninstall removes it)")
+    if not args.root_census and not args.user:
+        parser.error("--user is required (or --root-census)")
     try:
+        if args.root_census:
+            census = build_census(args.source, args.python, args.install_root, args.launch_daemons, args.launchctl)
+            result = (check_census(census) if args.check else
+                      apply_root_census(census) if args.apply else census_plan(census))
+            print(json.dumps(result, sort_keys=True))
+            return 0
         install = build_install(args.user, None if args.uninstall else args.source, args.python,
                                 args.install_root, args.launch_daemons, args.launchctl,
                                 uninstall=args.uninstall)
-        result = (apply_uninstall(install) if args.uninstall and args.apply else
+        result = (check(install) if args.check else
+                  apply_uninstall(install) if args.uninstall and args.apply else
                   apply_install(install) if args.apply else plan(install, args.uninstall))
     except HygieneError as exc:
         print(f"glaeda-runner-hygiene: {exc}", file=sys.stderr)

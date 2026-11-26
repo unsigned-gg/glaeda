@@ -1,0 +1,1874 @@
+#!/usr/bin/env python3
+"""glaeda-daemon-heal: keep macOS system daemons from holding a core for hours on a glaeda host.
+
+    glaeda-daemon-heal --policy P               plan: what a pass would do now (changes nothing)
+    glaeda-daemon-heal --policy P --apply       one reconcile pass (the root LaunchDaemon, every policy every_s)
+    glaeda-daemon-heal --install --policy P     plan the root install
+    sudo glaeda-daemon-heal --install --policy P --apply   install or update it (idempotent)
+    glaeda-daemon-heal --status --policy P      is the installed copy this one (any user; JSON)
+
+Desired state (config/macos-daemons.json, the one source of every number here): no daemon in `daemons` uses
+`hot_cores` or more for `hot_hours`. Each pass samples each daemon's CPU time with ps; a streak starts at the first
+interval at or above hot_cores and ends at the first below it, or when the pid changes. A daemon past hot_hours is
+restarted: SIGTERM, then SIGKILL after stop_wait_s, and launchd (KeepAlive or on demand) starts a fresh one. That is
+what clears fseventsd's wedged notify thread (cmux9 10-20: 100% CPU and 27 GiB RSS with no disk I/O, 1.5% and 4 MiB
+after one restart). A `wait_idle` daemon (fseventsd: a restart drops live FSEvents streams) waits while a process
+named in `busy` runs, up to busy_hot_hours. At most max_restarts_per_day per daemon, so nothing loops.
+
+A daemon whose memory footprint (top's MEM: resident, compressed and swapped pages) is footprint_gib or more is
+restarted at once, busy host or not: a wedged fseventsd never gives that memory back, and its swap files take the
+disk the runners need. cmuxs-mac-mini-6 10-25: fseventsd at 102 GiB footprint for 14 days, 65 GiB of swap files on
+the VM volume and 3 GiB left on a 460 GiB disk, while its CPU streak kept breaking and the busy wait held it 8 h.
+
+Only processes whose executable is exactly a policy path run as a system account (uid < 500) are touched, and a
+policy path must lie under a SIP-protected system directory. The installed copy and its policy are root-owned
+snapshots under INSTALL_DIR run by /usr/bin/python3 -I, so nothing the runner user (or a PR job) can write runs as
+root.
+
+The root copy keeps itself on the stable release (policy `release`), so a release that changes this script or the
+policy reaches every mini with no hand step. Every release.every_s an --apply pass reads ota-channels/control.json
+and stable.json from the first of release.sources that answers (glaeda-update's channel: this repository, or its
+byte-identical mirror), over HTTPS only. When the tag differs from the one installed, or the installed files no
+longer hash to what that tag shipped, it downloads release.json (its SHA-256 must be the channel's), then the macOS
+glaeda-hygiene archive (size and SHA-256 must be release.json's), and reads exactly two members from it in memory:
+glaeda/scripts/glaeda-daemon-heal and glaeda/config/macos-daemons.json. Those are staged root-owned and must plan a
+pass with each other (the new code's own check of its own policy) before they replace the snapshot; the next pass
+runs them. A pass whose plist no longer matches its policy (every_s changed) reloads the LaunchDaemon from a detached
+helper, after the pass exits. Nothing the runner user can write is read: not ~/.config/glaeda, not the release
+copies glaeda-update keeps. The report says what it runs and what the channel wants, and `judge` turns a report into
+current, stale or missing for glaeda-mini-health and glaeda-fleet-status (daemon_heal_missing, daemon_heal_stale).
+A copy installed before this existed cannot update itself: one root --install of a current release makes it.
+
+The same root pass also keeps the cmux fleet's root ops scripts current (config/fleet-ops.json, a third file of the
+snapshot that follows the release with the other two): each one's body, pinned to its source commit and SHA-256, at
+/Library/Application Support/cmux-fleet-ops/NAME with its LaunchDaemon. It acts only on a fleet Mac that already has
+that directory and no ec2-user account, never on a reserved host, and treats a reservation list it cannot read as a
+reservation (fleet_ops_hold).
+The same pass keeps each runner account's glaeda-runner-hygiene job on that release: the root-pinned glaeda-disk
+at /Library/Application Support/glaeda/runner-hygiene/<uid> and its LaunchDaemon, which glaeda-update (the runner
+user's) cannot write. glaeda-disk and glaeda-runner-hygiene are two more members the release chain installs into
+this snapshot; for every account that already has a job, that glaeda-runner-hygiene --check compares the snapshot
+and plist with what its --apply leaves, and a stale job is reinstalled by its --apply. A second pass finds them
+current and changes nothing. The report's runnerHygiene says per account: current, stale (with why), or error;
+glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
+On a CI mini where no account was ever enrolled (ci_mini_why_not: the fleet user runs runners glaeda-cmux-runner
+enrolled; never an EC2 Mac or cmux-lawrence), the same pass keeps the host's read-only root census with that
+release's glaeda-runner-hygiene --root-census --check and --apply (runnerHygiene.rootCensus; glaeda-mini-health:
+disk_root_census_stale). Where an account is enrolled its own job keeps the census, so one writer owns its plist.
+The same pass keeps the fleet user's glaeda-update LaunchAgent running (updater_pass): when launchd has it
+disabled and no fleet or host-local reservation holds the host (fleet_ops_hold, failing closed), it enables it and
+bootstraps it into that user's gui domain, with one line in the log. A host whose updater stayed disabled after a
+reservation ended otherwise stays on its old release for good, since that release is what the updater would change.
+The same pass keeps sandboxd answering (policy `sandbox_probe`). Homebrew pours every bottle under sandbox-exec, and a
+sandboxd whose approval queue waits forever on one tccd request hangs every sandboxed process that touches a denied
+mach service: brew sat 8 h in "Pouring" on austin-0 and austin-1 (2026-10-27; sample: 64 sandboxd.approval threads
+behind one tcc_server_message_request_authorization). `launchctl kickstart` of sandboxd is refused under SIP ("150:
+Operation not permitted while System Integrity Protection is engaged", as root), and a reboot clears it (austin-0,
+2026-10-28: the probe went from a hang to 0.5 s and `git submodule status` from 171 s to 0.6 s). So the heal is a
+reboot, behind these gates (fleet decision by claude-sr2 (coordinator), 2026-10-28):
+  - the mini is one the fleet registry opted in: ~/.config/glaeda/tailscale-self-heal.json of the fleet user names it
+    (fleet-registry.json writes it for the ci-runner role only, the same opt-in as glaeda-mini-health's Tailscale
+    self-heal; no host list here), it is a fleet Mac (the fleet-ops directory, no ec2-user), no fleet or host-local
+    reservation holds it, none of its names holds "lawrence", and it comes back by itself (FileVault off, an
+    auto-login user with a saved password);
+  - it is idle (no `busy` process), checked before the probe and again right before the reboot while this pass holds
+    the fleet host.lock and the reservation writers' .reservation.lock exclusively (a ps that fails refuses);
+  - the probe (an ad-hoc signed copy of /bin/date under `(deny mach-lookup)`, killed at slow_s) failed twice, at least
+    confirm_after_s and at most confirm_within_s apart;
+  - no reboot attempt by this heal in the last reboot_every_s (24 h), and none in the last repeat_window_s (7 d), by
+    the clock and by the passes' own capped count (a clock jump cannot open it): a mini that would need a second
+    reboot within that window is not rebooted; the report says needs_operator, which
+    glaeda-mini-health turns into a sandboxd_wedged error that ci-dash keeps as an HQ fleet-alert issue.
+Every step (first slow probe, reboot, refusal, the first probe after a reboot) is a line in STATE/sandboxd-heal.jsonl,
+written and synced before the reboot runs.
+Stdlib only; runs on macOS /usr/bin/python3 (3.9).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime
+import hashlib
+import http.client
+import importlib
+import io
+import json
+import math
+import os
+import plistlib
+import pwd
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-daemon-heal/v1"
+POLICY_SCHEMA = "glaeda-macos-daemons/v1"
+LABEL = "com.teamleaderleo.glaeda.daemon-heal"
+INSTALL_DIR = Path("/Library/Application Support/glaeda/daemon-heal")
+PLIST = Path("/Library/LaunchDaemons") / f"{LABEL}.plist"
+SYSTEM_PYTHON = "/usr/bin/python3"  # SIP-protected; a Homebrew python is writable by the runner user
+SCRIPT_NAME = "glaeda-daemon-heal"
+POLICY_NAME = "macos-daemons.json"
+FLEET_OPS_NAME = "fleet-ops.json"
+DISK_NAME = "glaeda-disk"  # with HYGIENE_NAME: the release's copies the runner-hygiene pass installs from
+HYGIENE_NAME = "glaeda-runner-hygiene"
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/")
+SYSTEM_UID_MAX = 499
+DAY_S = 86400
+GIB = 1 << 30
+UNITS = {"B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, float), "busy_hot_hours": (int, float),
+               "footprint_gib": (int, float), "max_restarts_per_day": int, "stop_wait_s": (int, float), "report_stale_passes": int, "busy": list,
+               "daemons": list, "release": dict}
+# The release channel (glaeda-update and glaeda_release.py write and read the same files).
+REPOSITORY = "teamleaderleo/glaeda"
+RELEASE_SOURCES = (REPOSITORY, "manaflow-ai/glaeda")  # glaeda-update SOURCES: the repository and its mirror
+RING = "stable"  # only releases a canary verified (with attestation) and that soaked
+CONTROL_SCHEMA = "glaeda-ota-control/v1"
+CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
+RELEASE_SCHEMA = "glaeda-release/v1"
+TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+ARCHIVE = "glaeda-hygiene-aarch64-apple-darwin.tar.gz"
+MEMBERS = {SCRIPT_NAME: "glaeda/scripts/glaeda-daemon-heal", POLICY_NAME: "glaeda/config/macos-daemons.json",
+           FLEET_OPS_NAME: "glaeda/config/fleet-ops.json", DISK_NAME: "glaeda/scripts/glaeda-disk",
+           HYGIENE_NAME: "glaeda/scripts/glaeda-runner-hygiene"}
+MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444, FLEET_OPS_NAME: 0o444, DISK_NAME: 0o555, HYGIENE_NAME: 0o555}
+OPTIONAL = {FLEET_OPS_NAME, DISK_NAME, HYGIENE_NAME}  # a hand install and older releases ship the first two only
+SWAP_ORDER = (FLEET_OPS_NAME, DISK_NAME, HYGIENE_NAME, POLICY_NAME, SCRIPT_NAME)  # the running script last
+MAX_META = 1 << 20
+MAX_ARCHIVE = 200 << 20  # glaeda-update MAX_ASSET
+MAX_MEMBER = 4 << 20  # glaeda-disk is the largest member (0.6 MiB)
+FLEET_OPS_SCHEMA = "glaeda-fleet-ops/v1"
+FLEET_OPS_DIR = Path("/Library/Application Support/cmux-fleet-ops")  # fixed here: no policy file directs root's writes
+FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
+RESERVATIONS_SCHEMA = "glaeda-fleet-reservations/v1"
+OP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+MAX_OP_BODY = 256 << 10
+MAX_EXTRACTED = 1 << 30  # glaeda-update MAX_EXTRACTED: what the whole archive may expand to
+ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors, at the archive root
+URL_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
+PAIR_MARK = "ready.json"  # in staged/: the commit point of a script and policy swap
+INSTALLED = "installed.json"  # beside the pair: the release it is (tag, commit, hashes), swapped with it
+FETCH_TIMEOUT = 60
+CHECK_TIMEOUT = 120  # the staged copy's plan pass (ps and one top sample)
+AFTER_PID_WAIT_S = 300
+HYGIENE_ROOT = Path("/Library/Application Support/glaeda/runner-hygiene")  # glaeda-runner-hygiene INSTALL_ROOT
+HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
+HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; the plist is <label>.<uid>.plist
+HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
+HYGIENE_TIMEOUT = 120
+HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
+# The python glaeda-runner-hygiene --root-census pins into the census plist: the one resolve_python() picks first, so
+# a later account enrollment writes the same plist bytes.
+CENSUS_PYTHON = "/usr/bin/python3"
+# sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs.
+SANDBOX_REBOOT = ["/sbin/shutdown", "-r", "now", "glaeda-daemon-heal: sandboxd is wedged (sandbox probe hangs)"]
+SANDBOX_JOURNAL = "sandboxd-heal.jsonl"  # in the state dir
+SANDBOX_JOURNAL_KEEP = 200  # lines kept when the journal is compacted
+SANDBOX_OPT_IN = ".config/glaeda/tailscale-self-heal.json"  # fleet-registry.json's ci-runner opt-in (fleet user)
+SANDBOX_OPT_IN_SCHEMA = "glaeda-tailscale-self-heal/v1"
+SANDBOX_LOGINWINDOW = "/Library/Preferences/com.apple.loginwindow.plist"
+SANDBOX_KCPASSWORD = "/etc/kcpassword"
+SANDBOX_KEYS = ("slow_s", "confirm_after_s", "confirm_within_s", "reboot_every_s", "repeat_window_s")
+# The deny takes effect: on the wedged mini this hangs, while "(version 1)(allow default)" ran the same ad-hoc copy
+# in 0.016 s (austin-0, 2026-10-28). It is the shape of rule Homebrew's bottle sandbox hit.
+SANDBOX_PROBE_PROFILE = "(version 1)(deny mach-lookup)(allow default)"
+SANDBOX_PROBE_SOURCE = "/bin/date"  # copied and ad-hoc signed: a platform binary takes sandboxd's fast path
+
+
+class HealError(RuntimeError):
+    pass
+
+
+# ---------------------------------------------------------------- policy
+
+
+def load_policy(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise HealError(f"cannot read policy {path}: {e}") from e
+    return validate_policy(doc)
+
+
+def validate_policy(doc: Any) -> dict[str, Any]:
+    if not isinstance(doc, dict) or doc.get("schema") != POLICY_SCHEMA:
+        raise HealError(f"policy schema is not {POLICY_SCHEMA}")
+    for key, kind in POLICY_KEYS.items():
+        value = doc.get(key)
+        if isinstance(value, bool) or not isinstance(value, kind):
+            raise HealError(f"policy {key} is missing or not {kind}")
+        if kind not in (list, dict) and value <= 0:
+            raise HealError(f"policy {key} must be positive")
+    if doc["busy_hot_hours"] < doc["hot_hours"]:
+        raise HealError("policy busy_hot_hours must be at least hot_hours")
+    if not all(isinstance(b, str) and b and "/" not in b for b in doc["busy"]):
+        raise HealError("policy busy holds process names")
+    names = set()
+    for d in doc["daemons"]:
+        if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not isinstance(d.get("path"), str) \
+                or not isinstance(d.get("wait_idle"), bool):
+            raise HealError("each policy daemon needs name, path and wait_idle")
+        path = d["path"]
+        if not path.startswith(SYSTEM_PREFIXES) or ".." in path.split("/") or os.path.basename(path) != d["name"]:
+            raise HealError(f"policy daemon {d['name']}: path must be its own executable under {SYSTEM_PREFIXES}")
+        if d["name"] in names:
+            raise HealError(f"policy daemon {d['name']} is listed twice")
+        names.add(d["name"])
+    probe = doc.get("sandbox_probe")
+    if probe is not None:
+        if not isinstance(probe, dict) or not isinstance(probe.get("enabled"), bool):
+            raise HealError("policy sandbox_probe needs enabled")
+        for key in SANDBOX_KEYS:
+            value = probe.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise HealError(f"policy sandbox_probe.{key} must be a positive finite number")
+        if probe["slow_s"] > 60:
+            raise HealError("policy sandbox_probe.slow_s must be at most 60")
+        if not probe["confirm_after_s"] < probe["confirm_within_s"]:
+            raise HealError("policy sandbox_probe.confirm_after_s must be less than confirm_within_s")
+        if probe["reboot_every_s"] < DAY_S or probe["repeat_window_s"] < probe["reboot_every_s"]:
+            raise HealError("policy sandbox_probe: reboot_every_s at least a day, repeat_window_s at least that")
+    release = doc["release"]
+    for key in ("every_s", "stale_s"):
+        if type(release.get(key)) is not int or release[key] <= 0:
+            raise HealError(f"policy release.{key} must be a positive integer")
+    if release["stale_s"] < release["every_s"]:
+        raise HealError("policy release.stale_s must be at least release.every_s")
+    sources = release.get("sources")
+    if not isinstance(sources, list) or not sources or not all(s in RELEASE_SOURCES for s in sources) \
+            or len(set(sources)) != len(sources):
+        raise HealError(f"policy release.sources must name some of {', '.join(RELEASE_SOURCES)}")
+    return doc
+
+
+# ---------------------------------------------------------------- the host
+
+
+def sh(argv: list[str], timeout: float = 15) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def cpu_seconds(text: str) -> float | None:
+    """ps `time` ([dd-][hh:]mm:ss[.ss]; macOS prints minutes past 59, as 1891:53.94) in seconds."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text.strip())
+    if not m:
+        return None
+    d, h, mi, s = m.groups()
+    return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(s)
+
+
+def footprint_bytes(text: str) -> int | None:
+    """top's MEM column (102G, 1264M, 31M+, 4096K, 12B) in bytes."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([BKMGT])[+-]?", text.strip())
+    return None if not m else int(float(m.group(1)) * UNITS[m.group(2)])
+
+
+class Host:
+    """What a pass reads and does. Tests replace these methods."""
+
+    def processes(self) -> list[tuple[int, int, float, str]]:
+        """(pid, uid, cpu seconds, executable) for every process."""
+        rows = []
+        for line in sh(["/bin/ps", "-axww", "-o", "pid=,uid=,time=,comm="])[1].splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                cpu = cpu_seconds(parts[2])
+                if cpu is not None:
+                    rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
+        return rows
+
+    def processes_strict(self) -> list[tuple[int, int, float, str]]:
+        """processes(), but a ps that fails or lists nothing raises: an idle check must never pass on no answer."""
+        code, out, err = sh(["/bin/ps", "-axww", "-o", "pid=,uid=,time=,comm="])
+        rows = []
+        for line in out.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                cpu = cpu_seconds(parts[2])
+                if cpu is not None:
+                    rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
+        if code != 0 or not rows:
+            raise HealError(f"ps gave no process list (exit {code}: {err.strip()[:80]})")
+        return rows
+
+    def footprints(self, pids: list[int]) -> dict[int, int]:
+        """pid -> memory footprint in bytes (top's MEM, which counts compressed and swapped pages; ps rss does not)."""
+        if not pids:
+            return {}
+        argv = ["/usr/bin/top", "-l", "1", "-s", "0", "-stats", "pid,mem"]
+        for pid in pids:
+            argv += ["-pid", str(pid)]
+        code, text, _err = sh(argv, timeout=30)
+        if code != 0:  # a failed top measured nothing, whatever it printed
+            return {}
+        out = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in pids:
+                size = footprint_bytes(parts[1])
+                if size is not None:
+                    out[int(parts[0])] = size
+        return out
+
+    def signal(self, pid: int, sig: int) -> bool:
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def now(self) -> float:
+        return time.time()
+
+    journal = None  # the sandboxd journal's path; run_pass sets it to STATE/sandboxd-heal.jsonl
+    # A missing journal is no reboots yet (a fresh install). Losing one after a reboot is caught by the state's
+    # reboot_t, which the pass that rebooted wrote, and refuses.
+
+    def sandbox_hold(self, now: float) -> str:
+        """Why this mini is never rebooted by the sandboxd heal right now ("" when it may be)."""
+        why = fleet_ops_eligible(FLEET_OPS_DIR) or fleet_ops_hold(now)
+        if why:
+            return why
+        names = {platform_node().split(".")[0].lower()}
+        try:
+            home = Path(pwd.getpwuid(os.stat(FLEET_ROOT).st_uid).pw_dir)
+        except (OSError, KeyError) as e:
+            return f"no fleet user (owner of {FLEET_ROOT}): {type(e).__name__}"
+        with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
+            host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+            if isinstance(host, str) and host:
+                names.add(host.lower())
+        if any("lawrence" in n for n in names):
+            return "cmux-lawrence: never rebooted by a self-heal"
+        try:  # the fleet registry's opt-in: only ci-runner minis get it, never AWS, interactive or no_touch Macs
+            opt = strict_json(read_small(home / SANDBOX_OPT_IN))
+        except (OSError, ValueError) as e:
+            return f"not opted in by fleet-registry.json (~/{SANDBOX_OPT_IN}: {type(e).__name__})"
+        if not isinstance(opt, dict) or opt.get("schema") != SANDBOX_OPT_IN_SCHEMA \
+                or opt.get("source") != "fleet-registry.json" or not isinstance(opt.get("host"), str) \
+                or opt["host"].lower() not in names:
+            return f"not opted in by fleet-registry.json (~/{SANDBOX_OPT_IN} does not name {sorted(names)})"
+        return self.boots_unattended()
+
+    def boots_unattended(self) -> str:
+        """Why a reboot would not come back to a working mini ("" when it would): FileVault on stops at its unlock
+        screen (a guard reboot left a mini off the pool ~21 h, 2026-10-25), and with no auto-login the runner
+        user's LaunchAgents never start. Anything unreadable refuses."""
+        code, out, _err = sh(["/usr/bin/fdesetup", "isactive"], timeout=15)
+        if not (code == 1 and out.strip() == "false"):
+            return f"FileVault on or unknown (fdesetup isactive: {out.strip()[:40] or code}): a reboot would stop there"
+        try:
+            with open(SANDBOX_LOGINWINDOW, "rb") as f:
+                user = plistlib.load(f).get("autoLoginUser")
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError) as e:
+            return f"no auto-login ({type(e).__name__} reading {SANDBOX_LOGINWINDOW}): a reboot would leave no console user"
+        if not isinstance(user, str) or not user or not os.path.isfile(SANDBOX_KCPASSWORD):
+            return "no auto-login user with a saved password: a reboot would leave no console user"
+        return ""
+
+    def sandbox_probe(self, slow_s: float) -> float | None:
+        """Seconds a sandboxed ad-hoc binary takes to run (slow_s when it was killed there); None if it cannot run
+        or exits nonzero (a probe that did not run says nothing about sandboxd)."""
+        with tempfile.TemporaryDirectory(prefix="glaeda-sandbox-probe.") as d:
+            exe = os.path.join(d, "date")
+            try:
+                shutil.copyfile(SANDBOX_PROBE_SOURCE, exe)
+                os.chmod(exe, 0o700)
+            except OSError:
+                return None
+            if sh(["/usr/bin/codesign", "-f", "-s", "-", exe], timeout=30)[0] != 0:
+                return None
+            start = time.monotonic()
+            try:
+                done = subprocess.run(["/usr/bin/sandbox-exec", "-p", SANDBOX_PROBE_PROFILE, exe],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      timeout=slow_s, check=False)
+            except subprocess.TimeoutExpired:
+                return float(slow_s)
+            except OSError:
+                return None
+            return None if done.returncode != 0 else time.monotonic() - start
+
+    def with_host_lock(self, fn):
+        """fn() while holding the fleet host.lock exclusively (no job is admitted) and the host's reservation writer
+        lock, .reservation.lock (no reserve or release interleaves); None if either is held or cannot be opened."""
+        # Loaded here, not at the top: glaeda-fleet-status loads this module for judge() on any operator machine,
+        # including ones without fcntl (its test keeps the module free of a top-level fcntl import).
+        fcntl = importlib.import_module("fcntl")
+        fds = []
+        try:
+            for name, flags in (("host.lock", os.O_RDWR), (".reservation.lock", os.O_WRONLY | os.O_APPEND)):
+                try:
+                    fd = os.open(FLEET_ROOT / name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError:
+                    return None
+                fds.append(fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return None
+            return fn()
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    def reboot(self) -> tuple[int, str]:
+        code, out, err = sh(SANDBOX_REBOOT, timeout=30)
+        return code, (out + err).strip()[:200]
+
+    def journal_read(self) -> list[dict[str, Any]]:
+        """The sandboxd journal's entries, oldest first ([] when there is none). Unreadable raises: the reboot count
+        lives here, so a journal that cannot be read never reads as "no reboots yet"."""
+        if self.journal is None:
+            return []
+        try:
+            raw = read_small(Path(self.journal), MAX_META)
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            raise HealError(f"sandboxd journal unreadable: {e}") from e
+        rows = []
+        for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+            try:
+                row = json.loads(line)
+            except ValueError as e:
+                raise HealError(f"sandboxd journal line {n} is not JSON") from e
+            t = row.get("t") if isinstance(row, dict) else None
+            if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) \
+                    or not isinstance(row.get("action"), str):
+                raise HealError(f"sandboxd journal line {n} has no finite time or action")
+            rows.append(row)
+        return rows
+
+    def journal_append(self, entry: dict[str, Any]) -> None:
+        """One line, synced before it returns (a reboot follows some of them)."""
+        if self.journal is None:
+            return
+        path = Path(self.journal)
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        rows = self.journal_read()
+        if len(rows) >= 2 * SANDBOX_JOURNAL_KEEP:  # every reboot line stays (the limits count them), the rest trims
+            tail = rows[-SANDBOX_JOURNAL_KEEP:]
+            kept = [r for r in rows[:-SANDBOX_JOURNAL_KEEP] if r.get("action") == "reboot"] + tail
+            keep = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in kept)
+            atomic_write(path, keep, 0o644, os.geteuid() == 0)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, json.dumps(entry, sort_keys=True).encode() + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------- one pass
+
+
+def iso(t: float) -> str:
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int) -> tuple[bool, str]:
+    """Stop pid only while it is still this daemon; launchd starts the next one."""
+    def alive() -> bool:
+        return any(p == pid and exe == daemon["path"] for p, _u, _c, exe in host.processes())
+
+    if pid <= 1:
+        return False, f"{daemon['name']} pid {pid}: refusing to signal launchd or the kernel"
+    if not alive():
+        return True, f"{daemon['name']} pid {pid} had already exited"
+    host.signal(pid, signal.SIGTERM)
+    waited = 0.0
+    while alive() and waited < policy["stop_wait_s"]:
+        host.sleep(0.5)
+        waited += 0.5
+    how = "SIGTERM"
+    if alive():
+        host.signal(pid, signal.SIGKILL)
+        host.sleep(0.5)
+        how = "SIGKILL after SIGTERM"
+    if alive():
+        return False, f"{daemon['name']} pid {pid} survived {how}"
+    fresh = [p for p, _u, _c, exe in host.processes() if exe == daemon["path"]]
+    return True, f"{daemon['name']} pid {pid} stopped ({how}); " + (
+        f"launchd started pid {fresh[0]}" if fresh else "launchd starts it on demand")
+
+
+def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now: float, busy: list[str],
+                 apply: bool, actions: list, healed: list) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(state, report) for sandboxd's self-heal. State: {"first_slow": t of the first slow probe of this episode,
+    "noted": t the repeat refusal was journalled, "reboot_t": the newest reboot the journal holds, "elapsed": seconds
+    since it, summed pass by pass with each step capped at 2 * every_s and never negative, "last_t": this sum's last
+    pass}. Reboots (every attempt, failed or not) are read from the journal. A wall-clock jump moves "elapsed" by at
+    most one capped step, so the 7 d rule needs both it and the clock to say a week has passed."""
+    probe = policy.get("sandbox_probe") or {}
+    mine = {k: v for k, v in (state.get("sandbox") or {}).items()
+            if k in ("first_slow", "noted", "reboot_t", "elapsed", "last_t") and isinstance(v, (int, float))
+            and not isinstance(v, bool) and math.isfinite(v)}
+    if not probe.get("enabled"):
+        return mine, {"skipped": "off in the policy"}
+    report: dict[str, Any] = {}
+    try:
+        journal = host.journal_read()
+    except HealError as e:
+        return mine, {"error": str(e)[:200]}
+    newest = max((r["t"] for r in journal if r.get("action") == "reboot"), default=None)
+    if "reboot_t" in mine and (newest is None or newest < mine["reboot_t"]):  # the journal lost the state's reboot
+        return mine, {"error": "sandboxd journal lost a reboot the state recorded; no reboot until a person looks"}
+    if newest is not None and newest != mine.get("reboot_t"):  # only a newer reboot is adopted
+        mine.update(reboot_t=newest, elapsed=0.0)
+    if newest is not None and apply:  # a plan pass's state is never written, so it adds nothing
+        if "last_t" in mine:
+            mine["elapsed"] = mine.get("elapsed", 0.0) + min(max(now - mine["last_t"], 0.0), 2 * policy["every_s"])
+        mine["last_t"] = now
+    keep = ("reboot_t", "elapsed", "last_t")  # what outlives an episode
+    clean = {k: v for k, v in mine.items() if k in keep}
+    if busy:
+        return mine, {"skipped": f"host busy ({', '.join(busy)})"}
+    hold = host.sandbox_hold(now)
+    if hold:
+        return clean, {"skipped": hold}
+    if not apply:
+        return mine, {"skipped": "probed under --apply only"}
+    slow = probe["slow_s"]
+    took = host.sandbox_probe(slow)
+    report["probe_s"] = None if took is None else round(took, 2)
+    if took is None:
+        report["error"] = "the probe could not run"
+        return mine, report
+
+    def note(entry: dict[str, Any]) -> None:
+        try:
+            host.journal_append(entry)
+        except (HealError, OSError) as e:
+            report["journal_error"] = str(e)[:200]
+
+    if took < slow:
+        last = journal[-1] if journal else None
+        if last and last.get("action") == "reboot":  # the first look after it
+            what = f"sandbox probe {took:.2f} s after the reboot at {iso(last['t'])}"
+            note({"t": now, "at": iso(now), "action": "after-reboot", "probe_s": round(took, 2)})
+            healed.append({"name": "sandboxd", "t": now, "at": iso(now), "since": last.get("since") or iso(last["t"]),
+                           "probe_s": last.get("probe_s"), "action": what})
+        return clean, report
+    first = mine.get("first_slow")
+    if first is None or not 0 <= now - first <= probe["confirm_within_s"]:
+        mine = {**clean, "first_slow": now}
+        note({"t": now, "at": iso(now), "action": "slow", "probe_s": round(took, 2)})
+        report["waiting"] = f"probe slow once; confirms after {probe['confirm_after_s']} s"
+        return mine, report
+    if now - first < probe["confirm_after_s"]:
+        report["waiting"] = f"probe slow since {iso(first)}; confirms {probe['confirm_after_s']} s after it"
+        return mine, report
+    window = probe["repeat_window_s"]
+    if newest is not None and (now - newest < window or mine.get("elapsed", 0.0) < window):
+        last_reboot = newest
+        why = (f"sandboxd is wedged again (probe {took:.1f} s >= {slow} s, slow since {iso(first)}) and this heal "
+               f"rebooted the mini at {iso(last_reboot)}, within {probe['repeat_window_s'] // 86400:g} d: not "
+               f"rebooted again (at most one reboot per {probe['reboot_every_s'] // 3600:g} h, a second within the "
+               "window needs a person)")
+        report["needs_operator"] = why
+        if not mine.get("noted"):
+            mine["noted"] = now
+            note({"t": now, "at": iso(now), "action": "refused-repeat", "probe_s": round(took, 2),
+                  "last_reboot": iso(last_reboot)})
+        return mine, report
+
+    def reboot():
+        # The probes took seconds: look again under the lock, so a job or reservation that arrived meanwhile wins.
+        # Both locks are held from here to the reboot: no job is admitted and no reservation is written meanwhile.
+        names = set(policy["busy"])
+        try:
+            rows = host.processes_strict()
+        except HealError as e:
+            return "refused", f"cannot tell the host is idle: {str(e)[:150]}"
+        late = sorted({os.path.basename(e) for _p, _u, _c, e in rows if os.path.basename(e) in names})
+        why = f"host busy ({', '.join(late)})" if late else host.sandbox_hold(host.now())
+        if why:
+            return "refused", why
+        try:  # logged and synced first: no reboot that the 24 h and 7 d rules could not see afterwards
+            host.journal_append({"t": now, "at": iso(now), "action": "reboot", "since": iso(first),
+                                 "probe_s": round(took, 2), "command": " ".join(SANDBOX_REBOOT[:3])})
+        except (HealError, OSError) as e:
+            return "refused", f"sandboxd journal not writable, no reboot: {str(e)[:150]}"
+        mine.update(reboot_t=now, elapsed=0.0, last_t=now)
+        return host.reboot()
+
+    done = host.with_host_lock(reboot)
+    if done is None:
+        report["waiting"] = "fleet host.lock is held; a later idle pass reboots"
+        return mine, report
+    if done[0] == "refused":
+        report["skipped"] = done[1]
+        return mine, report
+    code, out = done
+    what = (f"sandbox probe {took:.1f} s >= {slow} s twice since {iso(first)}: {' '.join(SANDBOX_REBOOT[:3])} "
+            f"exited {code}{': ' + out if out else ''}")
+    if code != 0:  # logged; it still counts toward the limits (shutdown may have taken it before timing out)
+        note({"t": host.now(), "at": iso(host.now()), "action": "reboot-failed", "for": now, "exit": code,
+              "out": out})
+    actions.append({"name": "sandboxd", "ok": code == 0, "action": what})
+    report["rebooting"] = code == 0
+    return mine, report
+
+
+def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: bool) -> tuple[dict, dict]:
+    """One pass: (new state, report). State: {"samples": {name: {pid, t, cpu, since}}, "restarts": {name: [t]}}."""
+    now = host.now()
+    rows = host.processes()
+    busy_names = set(policy["busy"])
+    busy = sorted({os.path.basename(exe) for _p, _u, _c, exe in rows if os.path.basename(exe) in busy_names})
+    samples: dict[str, Any] = dict(state.get("samples") or {})
+    restarts = {k: [t for t in v if isinstance(t, (int, float)) and now - t < DAY_S]
+                for k, v in (state.get("restarts") or {}).items() if isinstance(v, list)}
+    healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - h.get("t", 0) < DAY_S]
+    hot_s, busy_hot_s = policy["hot_hours"] * 3600, policy["busy_hot_hours"] * 3600
+    cap = int(policy["footprint_gib"] * GIB)
+    hot, actions = [], []
+    found = {}
+    for daemon in policy["daemons"]:
+        mine = [(p, c) for p, u, c, exe in rows if exe == daemon["path"] and u <= SYSTEM_UID_MAX]
+        if len(mine) == 1:  # not running, or more than one: nothing to judge
+            found[daemon["name"]] = mine[0]
+    sizes = host.footprints(sorted(pid for pid, _c in found.values()))
+    for daemon in policy["daemons"]:
+        name = daemon["name"]
+        if name not in found:
+            samples.pop(name, None)
+            continue
+        pid, cpu = found[name]
+        prev = samples.get(name)
+        since = None
+        cores = None
+        if isinstance(prev, dict) and prev.get("pid") == pid and now > prev.get("t", now) and cpu >= prev.get("cpu", cpu):
+            cores = (cpu - prev["cpu"]) / (now - prev["t"])
+            if cores >= policy["hot_cores"]:
+                since = prev.get("since") or prev["t"]
+        samples[name] = {"pid": pid, "t": now, "cpu": cpu, "since": since}
+        size = sizes.get(pid)
+        bloated = size is not None and size >= cap
+        if since is None and not bloated:
+            continue
+        hot_for = 0.0 if since is None else now - since
+        entry = {"name": name, "pid": pid, "cores": round(cores or 0, 2), "since": iso(since or now),
+                 "hot_for_s": round(hot_for)}
+        if size is not None:
+            entry["footprint_gib"] = round(size / GIB, 1)
+        due = hot_for >= hot_s and since is not None
+        if bloated:  # memory a wedged daemon never returns: its swap fills the disk, so no busy wait
+            due = True
+            entry["why"] = f"footprint {entry['footprint_gib']} GiB is at least {policy['footprint_gib']} GiB"
+        elif due and daemon["wait_idle"] and busy and hot_for < busy_hot_s:
+            entry["waiting"] = f"host busy ({', '.join(busy)}); restarts anyway at {policy['busy_hot_hours']} h"
+            due = False
+        if due and len(restarts.get(name, [])) >= policy["max_restarts_per_day"]:
+            entry["waiting"] = f"{policy['max_restarts_per_day']} restarts in the last day; no more until one ages out"
+            due = False
+        if not due:
+            entry.setdefault("waiting", f"restarts at {policy['hot_hours']} h")
+            hot.append(entry)
+            continue
+        if not apply:
+            entry["waiting"] = "would restart now (plan)"
+            hot.append(entry)
+            continue
+        ok, what = restart(host, policy, daemon, pid)
+        restarts.setdefault(name, []).append(now)
+        actions.append({"name": name, "ok": ok, "action": what})
+        if ok:
+            samples.pop(name, None)
+            healed.append({"name": name, "t": now, "at": iso(now), "since": entry["since"], "cores": entry["cores"],
+                           **({"footprint_gib": entry["footprint_gib"]} if "footprint_gib" in entry else {}),
+                           "action": what})
+        else:
+            entry["waiting"] = what
+            hot.append(entry)
+    sandbox_state, sandbox = sandbox_pass(host, policy, state, now, busy, apply, actions, healed)
+    new_state = {"samples": samples, "restarts": restarts, "healed": healed, "sandbox": sandbox_state}
+    report = {"schema": SCHEMA, "at": iso(now), "busy": busy, "hot": hot, "healed": healed, "actions": actions,
+              "sandbox": sandbox}
+    return new_state, report
+
+
+# ---------------------------------------------------------------- files
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def atomic_write(path: Path, data: bytes, mode: int, root: bool) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=os.fspath(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if root:
+            os.chown(tmp, 0, 0)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_root_dir(path: Path) -> None:
+    """Every component from / down is a real directory owned by root and not writable by others."""
+    current = Path("/")
+    for part in path.parts[1:]:
+        current = current / part
+        st = os.lstat(current)
+        if not os.path.isdir(current) or os.path.islink(current) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise HealError(f"{current} is not a root-owned directory closed to other users")
+
+
+# ---------------------------------------------------------------- install
+
+
+def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[str, Any]:
+    """The files the root LaunchDaemon needs, from this copy of the script and a validated policy."""
+    policy_bytes = policy_path.read_bytes()
+    policy = validate_policy(json.loads(policy_bytes))
+    script = install_dir / SCRIPT_NAME
+    state_dir = install_dir / "state"
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [SYSTEM_PYTHON, "-I", os.fspath(script), "--apply",
+                             "--policy", os.fspath(install_dir / POLICY_NAME), "--state-dir", os.fspath(state_dir)],
+        "StartInterval": policy["every_s"],
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "Nice": 10,
+        "StandardOutPath": os.fspath(state_dir / "heal.log"),
+        "StandardErrorPath": os.fspath(state_dir / "heal.err"),
+    }
+    # Not fleet-ops.json: a hand install takes the script and the policy (pinned by --expect-*), and drops any
+    # fleet-ops.json the snapshot had (finish_pair). Only the release chain (refresh) installs fleet-ops.json, so
+    # root never runs an op body it did not verify against the signed release.
+    files = {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
+             install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])}
+    return {"files": files,
+            "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
+
+
+def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_path: Path = PLIST) -> dict[str, Any]:
+    want = desired_install(policy_path, install_dir)
+    stale = [os.fspath(p) for p, (data, _m) in want["files"].items() if read_bytes(p) != data]
+    if read_bytes(plist_path) != want["plist"]:
+        stale.append(os.fspath(plist_path))
+    installed = (install_dir / SCRIPT_NAME).exists() and plist_path.exists()
+    report_path = want["state_dir"] / "report.json"
+    policy = validate_policy(json.loads(policy_path.read_bytes()))
+    try:
+        report_age = time.time() - report_path.stat().st_mtime
+    except OSError:
+        report_age = None
+    # The daemon writes its report every pass: older than report_stale_passes passes means it is not running.
+    fresh = report_age is not None and report_age <= policy["report_stale_passes"] * policy["every_s"]
+    # current/stale/missing from the root report: a self-updating copy follows stable, not this user's release
+    verdict = judge(load_json(report_path), time.time(), installed)
+    return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale, "verdict": verdict,
+            "loaded": loaded(), "reportFresh": fresh,
+            "reportAgeS": None if report_age is None else round(report_age),
+            "sha256": sha256(Path(__file__).read_bytes()), "policySha256": sha256(policy_path.read_bytes()),
+            "report": os.fspath(report_path)}
+
+
+def loaded() -> bool | None:
+    """launchctl print system/LABEL (readable without root); None when launchctl could not answer."""
+    code, said = launchctl("print", f"system/{LABEL}")
+    if code == 0:
+        return True
+    return False if code in (36, 113) or "could not find service" in said.lower() else None
+
+
+def launchctl(*args: str) -> tuple[int, str]:
+    code, out, err = sh(["/bin/launchctl", *args], timeout=20)
+    return code, (err or out).strip()[-200:]
+
+
+def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
+            expect_policy_sha256: str | None = None) -> dict[str, Any]:
+    want = desired_install(policy_path)
+    # These bytes become root's: check exactly them against the hashes the operator took from the release
+    # (first, so a wrong pin says so even when nothing would change).
+    script_bytes = want["files"][INSTALL_DIR / SCRIPT_NAME][0]
+    policy_bytes = want["files"][INSTALL_DIR / POLICY_NAME][0]
+    for what, data, expected in (("script", script_bytes, expect_sha256), ("policy", policy_bytes, expect_policy_sha256)):
+        if expected is None:
+            continue
+        pin = (expected.split() or [""])[0].lower()  # `shasum -a 256` prints "<hash>  -"
+        if not re.fullmatch(r"[0-9a-f]{64}", pin):
+            raise HealError(f"--expect-{what if what == 'policy' else 'script'} sha256 {expected!r} is not 64 hex digits")
+        if sha256(data) != pin:
+            raise HealError(f"{what} sha256 {sha256(data)} is not the expected {pin}; refusing to install")
+    status = install_status(policy_path)
+    if not apply or status["current"] and status["loaded"] and status["reportFresh"]:
+        return {**status, "state": "unchanged" if status["current"] else "planned"}
+    if os.geteuid() != 0:
+        raise HealError("--install --apply needs root: the snapshot and the LaunchDaemon are root-owned")
+    for d in (INSTALL_DIR, want["state_dir"]):
+        d.mkdir(mode=0o755, parents=True, exist_ok=True)
+        check_root_dir(d.parent)  # before chown/chmod: never follow a planted link with root's chown
+        if os.path.islink(d):
+            raise HealError(f"{d} is a symlink")
+        os.chown(d, 0, 0)
+        os.chmod(d, 0o755)
+    check_root_dir(want["state_dir"])
+    check_root_dir(PLIST.parent)
+    finish_pair(INSTALL_DIR, root=True)
+    if any(read_bytes(path) != data or (path.stat().st_mode & 0o777) != mode
+           for path, (data, mode) in want["files"].items()):
+        commit_pair({path.name: data for path, (data, _mode) in want["files"].items()}, INSTALL_DIR, True, None)
+    changed = read_bytes(PLIST) != want["plist"]
+    if changed:
+        launchctl("bootout", f"system/{LABEL}")
+        atomic_write(PLIST, want["plist"], 0o644, root=True)
+    if changed or not status["loaded"] or not status["reportFresh"]:
+        launchctl("bootout", f"system/{LABEL}")  # loaded but not running its passes: load it afresh
+        for _ in range(40):  # launchd lets go of a booted-out job asynchronously
+            if loaded() is not True:
+                break
+            time.sleep(0.25)
+        tries = []
+        for wait in (0, 1, 2, 4, 8, 15):  # a bootstrap right after a bootout can fail with EIO; nothing reloads it later
+            time.sleep(wait)
+            code, said = launchctl("bootstrap", "system", os.fspath(PLIST))
+            tries.append(code)
+            if code == 0 or loaded() is True:
+                break
+        else:
+            raise HealError(f"launchctl bootstrap system {PLIST} failed {tries}: {said}")
+    return {**install_status(policy_path), "state": "applied"}
+
+
+# ---------------------------------------------------------------- the release this copy follows
+
+
+class HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """Release downloads redirect to GitHub's asset host; a redirect off https is refused, not followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001 (urllib's signature)
+        if not url_ok(newurl):
+            raise HealError(f"refusing a redirect off https://github.com and its asset hosts ({URL_HOSTS})")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def url_ok(url: str, hosts: tuple[str, ...] = URL_HOSTS) -> bool:
+    parts = urllib.parse.urlsplit(str(url))
+    return parts.scheme == "https" and parts.hostname in hosts and parts.port in (None, 443)
+
+
+def fetch(url: str, limit: int) -> bytes:
+    if not url_ok(url, ("github.com",)):
+        raise HealError("release files come from https://github.com only")
+    request = urllib.request.Request(url, headers={"User-Agent": "glaeda-daemon-heal"})
+    with urllib.request.build_opener(HttpsOnly).open(request, timeout=FETCH_TIMEOUT) as response:
+        raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise HealError(f"{url} exceeds {limit} bytes")
+    return raw
+
+
+def release_url(source: str, tag: str, name: str) -> str:
+    return f"https://github.com/{source}/releases/download/{tag}/{name}"
+
+
+def read_channel(sources: list[str], get=fetch) -> tuple[str, dict[str, Any] | None]:
+    """(source, the stable entry), or (source, None) while paused; the first source that answers wins."""
+    errors = []
+    for source in sources:
+        try:
+            control = json.loads(get(release_url(source, "ota-channels", "control.json"), MAX_META))
+            if not isinstance(control, dict) or control.get("schema") != CONTROL_SCHEMA \
+                    or not isinstance(control.get("paused"), bool):
+                raise HealError("control.json is malformed")
+            if control["paused"]:
+                return source, None
+            entry = json.loads(get(release_url(source, "ota-channels", f"{RING}.json"), MAX_META))
+            if not isinstance(entry, dict) or entry.get("schema") != CHANNEL_SCHEMA or entry.get("ring") != RING \
+                    or not TAG_RE.fullmatch(str(entry.get("tag"))) or not SHA_RE.fullmatch(str(entry.get("source"))) \
+                    or not HEX64.fullmatch(str(entry.get("releaseSha256"))):
+                raise HealError(f"{RING}.json is malformed")
+            return source, entry
+        except (HealError, OSError, ValueError, http.client.HTTPException) as e:  # urllib's errors are OSErrors
+            errors.append(f"{source}: {str(e)[:120]}")
+    raise HealError("no release source answered: " + "; ".join(errors))
+
+
+def release_files(source: str, entry: dict[str, Any], get=fetch, installed: str | None = None) -> dict[str, bytes]:
+    """The two files the channel's release ships, by the hash chain channel -> release.json -> archive. A release
+    that does not descend from the installed commit (its ancestry.txt) is refused, as glaeda-update refuses it."""
+    raw = get(release_url(source, entry["tag"], "release.json"), MAX_META)
+    if sha256(raw) != entry["releaseSha256"]:
+        raise HealError(f"release.json of {entry['tag']} does not match the channel")
+    doc = json.loads(raw)
+    if not isinstance(doc, dict) or doc.get("schema") != RELEASE_SCHEMA or doc.get("repository") != REPOSITORY \
+            or doc.get("tag") != entry["tag"] or doc.get("source") != entry["source"]:
+        raise HealError(f"release.json does not describe {entry['tag']}")
+    assets = doc.get("assets")
+    meta = assets.get(ARCHIVE) if isinstance(assets, dict) else None
+    if not isinstance(meta, dict):
+        raise HealError(f"{entry['tag']} has no {ARCHIVE}")
+    archive = get(release_url(source, entry["tag"], ARCHIVE), MAX_ARCHIVE)
+    if len(archive) != meta.get("size") or sha256(archive) != meta.get("sha256"):
+        raise HealError(f"{ARCHIVE} of {entry['tag']} does not match release.json")
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        if sum(m.size for m in tar.getmembers() if m.isfile()) > MAX_EXTRACTED:
+            raise HealError(f"{ARCHIVE} of {entry['tag']} expands past {MAX_EXTRACTED} bytes")
+        if installed and installed != entry["source"]:
+            try:
+                info = tar.getmember(ANCESTRY)
+                lines = tar.extractfile(info).read(MAX_META).decode("ascii").split() if info.isfile() else []
+            except (KeyError, UnicodeDecodeError):
+                lines = []
+            if installed not in lines:
+                raise HealError(f"{entry['tag']} does not descend from the installed {installed[:12]}; kept")
+        for name, member in MEMBERS.items():
+            try:
+                info = tar.getmember(member)
+            except KeyError:
+                if name in OPTIONAL:  # a release from before it existed
+                    continue
+                raise HealError(f"{entry['tag']} ships no {member}") from None
+            if not info.isfile() or info.size > MAX_MEMBER:
+                raise HealError(f"{member} in {entry['tag']} is not a small regular file")
+            files[name] = tar.extractfile(info).read()
+    return files
+
+
+def bounded_run(argv: list[str], timeout: float, limit: int = MAX_META) -> tuple[int, str, str]:
+    """sh() for code root did not write: keeps at most `limit` bytes of each stream, drains and drops the rest."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+    except OSError as e:
+        return 127, "", str(e)
+    kept = (bytearray(), bytearray())
+
+    def drain(stream: Any, buf: bytearray) -> None:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            buf.extend(chunk[:max(0, limit - len(buf))])
+
+    readers = [threading.Thread(target=drain, args=(stream, buf), daemon=True)
+               for stream, buf in ((proc.stdout, kept[0]), (proc.stderr, kept[1]))]
+    for reader in readers:
+        reader.start()
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        code = 124
+        with contextlib.suppress(OSError):  # its own session (not yet reaped): what it started, holding our pipes, too
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    for reader in readers:
+        reader.join(5)
+    for stream, reader in zip((proc.stdout, proc.stderr), readers):
+        if not reader.is_alive():
+            stream.close()
+    return code, kept[0].decode(errors="replace"), kept[1].decode(errors="replace")
+
+
+def stage_dir(install_dir: Path, root: bool) -> Path:
+    stage = install_dir / "staged"
+    stage.mkdir(mode=0o700, exist_ok=True)
+    if root:
+        check_root_dir(stage)
+    return stage
+
+
+def commit_pair(files: dict[str, bytes], install_dir: Path, root: bool, release: dict[str, str] | None) -> None:
+    """The script, the policy and the release they are (installed.json; None for a hand install) change together or
+    not at all: all staged, then a ready mark (the commit point), then the swap. A pass or install that dies after
+    the mark is finished by finish_pair before any policy load."""
+    stage = stage_dir(install_dir, root)
+    for name, data in files.items():
+        if read_bytes(stage / name) != data:
+            atomic_write(stage / name, data, MODES[name], root)
+    mark = {"files": {n: sha256(d) for n, d in files.items()}, "release": release}
+    atomic_write(stage / PAIR_MARK, json.dumps(mark, sort_keys=True).encode(), 0o644, root)
+    finish_pair(install_dir, root)
+
+
+def finish_pair(install_dir: Path, root: bool) -> bool:
+    """Swap in a pair marked ready; a mark whose staged files do not hash to it is dropped. True if one was marked."""
+    stage = install_dir / "staged"
+    mark = load_json(stage / PAIR_MARK)
+    if not mark:
+        return False
+    want = mark.get("files") if isinstance(mark.get("files"), dict) else {}
+    staged = {name: read_bytes(stage / name) for name in want if name in MEMBERS}
+    # A mark from a copy that predates fleet-ops.json names only the script and the policy.
+    if {SCRIPT_NAME, POLICY_NAME} <= set(want) <= set(MEMBERS) \
+            and all(data is not None and sha256(data) == want[name] for name, data in staged.items()):
+        for name in OPTIONAL - set(staged):  # a release without it: no copy of another release's stays beside it
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(install_dir / name)
+        for name in (n for n in SWAP_ORDER if n in staged):
+            path = install_dir / name
+            if read_bytes(path) != staged[name] or (path.stat().st_mode & 0o777) != MODES[name]:
+                atomic_write(path, staged[name], MODES[name], root)
+        release = mark.get("release")
+        if isinstance(release, dict):
+            atomic_write(install_dir / INSTALLED, json.dumps({**release, "files": want}, sort_keys=True).encode(),
+                         0o644, root)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(install_dir / INSTALLED)  # a hand install: these bytes are no release this copy knows
+    os.unlink(stage / PAIR_MARK)
+    return True
+
+
+def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=bounded_run,
+                python: str = SYSTEM_PYTHON) -> None:
+    """The new pair must plan a pass with each other (its code reading its policy) before it replaces the snapshot."""
+    stage = stage_dir(install_dir, root)
+    for name, data in files.items():
+        atomic_write(stage / name, data, MODES[name], root)
+    for name in OPTIONAL - set(files):  # a release without it: the plan must not read an earlier stage's copy
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(stage / name)
+    code, out, err = run([python, "-I", os.fspath(stage / SCRIPT_NAME), "--policy", os.fspath(stage / POLICY_NAME),
+                          "--state-dir", os.fspath(install_dir / "state")], timeout=CHECK_TIMEOUT)
+    try:
+        doc = json.loads(out) if code == 0 else None
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict) or not str(doc.get("schema") or "").startswith("glaeda-daemon-heal/"):
+        raise HealError(f"its own plan pass failed (exit {code}): {(err or out).strip()[-160:]}")
+    if doc.get("follows") != RING:
+        # Code from before self-update would run, but never update again: a hand install newer than the channel
+        # (no installed.json, so no ancestry to check) would be stranded on it for good.
+        raise HealError(f"its code does not keep itself on the {RING} release; kept")
+
+
+def pair_hashes(install_dir: Path) -> dict[str, str | None]:
+    """The installed files' hashes, as installed.json records them: an optional file only when it is there."""
+    out = {name: None if (data := read_bytes(install_dir / name)) is None else sha256(data) for name in MEMBERS}
+    return {name: h for name, h in out.items() if h is not None or name not in OPTIONAL}
+
+
+def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_dir: Path = INSTALL_DIR,
+            root: bool = True, get=fetch, run=bounded_run, python: str = SYSTEM_PYTHON) -> dict[str, Any]:
+    """Bring the snapshot to the stable release's two files; returns the new state["release"]. Never raises: a
+    channel or release that fails a check leaves the snapshot as it is and says why."""
+    rel = dict(state.get("release") or {})
+    have = {name: read_bytes(install_dir / name) for name in MEMBERS}
+    hashes = pair_hashes(install_dir)
+    ident = load_json(install_dir / INSTALLED)  # what the pair is, swapped with it: never ahead of or behind it
+    # members: the files the copy that installed this pair read from its release. A pair a copy from before
+    # fleet-ops.json installed never looked for it, so it is read again from the same release.
+    drifted = ident.get("files") != hashes or ident.get("members") != sorted(MEMBERS)
+    if now - float(rel.get("checked") or 0) < policy["release"]["every_s"] and not (drifted and not rel.get("error")):
+        return rel
+    rel["checked"] = now
+    try:
+        source, entry = read_channel(policy["release"]["sources"], get)
+        rel.update(source=source, wants=None if entry is None else entry["tag"], ok=now)  # ok: the channel answered
+        if entry is not None and (entry["tag"] != ident.get("tag") or drifted):
+            commit = ident.get("commit") if isinstance(ident.get("commit"), str) else None
+            files = release_files(source, entry, get, commit)
+            release = {"tag": entry["tag"], "commit": entry["source"], "members": sorted(MEMBERS)}
+            if any(have[name] != data for name, data in files.items()) \
+                    or any(have[name] is not None for name in OPTIONAL - set(files)):
+                stage_check(files, install_dir, root, run, python)
+                commit_pair(files, install_dir, root, release)  # the next pass runs the pair
+                rel["installed_at"] = now
+            else:  # the bytes already are this release (a hand install of it): only name them
+                atomic_write(install_dir / INSTALLED, json.dumps({**release, "files": hashes}, sort_keys=True).encode(),
+                             0o644, root)
+        rel["error"] = None
+    except Exception as e:  # noqa: BLE001 (a root pass persists its heal state whatever the network or release did)
+        rel["error"] = re.sub(r"\s+", " ", str(e))[:300] or type(e).__name__
+    ident = load_json(install_dir / INSTALLED)
+    rel.update(tag=ident.get("tag"), commit=ident.get("commit"))
+    # behind: not the release the channel names, or not the bytes of the release it says it is (a repair failed)
+    rel["drifted"] = ident.get("files") != pair_hashes(install_dir) or ident.get("members") != sorted(MEMBERS)
+    if rel.get("wants") and rel.get("wants") != rel.get("tag") or rel["drifted"]:
+        rel.setdefault("behind_since", now)
+    else:
+        rel.pop("behind_since", None)
+    return rel
+
+
+def release_report(rel: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    def at(key: str) -> str | None:
+        return iso(rel[key]) if isinstance(rel.get(key), (int, float)) else None
+    return {"tag": rel.get("tag"), "commit": rel.get("commit"), "wants": rel.get("wants"), "source": rel.get("source"),
+            "checkedAt": at("checked"), "okAt": at("ok"), "installedAt": at("installed_at"),
+            "behindSince": at("behind_since"), "drifted": bool(rel.get("drifted")), "error": rel.get("error"), "staleAfterS": policy["release"]["stale_s"]}
+
+
+def parse_iso(text: Any) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def judge(report: Any, now: float, installed: bool) -> dict[str, Any]:
+    """current, stale or missing, and why, from the root report alone (any reader: mini-health, fleet-status).
+    reinstall: whether a root --install can fix it (not for a channel it cannot read or a release it refused)."""
+    if not installed:
+        return {"state": "missing", "reinstall": True, "why": "the root daemon-heal LaunchDaemon is not installed"}
+    at = parse_iso(report.get("at")) if isinstance(report, dict) else None
+    if at is None:
+        return {"state": "stale", "reinstall": True, "why": "the root daemon-heal LaunchDaemon has written no report: no passes run"}
+    rel = report.get("release")
+    limit = report.get("staleAfterS")
+    if not isinstance(rel, dict) or type(limit) is not int or type(rel.get("staleAfterS")) is not int:
+        return {"state": "stale", "reinstall": True, "why": "installed before it kept itself on the release: one root --install of a "
+                                         "current release makes it"}
+    if now - at > limit:
+        return {"state": "stale", "reinstall": True, "why": f"its last pass was {round(now - at)} s ago: its passes are not running"}
+    tag, wants, error = rel.get("tag"), rel.get("wants"), rel.get("error")
+    grace = rel["staleAfterS"]
+    because = f": {str(error)[:200]}" if error else ""
+    behind = parse_iso(rel.get("behindSince"))
+    if behind is not None and now - behind > grace and (wants and wants != tag or rel.get("drifted")):
+        what = ("it has not identified its files as any release" if not tag else
+                f"its files are not the {tag} they were installed as" if not wants or wants == tag else
+                f"runs {tag}, its channel has named {wants}")
+        return {"state": "stale", "reinstall": False, "why": f"{what} since {rel.get('behindSince')}{because}"}
+    ok = parse_iso(rel.get("okAt"))
+    if ok is None or now - ok > grace:
+        return {"state": "stale", "reinstall": False, "why": f"has not read its release channel since {rel.get('okAt') or 'install'}"
+                                         f"{because}"}
+    lag = f", its channel names {wants}" if wants and wants != tag else ""
+    return {"state": "current", "reinstall": False, "why": f"runs {tag or 'its install'}{lag}"}
+
+
+def schedule_reload(install_dir: Path, plist_path: Path, state: dict[str, Any], now: float,
+                    every_s: int, spawn=subprocess.Popen) -> bool:
+    """A plist that no longer matches the installed policy (or this code) is reloaded by a detached --install, in
+    its own session so launchd's bootout of this job does not end it; it waits for this pass to exit first."""
+    want = desired_install(install_dir / POLICY_NAME, install_dir)["plist"]
+    if read_bytes(plist_path) == want or now - float(state.get("reload_at") or 0) < every_s:
+        return False
+    state["reload_at"] = now
+    with open(install_dir / "state" / "reload.log", "ab") as log:
+        spawn([SYSTEM_PYTHON, "-I", os.fspath(install_dir / SCRIPT_NAME), "--install", "--apply", "--policy",
+               os.fspath(install_dir / POLICY_NAME), "--after-pid", str(os.getpid())],
+              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
+    return True
+
+
+# ---------------------------------------------------------------- the fleet's root ops scripts
+
+
+def load_fleet_ops(raw: bytes) -> dict[str, Any]:
+    """config/fleet-ops.json, validated: each op's body hashes to its pin and names its source commit. Everything
+    root derives from it (path, label, log) is built here from the op's name, never read from the file."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise HealError(f"{FLEET_OPS_NAME} is not JSON: {e}") from e
+    if not isinstance(doc, dict) or doc.get("schema") != FLEET_OPS_SCHEMA or not isinstance(doc.get("ops"), dict):
+        raise HealError(f"{FLEET_OPS_NAME} schema is not {FLEET_OPS_SCHEMA}")
+    for name, op in doc["ops"].items():
+        if not isinstance(name, str) or not OP_NAME.fullmatch(name) or not isinstance(op, dict):
+            raise HealError(f"{FLEET_OPS_NAME}: op {name!r} is not a plain name")
+        body, every, src = op.get("body"), op.get("every_s"), op.get("source")
+        if not isinstance(body, str) or not body.startswith("#!/bin/bash\n") or len(body.encode()) > MAX_OP_BODY:
+            raise HealError(f"{FLEET_OPS_NAME}: {name} body must be a bash script under {MAX_OP_BODY} bytes")
+        if sha256(body.encode()) != op.get("sha256"):
+            raise HealError(f"{FLEET_OPS_NAME}: {name} body does not hash to its sha256 pin")
+        if type(every) is not int or not 60 <= every <= DAY_S:
+            raise HealError(f"{FLEET_OPS_NAME}: {name} every_s must be an integer from 60 to {DAY_S}")
+        if not isinstance(src, dict) or not isinstance(src.get("repository"), str) \
+                or not isinstance(src.get("path"), str) or not SHA_RE.fullmatch(str(src.get("commit"))):
+            raise HealError(f"{FLEET_OPS_NAME}: {name} source needs repository, path and a full commit")
+    return doc
+
+
+def op_label(name: str) -> str:
+    return f"ai.manaflow.{name}"
+
+
+def op_plist(name: str, every_s: int, ops_dir: Path) -> dict[str, Any]:
+    """What the op's installer writes: the body every every_s, its output in /var/log/NAME.log."""
+    log = f"/var/log/{name}.log"
+    return {"Label": op_label(name), "ProgramArguments": [os.fspath(ops_dir / name)], "StartInterval": every_s,
+            "StandardOutPath": log, "StandardErrorPath": log}
+
+
+def read_small(path: Path, limit: int = MAX_META) -> bytes:
+    """A regular file's bytes, never through a symlink and never more than limit."""
+    fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(f"{path} is over {limit} bytes")
+    return data
+
+
+def reservation_time(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) < 1e11:
+        return float(value)
+    t = parse_iso(value)
+    if t is None:
+        raise ValueError(f"not a time: {value!r}")
+    return t
+
+
+def strict_json(raw: bytes) -> Any:
+    """json.loads that refuses NaN and Infinity and a key given twice (the later one would win unseen)."""
+    def refuse(token: str) -> Any:
+        raise ValueError(f"{token} in a reservation file")
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        keys = [k for k, _v in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("a key given twice")
+        return dict(pairs)
+    try:
+        return json.loads(raw, parse_constant=refuse, object_pairs_hook=unique)
+    except RecursionError:  # deep nesting within read_small's cap is a malformed file, not a crashed root pass
+        raise ValueError("nested too deeply") from None
+
+
+def names_list(value: Any, what: str) -> set[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError(f"{what} is not a list of names")
+    return {v.lower() for v in value}
+
+
+def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None = None) -> str:
+    """Why the ops stay as they are on this host ("" when they may be installed). Fails closed: a reservation list that
+    is missing or unreadable holds, as an active entry naming this host or an active host-local reservation does. A
+    list past its own "expires" is released: only an entry in it still live by its own from/until holds.
+    The list is the fleet user's ~/.local/share/glaeda/fleet-reservations.json (glaeda-fleet-reservations/v1), the
+    user being the owner of the fleet root. Root reads it, and the update config's host name, only to decide whether
+    to hold: whatever they say, the bytes it installs are the pinned ones."""
+    try:
+        home = Path(pwd.getpwuid(os.stat(fleet_root).st_uid).pw_dir)
+    except (OSError, KeyError) as e:
+        return f"no fleet user (owner of {fleet_root}): {type(e).__name__}"
+    names = {(node if node is not None else platform_node()).split(".")[0].lower()}
+    try:  # every OTA host has it; without its host name a reservation naming only that could be missed
+        host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("no host")
+        names.add(host.lower())
+    except (OSError, ValueError, AttributeError) as e:
+        return f"glaeda update config unreadable ({type(e).__name__}); held as reserved"
+    try:
+        doc = strict_json(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
+        if not isinstance(doc, dict) or doc.get("schema") != RESERVATIONS_SCHEMA:
+            raise ValueError("schema")
+        # an expired list is released (glaeda-disk's host_reservation reads it the same way): its writer stopped
+        # refreshing it, so only an entry in it still live by its own from/until holds this host
+        stale = reservation_time(doc.get("expires")) <= now
+        entries, aliases = doc["reservations"], doc.get("aliases", {})
+        if not isinstance(entries, list) or not isinstance(aliases, dict):
+            raise ValueError("malformed")
+        alias_of = {str(k).lower(): names_list(v, f"aliases of {k}") for k, v in aliases.items()}
+        reserved = ""
+        for e in entries:  # every entry is checked, so a malformed one anywhere holds
+            if not isinstance(e, dict):
+                raise ValueError("an entry is not an object")
+            hosts = names_list(e["hosts"], "hosts")
+            hosts |= {a for h in hosts for a in alias_of.get(h, ())}
+            start, until = reservation_time(e["from"]), reservation_time(e["until"])
+            if start > until:
+                raise ValueError("an entry ends before it starts")
+            if names & hosts and start <= now <= until and not reserved:
+                reserved = f"reserved until {e['until']}" + (f" (list expired at {doc['expires']})" if stale else "")
+        if reserved:
+            return reserved
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return f"fleet reservations unreadable ({type(e).__name__}); held as reserved"
+    local = fleet_root / "reservation.json"
+    if os.path.lexists(local):  # absent is no reservation; anything there that cannot be read holds
+        try:
+            held = strict_json(read_small(local))
+            if not isinstance(held, dict) or held.get("schema") != "glaeda-reservation/v1":
+                raise ValueError("schema")
+            since, until = reservation_time(held["since"]), reservation_time(held["until"])
+            if since > until:
+                raise ValueError("ends before it starts")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return f"host reservation unreadable ({type(e).__name__}); held as reserved"
+        if since <= now < until:
+            return f"host reservation until {held['until']}"
+    return ""
+
+
+def platform_node() -> str:
+    return os.uname().nodename
+
+
+def fleet_ops_eligible(ops_dir: Path) -> str:
+    """Why this host is not one the ops belong on ("" when it is): a fleet Mac whose ops directory a root install
+    already made, and not an EC2 Mac (they carry ec2-user, and nothing installs fleet ops on them)."""
+    if sys.platform != "darwin":
+        return "not macOS"
+    with contextlib.suppress(KeyError):
+        pwd.getpwnam("ec2-user")
+        return "an EC2 Mac (ec2-user): fleet ops are not installed here"
+    if not ops_dir.is_dir() or ops_dir.is_symlink():
+        return f"no {ops_dir}: not a fleet Mac a root install set up"
+    return ""
+
+
+def unload_op(name: str, ctl, wait=time.sleep) -> bool:
+    """Boot out system/ai.manaflow.NAME and wait until launchd no longer lists it."""
+    target = f"system/{op_label(name)}"
+    ctl("bootout", target)
+    for _ in range(40):  # launchd lets go of a booted-out job asynchronously
+        if op_loaded(name, ctl) is False:  # launchd said it has no such service; no answer is not that
+            return True
+        wait(0.25)
+    return False
+
+
+def op_loaded(name: str, ctl) -> bool | None:
+    """True when launchd lists system/ai.manaflow.NAME, False when it says it has no such service, None otherwise."""
+    code, said = ctl("print", f"system/{op_label(name)}")
+    if code == 0:
+        return True
+    return False if code in (36, 113) or "could not find service" in str(said).lower() else None
+
+
+def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
+    """Load plist as system/ai.manaflow.NAME afresh; None when it is loaded, else why not. A plist left that did
+    not load is removed, so the next pass sees it differ and tries again."""
+    target = f"system/{op_label(name)}"
+    if not unload_op(name, ctl, wait):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(plist)
+        return f"launchctl bootout {target} did not unload it"
+    said = ""
+    for pause in (0, 1, 2, 4):  # a bootstrap right after a bootout can fail with EIO
+        wait(pause)
+        code, said = ctl("bootstrap", "system", os.fspath(plist))
+        if code == 0:
+            return None
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(plist)
+    return f"launchctl bootstrap: {said}"
+
+
+def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEET_OPS_DIR,
+                   plist_dir: Path = PLIST.parent, root: bool = True, hold=fleet_ops_hold, eligible=fleet_ops_eligible,
+                   ctl=None, ledger: Path = INSTALL_DIR / "state" / "fleet-ops-managed.json",
+                   wait=time.sleep) -> dict[str, Any]:
+    """Each op's state here (current, stale, missing) and, on apply, what was installed. A body is replaced
+    atomically (launchd runs the path afresh at each StartInterval, so no reload is needed for it); the
+    LaunchDaemon is rewritten and reloaded only when it differs from the op's, and loaded when it is not. An op this
+    pass installed earlier (the root-owned ledger) that the file no longer lists is unloaded and removed; nothing
+    it did not install is touched."""
+    ctl = ctl or launchctl
+    doc = load_fleet_ops(read_bytes(ops_path) or b"")
+    out: dict[str, Any] = {"ops": {}, "installed": []}
+    for name, op in sorted(doc["ops"].items()):
+        have = read_bytes(ops_dir / name)
+        out["ops"][name] = {"want": op["sha256"], "source": op["source"]["commit"],
+                            "have": None if have is None else sha256(have),
+                            "state": "missing" if have is None else "current" if sha256(have) == op["sha256"] else "stale"}
+    why = eligible(ops_dir) or hold(now)
+    if why:
+        out["held"] = why
+        return out
+    if not apply:
+        return out
+    if root:
+        check_root_dir(ops_dir)
+        check_root_dir(plist_dir)
+    managed = load_json(ledger).get("ops")
+    managed = {n for n in managed if isinstance(n, str) and OP_NAME.fullmatch(n)} if isinstance(managed, list) else set()
+    for name in sorted(managed - set(doc["ops"])):
+        if not unload_op(name, ctl, wait):
+            out.setdefault("errors", []).append(f"{name}: launchctl bootout did not unload it; kept, tried again next pass")
+            continue
+        for path in (plist_dir / f"{op_label(name)}.plist", ops_dir / name):
+            if path.is_file() and not path.is_symlink():
+                os.unlink(path)
+        managed.discard(name)
+        out.setdefault("removed", []).append(name)
+    for name, op in sorted(doc["ops"].items()):
+        target = ops_dir / name
+        if target.is_symlink() or target.exists() and not target.is_file():
+            out["ops"][name]["error"] = f"{target} is not a regular file; left alone"
+            continue
+        if out["ops"][name]["state"] != "current" or (target.stat().st_mode & 0o777) != 0o755:
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)  # before the write
+            atomic_write(target, op["body"].encode(), 0o755, root)
+            out["installed"].append(name)
+            out["ops"][name].update(state="current", have=op["sha256"])
+        plist = plist_dir / f"{op_label(name)}.plist"
+        want = op_plist(name, op["every_s"], ops_dir)
+        try:
+            same = plistlib.loads(read_bytes(plist) or b"") == want
+        except Exception:  # noqa: BLE001 (any unparsable plist is one to rewrite)
+            same = False
+        if not same:
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
+            atomic_write(plist, plistlib.dumps(want, sort_keys=True), 0o644, root)
+        if not same or op_loaded(name, ctl) is not True:
+            error = load_op(name, plist, ctl, wait)
+            if error:
+                out["ops"][name]["error"] = error
+    if managed != set(load_json(ledger).get("ops") or []):
+        atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
+    return out
+
+
+# ---------------------------------------------------------------- the fleet user's OTA updater
+
+UPDATER_LABEL = "com.teamleaderleo.glaeda.update"  # glaeda-update LABEL (glaeda-mini-setup LABEL_PREFIX + "update")
+UPDATER_RETRY_S = 900  # a failed enable or bootstrap is tried again this long after, not every pass
+
+
+def launchctl_full(*args: str) -> tuple[int, str]:
+    """launchctl with its whole answer on success: print-disabled lists every label, and launchctl() keeps only the
+    last 200 characters."""
+    code, out, err = sh(["/bin/launchctl", *args], timeout=20)
+    return code, out if code == 0 else (err or out).strip()[-200:]
+
+
+def label_disabled(listing: str, label: str) -> bool:
+    """Whether a `launchctl print-disabled` listing has label disabled (glaeda-cmux-runner launchctl_disabled)."""
+    found = re.search(r'"' + re.escape(label) + r'"\s*=>\s*(\w+)', listing)
+    return bool(found) and found.group(1) in {"disabled", "true"}
+
+
+def fleet_user(fleet_root: Path = FLEET_ROOT) -> pwd.struct_passwd:
+    """The account glaeda-update runs as: the owner of the fleet root, as fleet_ops_hold reads it."""
+    return pwd.getpwuid(os.stat(fleet_root).st_uid)
+
+
+def updater_pass(now: float, apply: bool, state: dict[str, Any], hold=fleet_ops_hold, user=fleet_user,
+                 ctl=None) -> dict[str, Any]:
+    """Re-enable the fleet user's glaeda-update LaunchAgent when launchd has it disabled and no reservation holds
+    this host, then bootstrap it into gui/<uid>.
+
+    A disabled updater freezes the host on whatever release it last installed, hook included, and nothing in the
+    user's own release can undo that (the updater is how that release would change). A mini sat on an old runner
+    hook for two weeks that way: its updater was disabled during a perf reservation and left disabled after the
+    reservation ended. glaeda's reservation writers disable nothing, so the heal does not
+    depend on who disabled it: while fleet_ops_hold finds a reservation (or cannot read the list: fails closed), the
+    updater stays as it is; once none holds, a disabled updater is enabled. Root acts only on the fleet user's own
+    plist (a regular file of that user with the updater's Label) and loads it into that user's gui domain, where
+    launchd runs it as that user, so nothing here runs as root. state["updater"] keeps a failed attempt, retried
+    every UPDATER_RETRY_S; a bootstrap that failed (no GUI session yet) is retried until launchd lists the agent."""
+    ctl = ctl or launchctl_full
+    try:
+        account = user()
+    except (OSError, KeyError) as e:
+        return {"state": "no fleet user", "why": type(e).__name__}
+    uid, home = account.pw_uid, Path(account.pw_dir)
+    plist = home / "Library" / "LaunchAgents" / f"{UPDATER_LABEL}.plist"
+    try:
+        info = os.lstat(plist)
+    except FileNotFoundError:
+        return {"state": "not installed"}
+    except OSError as e:
+        return {"state": "unknown", "error": f"{plist}: {type(e).__name__}"}
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+        return {"state": "left alone", "why": f"{plist} is not a regular file of {account.pw_name}"}
+    try:
+        label = plistlib.loads(read_small(plist)).get("Label")
+    except Exception as e:  # noqa: BLE001 (any unreadable or unparsable plist is one to leave alone)
+        return {"state": "left alone", "why": f"{plist} does not parse ({type(e).__name__})"}
+    if label != UPDATER_LABEL:
+        return {"state": "left alone", "why": f"{plist} has Label {label!r}"}
+    code, listing = ctl("print-disabled", f"gui/{uid}")
+    if code != 0:
+        return {"state": "unknown", "error": f"launchctl print-disabled gui/{uid}: {listing}"}
+    disabled = label_disabled(listing, UPDATER_LABEL)
+    mine = state.get("updater") if isinstance(state.get("updater"), dict) else {}
+    pending = bool(mine.get("bootstrapPending"))
+    if not disabled and not pending:
+        state.pop("updater", None)
+        return {"state": "enabled"}
+    out: dict[str, Any] = {"state": "disabled" if disabled else "enabled, not loaded"}
+    why = hold(now)
+    if why:
+        out["held"] = why
+        return out
+    tried = mine.get("tried")
+    if isinstance(tried, (int, float)) and 0 <= now - tried < UPDATER_RETRY_S:
+        out["retryAt"] = iso(tried + UPDATER_RETRY_S)
+        return out
+    if not apply:
+        out["would"] = "enable and bootstrap" if disabled else "bootstrap"
+        return out
+    target = f"gui/{uid}/{UPDATER_LABEL}"
+    if disabled:
+        code, said = ctl("enable", target)
+        if code != 0:
+            state["updater"] = {"tried": now}
+            out.update(error=f"launchctl enable {target}: {said}",
+                       line=f"{target} is disabled with no reservation on this host; launchctl enable failed: {said}")
+            return out
+        out["enabled"] = True
+    if ctl("print", target)[0] == 0:
+        state.pop("updater", None)
+        out["bootstrapped"] = False  # already loaded
+    else:
+        code, said = ctl("bootstrap", f"gui/{uid}", os.fspath(plist))
+        if code != 0:
+            state["updater"] = {"bootstrapPending": True, "tried": now}
+            out["error"] = f"launchctl bootstrap gui/{uid}: {said}"
+        else:
+            state.pop("updater", None)
+        out["bootstrapped"] = code == 0
+    out["line"] = (f"{target}: " + ("re-enabled (disabled with no reservation on this host)" if disabled else
+                                    "enabled but not loaded")
+                   + ("; bootstrapped" if out["bootstrapped"] else "; already loaded" if "error" not in out
+                      else f"; {out['error']}, retried in {UPDATER_RETRY_S} s"))
+    return out
+
+
+# ---------------------------------------------------------------- runner accounts' root-pinned glaeda-disk
+
+
+def account_name(uid: int) -> str:
+    return pwd.getpwuid(uid).pw_name
+
+
+def ci_mini_why_not(fleet_root: Path = FLEET_ROOT) -> str:
+    """Why this host is not a CI mini ("" when it is), glaeda-disk's own test (hygiene_mirror_host) read by root: a Mac
+    whose fleet user (the owner of the fleet root) runs runners glaeda-cmux-runner enrolled (~/actions-runner* with a
+    .runner config and glaeda-hooks beside it). Never an EC2 Mac and never cmux-lawrence; a devbox or an interactive
+    Mac has no enrolled runner."""
+    if sys.platform != "darwin":
+        return "not macOS"
+    with contextlib.suppress(KeyError):
+        pwd.getpwnam("ec2-user")
+        return "an EC2 Mac (ec2-user)"
+    try:
+        user = fleet_user(fleet_root)
+    except (OSError, KeyError) as e:
+        return f"no fleet user (owner of {fleet_root}): {type(e).__name__}"
+    home = Path(user.pw_dir)
+    names = {platform_node().split(".")[0].lower(), str(user.pw_name).lower()}
+    with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
+        host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+        if isinstance(host, str) and host:
+            names.add(host.lower())
+    if any("lawrence" in n for n in names):
+        return "cmux-lawrence: not a CI mini"
+    try:
+        runners = [r for r in home.glob("actions-runner*")
+                   if not r.is_symlink() and (r / ".runner").is_file() and (r / "glaeda-hooks").is_dir()]
+    except OSError as e:
+        return f"cannot list {home}: {type(e).__name__}"
+    if not runners:
+        return f"no runner glaeda-cmux-runner enrolled under {home}: not a CI mini"
+    return ""
+
+
+def _keep_current(argv: list[str], inputs, cache: dict[str, Any], key: str, entry: dict[str, Any], now: float,
+                  live: bool, run) -> None:
+    """One glaeda-runner-hygiene job (an account's, or the host's root census) on its release: the cache answers an
+    unchanged current one until HYGIENE_RECHECK_S and a failed one until HYGIENE_RETRY_S; otherwise --check, and on
+    a root pass a stale one is reinstalled by --apply and checked again. entry gets state, why and action."""
+    k = inputs()
+    seen = cache.get(key) if isinstance(cache.get(key), dict) else {}
+    if seen.get("key") == k and now - float(seen.get("at") or 0) < HYGIENE_RECHECK_S:
+        entry.update(state="current", why=f"checked at {iso(float(seen['at']))}")
+        return
+    if seen.get("failed") and seen.get("inputs") == k and now - float(seen.get("at") or 0) < HYGIENE_RETRY_S:
+        entry.update(state=seen.get("state") or "error", why=str(seen["failed"]), action="reinstall")
+        return
+
+    def ask(*flags: str) -> tuple[dict[str, Any] | None, str]:
+        code, said, err = run(argv + list(flags), timeout=HYGIENE_TIMEOUT)
+        try:
+            doc = json.loads(said) if code == 0 else None
+        except ValueError:
+            doc = None
+        return (doc if isinstance(doc, dict) else None), re.sub(r"\s+", " ", (err or said).strip())[-200:]
+
+    doc, said = ask("--check")
+    if doc is not None and doc.get("state") == "stale" and live:
+        applied, said = ask("--apply")
+        entry["reinstalled"] = applied is not None
+        if applied is not None:
+            entry["at"] = iso(now)
+            doc, said = ask("--check")
+    if doc is not None and doc.get("state") == "current":
+        entry.update(state="current", why="matches its release" + (" after a reinstall" if entry.get("reinstalled") else ""))
+        cache[key] = {"key": inputs(), "at": now}
+        return
+    if doc is None or doc.get("state") != "stale":
+        entry.update(state="error", why=f"glaeda-runner-hygiene: {said or 'no answer'}")
+    else:  # a root pass that tried to reinstall and is still stale has failed: an error, retried
+        failed = live and "reinstalled" in entry
+        entry.update(state="error" if failed else "stale", why=", ".join(map(str, doc.get("stale") or [])) +
+                     ("" if live else "; a root pass reinstalls it") +
+                     (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else
+                      "; still stale after a reinstall" if failed else ""), action="reinstall")
+    if live:  # a root pass that could not fix it waits HYGIENE_RETRY_S before trying again
+        cache[key] = {"failed": entry["why"], "state": entry["state"], "inputs": inputs(), "at": now}
+    else:
+        cache.pop(key, None)
+
+
+def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: bool, hygiene_root: Path = HYGIENE_ROOT,
+                 daemons: Path = HYGIENE_DAEMONS, run=bounded_run, python: str = SYSTEM_PYTHON,
+                 account=account_name, ci_mini=ci_mini_why_not) -> dict[str, Any]:
+    """Keep every runner account's glaeda-runner-hygiene job (a root-pinned glaeda-disk and its LaunchDaemon) on the
+    release this copy runs. For each account that already has one (an operator enrolled it once; nothing is
+    adopted), the release's own glaeda-runner-hygiene --check compares the snapshot and plist with what that
+    release's --apply leaves; a stale one is reinstalled by that release's --apply. Only the two files refresh()
+    took from the verified release and recorded in installed.json ever run as root. state["runner_hygiene"] remembers
+    each account's last current inputs, so an unchanged one is not checked again until HYGIENE_RECHECK_S.
+    With no enrolled account on a CI mini, the host's root census alone is kept the same way (root_census_pass)."""
+    out: dict[str, Any] = {"accounts": {}}
+    try:
+        dirs = sorted((d for d in hygiene_root.iterdir() if d.name.isdigit() and (d / "manifest.json").is_file()),
+                      key=lambda d: int(d.name))
+    except FileNotFoundError:
+        dirs = []  # no account was ever enrolled here
+    except OSError as e:  # unreadable: the accounts are not managed this pass; the cache stays, the report says so
+        return {"accounts": {}, "error": f"cannot list {hygiene_root}: {str(e)[:200]}"}
+    ident = load_json(install_dir / INSTALLED)
+    files = ident.get("files") if isinstance(ident.get("files"), dict) else {}
+    tool, disk = install_dir / HYGIENE_NAME, install_dir / DISK_NAME
+    wants = files.get(DISK_NAME)
+    verified = bool(wants and files.get(HYGIENE_NAME)) and all(
+        files.get(p.name) == sha256(read_bytes(p) or b"") for p in (tool, disk))
+    hold = "this copy holds no glaeda-disk and glaeda-runner-hygiene its release recorded; a release pass brings them"
+    if dirs and not verified:
+        out["hold"] = hold
+    if dirs:
+        state.pop("root_census", None)  # each enrolled account's --check and --apply keep the census here
+    else:
+        out["rootCensus"] = root_census_pass(tool, disk, verified, hold, state, now, live, hygiene_root, daemons, run,
+                                             python, ci_mini)
+    cache = state.setdefault("runner_hygiene", {})
+    for d in dirs:
+        uid = d.name
+        manifest = load_json(d / "manifest.json")
+        entry: dict[str, Any] = {"user": manifest.get("user"), "sha256": manifest.get("sha256"), "wants": wants}
+        out["accounts"][uid] = entry
+        try:
+            user = account(int(uid))
+        except (KeyError, ValueError):
+            user = None
+        if not user or user != manifest.get("user") or not isinstance(manifest.get("python"), str):
+            entry.update(state="error", why="its manifest names no account with this uid and a python; left to an operator")
+            continue
+        if not verified:
+            entry.update(state="unchecked", why=out["hold"])  # daemon_heal_stale covers a release pass that fails
+            continue
+
+        def inputs(d: Path = d, uid: str = uid) -> str:  # what --check reads: the release's two files, the snapshot,
+            # its manifest and plist
+            return sha256(json.dumps([files.get(DISK_NAME), files.get(HYGIENE_NAME)] + [
+                sha256(read_bytes(p) or b"") for p in (d / DISK_NAME, d / "manifest.json",
+                                                       daemons / f"{HYGIENE_LABEL}.{uid}.plist")]).encode())
+
+        argv = [python, "-I", os.fspath(tool), "--user", user, "--source", os.fspath(disk),
+                "--python", manifest["python"]]
+        _keep_current(argv, inputs, cache, uid, entry, now, live, run)
+    for uid in [u for u in cache if u not in out["accounts"]]:
+        cache.pop(uid)
+    return out
+
+
+def root_census_pass(tool: Path, disk: Path, verified: bool, hold: str, state: dict[str, Any], now: float, live: bool,
+                     hygiene_root: Path, daemons: Path, run, python: str, ci_mini) -> dict[str, Any]:
+    """The host's root census (glaeda-disk --root-census, read-only, every 30 min) on a CI mini no account was ever
+    enrolled on: glaeda-runner-hygiene --root-census --check, and on a root pass --apply when stale. Before this only
+    an account's enrollment installed it, and no lent CI mini had one (2026-11-18). Every check of an account's
+    install applies: a plist or directory that is not ours is refused, the snapshot is pinned and root-owned."""
+    cache = state.setdefault("root_census", {})
+    why = ci_mini()
+    if why:
+        cache.clear()
+        return {"state": "skipped", "why": why}
+    if not verified:
+        return {"state": "unchecked", "why": hold}
+    entry: dict[str, Any] = {"wants": sha256(read_bytes(disk) or b"")}
+    census = hygiene_root / "root-census"
+
+    def inputs() -> str:  # what --check reads: the release's two files, the census snapshot and its plist
+        return sha256(json.dumps([sha256(read_bytes(p) or b"") for p in (
+            tool, disk, census / DISK_NAME, daemons / f"{HYGIENE_LABEL}.root-census.plist")]).encode())
+
+    argv = [python, "-I", os.fspath(tool), "--root-census", "--source", os.fspath(disk), "--python", CENSUS_PYTHON]
+    _keep_current(argv, inputs, cache, "host", entry, now, live, run)
+    return entry
+
+
+# ---------------------------------------------------------------- main
+
+
+def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None,
+             install_dir: Path | None = None, fleet_ops: dict[str, Any] | None = None,
+             hygiene: dict[str, Any] | None = None, updater: dict[str, Any] | None = None,
+             **release: Any) -> dict[str, Any]:
+    """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
+    policy = load_policy(policy_path)
+    state = load_json(state_dir / "state.json")
+    host = host or Host()
+    if host.journal is None:
+        host.journal = state_dir / SANDBOX_JOURNAL
+    new_state, report = reconcile(host, policy, state, apply)
+    root = os.geteuid() == 0
+    if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
+        install_dir = INSTALL_DIR
+    for key in ("release", "reload_at", "runner_hygiene", "root_census", "updater"):
+        if key in state:
+            new_state[key] = state[key]
+    if apply and install_dir is not None:
+        new_state["release"] = refresh(policy, state, report_time(report), install_dir, root, **release)
+        if root and install_dir == INSTALL_DIR:
+            try:
+                schedule_reload(install_dir, PLIST, new_state, report_time(report), policy["release"]["every_s"])
+            except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+                new_state["release"]["error"] = f"reload: {str(e)[:200]}"
+    # The ops file sits beside the policy (the snapshot, the stage, or a release's config/). A copy that predates it
+    # stages a new release with only the other two files, so its absence is reported, never a failed plan pass.
+    ops_path = policy_path.with_name(FLEET_OPS_NAME)
+    live = root_live = apply and root and install_dir == INSTALL_DIR
+    if live and fleet_ops is None and ops_path.exists():
+        # Root acts only on the bytes refresh() took from the verified release and recorded in installed.json,
+        # whatever put a file at this path (a hand install leaves the snapshot's as it was).
+        ident = load_json(install_dir / INSTALLED)
+        recorded = (ident.get("files") or {}).get(FLEET_OPS_NAME) if isinstance(ident.get("files"), dict) else None
+        if not recorded or recorded != sha256(read_bytes(ops_path) or b""):
+            live = False
+            fleet_ops = {"hold": lambda now: "fleet-ops.json is not the one its release installed; a pass restores it"}
+    try:
+        report["fleetOps"] = (fleet_ops_pass(ops_path, report_time(report), live, **(fleet_ops or {}))
+                              if fleet_ops is not None or ops_path.exists() else {"error": f"no {ops_path}"})
+    except (HealError, OSError, ValueError) as e:
+        if not apply:
+            raise  # a plan pass (the staged check of a new release) refuses a pair with a bad fleet-ops.json
+        report["fleetOps"] = {"error": str(e)[:300]}
+    # The runner accounts' root-pinned glaeda-disk follows the same release (a test passes hygiene to run it).
+    if apply and install_dir is not None and (root_live or hygiene is not None):
+        try:
+            report["runnerHygiene"] = hygiene_pass(install_dir, new_state, report_time(report),
+                                                   **{"live": root_live, **(hygiene or {})})
+        except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+            report["runnerHygiene"] = {"error": str(e)[:300], "accounts": {}}
+    # The fleet user's glaeda-update, re-enabled once no reservation holds the host (a test passes updater).
+    if apply and (root_live or updater is not None):
+        try:
+            report["updater"] = updater_pass(report_time(report), True, new_state, **(updater or {}))
+        except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+            report["updater"] = {"error": str(e)[:300]}
+    report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
+    report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
+    if "release" in new_state:
+        report["release"] = release_report(new_state["release"], policy)
+    if apply:
+        state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        atomic_write(state_dir / "state.json", json.dumps(new_state, sort_keys=True).encode() + b"\n", 0o644, root)
+        atomic_write(state_dir / "report.json", json.dumps(report, sort_keys=True).encode() + b"\n", 0o644, root)
+    return report
+
+
+def report_time(report: dict[str, Any]) -> float:
+    return parse_iso(report["at"]) or time.time()
+
+
+def wait_for_exit(pid: int) -> None:
+    deadline = time.time() + AFTER_PID_WAIT_S
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        time.sleep(0.5)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--policy", type=Path, required=True, help="config/macos-daemons.json")
+    p.add_argument("--state-dir", type=Path, default=INSTALL_DIR / "state")
+    p.add_argument("--apply", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--install", action="store_true", help="install or update the root LaunchDaemon")
+    mode.add_argument("--status", action="store_true", help="is the installed copy this one")
+    p.add_argument("--expect-sha256", help="--install: refuse unless this script's sha256 is this (from the release)")
+    p.add_argument("--expect-policy-sha256", help="--install: the same for the policy file")
+    p.add_argument("--after-pid", type=int, help="--install: wait for this pass to exit first (the self-reload)")
+    args = p.parse_args(argv)
+    try:
+        if args.after_pid:
+            wait_for_exit(args.after_pid)
+        if args.apply and not args.install and os.geteuid() == 0 \
+                and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
+            before = Path(__file__).read_bytes()
+            if finish_pair(INSTALL_DIR, root=True) and Path(__file__).read_bytes() != before:
+                # a swap a crash cut short, finished: run the pass with the code that goes with the new policy
+                os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, "-I", os.fspath(INSTALL_DIR / SCRIPT_NAME),
+                                         *(sys.argv[1:] if argv is None else argv)])
+        if args.status:
+            out = install_status(args.policy)
+        elif args.install:
+            out = install(args.policy, args.apply, args.expect_sha256, args.expect_policy_sha256)
+        else:
+            out = run_pass(args.policy, args.state_dir, args.apply)
+            if args.apply:
+                if out["actions"]:
+                    print(json.dumps({"at": out["at"], "actions": out["actions"]}, separators=(",", ":")), flush=True)
+                if (out.get("updater") or {}).get("line"):
+                    print(json.dumps({"at": out["at"], "updater": out["updater"]["line"]}, separators=(",", ":")),
+                          flush=True)
+                return 0
+    except (HealError, OSError, ValueError) as e:
+        print(json.dumps({"schema": SCHEMA, "error": str(e)}), file=sys.stderr)
+        return 1
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

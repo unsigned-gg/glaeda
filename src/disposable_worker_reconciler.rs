@@ -181,7 +181,57 @@ impl DisposableHostBudget {
         }
         Ok(Self { max_workers, total })
     }
+
+    /// The deployed shape: exactly one worker of `request` per host.
+    #[must_use]
+    pub const fn single(request: DisposableWorkerResources) -> Self {
+        Self {
+            max_workers: 1,
+            total: request,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_workers(self) -> u16 {
+        self.max_workers
+    }
+
+    #[must_use]
+    pub const fn total(self) -> DisposableWorkerResources {
+        self.total
+    }
+
+    /// Whether one more worker of `request` fits beside the reserved `usage`: under the worker
+    /// ceiling and with the summed CPU, memory and disk reservations inside the host total.
+    /// Overflow fails closed.
+    #[must_use]
+    pub fn admits_another(
+        self,
+        usage: DisposableHostUsage,
+        request: DisposableWorkerResources,
+    ) -> bool {
+        if usage.workers >= self.max_workers {
+            return false;
+        }
+        let used = usage.resources;
+        let (Some(cpu_millis), Some(memory_bytes), Some(disk_bytes)) = (
+            used.cpu_millis.checked_add(request.cpu_millis),
+            used.memory_bytes.checked_add(request.memory_bytes),
+            used.disk_bytes.checked_add(request.disk_bytes),
+        ) else {
+            return false;
+        };
+        DisposableWorkerResources {
+            cpu_millis,
+            memory_bytes,
+            disk_bytes,
+        }
+        .fits_within(self.total)
+    }
 }
+
+/// The largest per-host worker ceiling any layer accepts (the bridge's own bound is the same).
+pub(crate) const MAX_HOST_WORKERS: u16 = MAX_WORKERS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DisposableHostUsage {

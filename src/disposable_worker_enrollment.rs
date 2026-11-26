@@ -1,7 +1,10 @@
 //! Canonical, secret-free operator enrollment for one disposable Scale Set worker.
 //!
 //! The document names the Mac-local control-plane inputs, but never contains the GitHub App
-//! private key or a runner JIT value. Construction delegates policy validation to the existing
+//! private key, an installation token, or a runner JIT value. Schema 2 names one credential source:
+//! the Keychain item holding the App key (`keychain`), or the path of an installation token file the
+//! key's home host pushes (`installation_token_file`). Schema 1 documents still decode, as the
+//! Keychain kind, under their own canonical encoding. Construction delegates policy validation to the existing
 //! bridge, prepared-template, resource, Lima, and consumer boundaries instead of duplicating
 //! those semantics here.
 
@@ -23,14 +26,17 @@ use crate::disposable_lima_worker::{
 };
 use crate::disposable_prepared_template::current_disposable_prepared_template;
 use crate::disposable_runner_runtime::DisposableRunnerRuntime;
-use crate::disposable_worker_reconciler::DisposableWorkerResources;
+use crate::disposable_worker_reconciler::{DisposableHostBudget, DisposableWorkerResources};
 use crate::github_scale_set_bridge::{
-    GitHubAppKeychainConfig, ScaleSetBridgeConfig, ScaleSetBridgeTarget,
+    GitHubAppKeychainConfig, InstallationTokenFileConfig, ScaleSetBridgeConfig,
+    ScaleSetBridgeCredential, ScaleSetBridgeTarget,
 };
 use crate::github_scale_set_delivery_consumer::ScaleSetDeliveryConsumerPolicy;
 use crate::lima_observation::LimaInstanceName;
 
-pub const DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION: u8 = 1;
+pub const DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION: u8 = 2;
+/// The Keychain-only schema; still decoded so existing enrollments keep working unchanged.
+pub const DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION_V1: u8 = 1;
 pub const MAX_DISPOSABLE_WORKER_ENROLLMENT_BYTES: usize = 16 * 1024;
 const BRIDGE_PROGRAM: &str = "/opt/smolrunner/bin/scaleset-bridge";
 
@@ -80,7 +86,8 @@ impl fmt::Display for DisposableWorkerEnrollmentError {
 
 impl std::error::Error for DisposableWorkerEnrollmentError {}
 
-/// Validated construction inputs for one local, single-concurrency Scale Set service.
+/// Validated construction inputs for one local Scale Set service (one clone per host unless the
+/// enrollment names a `host` ceiling).
 ///
 /// The type deliberately has no serialization, path accessor, `Clone`, or derived `Debug`.
 pub struct DisposableWorkerEnrollment {
@@ -142,22 +149,42 @@ pub fn decode_disposable_worker_enrollment(
         ));
     }
     let version: VersionWire = serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
-    if version.schema_version != DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION {
-        return Err(enrollment_error(
-            DisposableWorkerEnrollmentErrorKind::VersionIncompatible,
-            "disposable_worker_enrollment_version_incompatible",
-            "the disposable-worker enrollment schema version is unsupported",
-        ));
-    }
-    let wire: EnrollmentWire = serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
-    if canonical_bytes(&wire)? != bytes {
+    let wire = match version.schema_version {
+        DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION => {
+            let wire: EnrollmentWire =
+                serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
+            require_canonical(&canonical_bytes(&wire)?, bytes)?;
+            wire
+        }
+        DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION_V1 => {
+            let wire: EnrollmentWireV1 =
+                serde_json::from_slice(bytes).map_err(|_| invalid_document())?;
+            require_canonical(&canonical_bytes(&wire)?, bytes)?;
+            wire.into_current()
+        }
+        _ => {
+            return Err(enrollment_error(
+                DisposableWorkerEnrollmentErrorKind::VersionIncompatible,
+                "disposable_worker_enrollment_version_incompatible",
+                "the disposable-worker enrollment schema version is unsupported",
+            ));
+        }
+    };
+    build_enrollment(wire)
+}
+
+fn require_canonical(
+    canonical: &[u8],
+    bytes: &[u8],
+) -> Result<(), DisposableWorkerEnrollmentError> {
+    if canonical != bytes {
         return Err(enrollment_error(
             DisposableWorkerEnrollmentErrorKind::NonCanonical,
             "disposable_worker_enrollment_noncanonical",
             "the disposable-worker enrollment is not canonically encoded",
         ));
     }
-    build_enrollment(wire)
+    Ok(())
 }
 
 fn build_enrollment(
@@ -178,26 +205,46 @@ fn build_enrollment(
         LimaInstanceName::parse(&wire.lima.source_instance).map_err(|_| invalid_configuration())?;
     let bridge_digest =
         Sha256Digest::parse(&wire.bridge.program_digest).map_err(|_| invalid_configuration())?;
-    let github_app = GitHubAppKeychainConfig::new(
-        &wire.github.config_url,
-        &wire.github.client_id,
-        wire.github.installation_id,
-        &wire.github.keychain_service,
-        &wire.github.keychain_account,
-    )
-    .map_err(|_| invalid_configuration())?;
+    let credential = match &wire.github.credential {
+        CredentialWire::Keychain {
+            client_id,
+            installation_id,
+            service,
+            account,
+        } => ScaleSetBridgeCredential::GitHubAppKeychain(
+            GitHubAppKeychainConfig::new(
+                &wire.github.config_url,
+                client_id,
+                *installation_id,
+                service,
+                account,
+            )
+            .map_err(|_| invalid_configuration())?,
+        ),
+        CredentialWire::InstallationTokenFile { app_id, path } => {
+            ScaleSetBridgeCredential::InstallationTokenFile(
+                InstallationTokenFileConfig::new(&wire.github.config_url, *app_id, Path::new(path))
+                    .map_err(|_| invalid_configuration())?,
+            )
+        }
+    };
+    let max_workers = wire.host.as_ref().map_or(1, |host| host.max_workers);
     let target = ScaleSetBridgeTarget::new(
         wire.scale_set.id,
         &wire.scale_set.name,
         wire.scale_set.runner_group_id,
         &wire.scale_set.labels,
         &wire.scale_set.owner,
-        1,
+        max_workers,
     )
     .map_err(|_| invalid_configuration())?;
-    let bridge_config =
-        ScaleSetBridgeConfig::new(Path::new(BRIDGE_PROGRAM), bridge_digest, github_app, target)
-            .map_err(|_| invalid_configuration())?;
+    let bridge_config = ScaleSetBridgeConfig::with_credential(
+        Path::new(BRIDGE_PROGRAM),
+        bridge_digest,
+        credential,
+        target,
+    )
+    .map_err(|_| invalid_configuration())?;
     let prepared = current_disposable_prepared_template().map_err(|_| invalid_configuration())?;
     let resources = DisposableWorkerResources::new(
         wire.resources.cpu_millis,
@@ -217,6 +264,12 @@ fn build_enrollment(
         &prepared,
     )
     .map_err(|_| invalid_configuration())?;
+    let consumer_policy = match &wire.host {
+        None => consumer_policy,
+        Some(host) => consumer_policy
+            .with_host_budget(host_budget(host, resources)?)
+            .map_err(|_| invalid_configuration())?,
+    };
     let clone_runtime = DisposableCloneRuntime::new(
         state_root.clone(),
         limactl_program.clone(),
@@ -238,7 +291,30 @@ fn build_enrollment(
     })
 }
 
-fn canonical_bytes(wire: &EnrollmentWire) -> Result<Vec<u8>, DisposableWorkerEnrollmentError> {
+/// The host budget an enrollment's `host` block names: up to `max_workers` clones whose memory
+/// reservations sum to at most `memory_bytes`. CPU and disk totals follow the worker ceiling (CPU is
+/// shared by the hypervisor; disk is admitted per clone against the filesystem at clone time).
+fn host_budget(
+    host: &HostWire,
+    resources: DisposableWorkerResources,
+) -> Result<DisposableHostBudget, DisposableWorkerEnrollmentError> {
+    let workers = u32::from(host.max_workers);
+    let total = DisposableWorkerResources::new(
+        resources
+            .cpu_millis()
+            .checked_mul(workers)
+            .ok_or_else(invalid_configuration)?,
+        host.memory_bytes,
+        resources
+            .disk_bytes()
+            .checked_mul(u64::from(workers))
+            .ok_or_else(invalid_configuration)?,
+    )
+    .map_err(|_| invalid_configuration())?;
+    DisposableHostBudget::new(host.max_workers, total).map_err(|_| invalid_configuration())
+}
+
+fn canonical_bytes(wire: &impl Serialize) -> Result<Vec<u8>, DisposableWorkerEnrollmentError> {
     let mut bytes = serde_json::to_vec_pretty(wire).map_err(|_| invalid_document())?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -287,6 +363,18 @@ struct EnrollmentWire {
     github: GitHubWire,
     scale_set: ScaleSetWire,
     resources: ResourcesWire,
+    /// Optional per-host ceiling. Absent means one clone per host, and an enrollment without it
+    /// keeps its exact canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<HostWire>,
+}
+
+/// How many clones this host may run at once and the memory their reservations may sum to.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct HostWire {
+    max_workers: u16,
+    memory_bytes: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -307,10 +395,70 @@ struct BridgeWire {
 #[serde(deny_unknown_fields)]
 struct GitHubWire {
     config_url: String,
+    credential: CredentialWire,
+}
+
+/// One credential source. The installation token file holds a pushed token, never the App key; its
+/// owner, mode, link and expiry checks run at every session start, not at decode.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum CredentialWire {
+    Keychain {
+        client_id: String,
+        installation_id: u64,
+        service: String,
+        account: String,
+    },
+    InstallationTokenFile {
+        app_id: u64,
+        path: String,
+    },
+}
+
+/// Schema 1: the Keychain-only layout, kept byte-for-byte so its canonical check is unchanged.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentWireV1 {
+    schema_version: u8,
+    state_root: String,
+    lima: LimaWire,
+    bridge: BridgeWire,
+    github: GitHubWireV1,
+    scale_set: ScaleSetWire,
+    resources: ResourcesWire,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GitHubWireV1 {
+    config_url: String,
     client_id: String,
     installation_id: u64,
     keychain_service: String,
     keychain_account: String,
+}
+
+impl EnrollmentWireV1 {
+    fn into_current(self) -> EnrollmentWire {
+        EnrollmentWire {
+            schema_version: DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION,
+            state_root: self.state_root,
+            lima: self.lima,
+            bridge: self.bridge,
+            github: GitHubWire {
+                config_url: self.github.config_url,
+                credential: CredentialWire::Keychain {
+                    client_id: self.github.client_id,
+                    installation_id: self.github.installation_id,
+                    service: self.github.keychain_service,
+                    account: self.github.keychain_account,
+                },
+            },
+            scale_set: self.scale_set,
+            resources: self.resources,
+            host: None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -339,6 +487,10 @@ mod tests {
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn canonical_document() -> Vec<u8> {
+        canonical_document_with_host(None)
+    }
+
+    fn canonical_document_with_host(host: Option<HostWire>) -> Vec<u8> {
         canonical_bytes(&EnrollmentWire {
             schema_version: DISPOSABLE_WORKER_ENROLLMENT_SCHEMA_VERSION,
             state_root: "/private/var/lib/smolrunner".to_owned(),
@@ -352,10 +504,12 @@ mod tests {
             },
             github: GitHubWire {
                 config_url: "https://github.com/acme".to_owned(),
-                client_id: "Iv1.0123456789abcdef".to_owned(),
-                installation_id: 42,
-                keychain_service: "smolrunner.github-app".to_owned(),
-                keychain_account: "acme-ci".to_owned(),
+                credential: CredentialWire::Keychain {
+                    client_id: "Iv1.0123456789abcdef".to_owned(),
+                    installation_id: 42,
+                    service: "smolrunner.github-app".to_owned(),
+                    account: "acme-ci".to_owned(),
+                },
             },
             scale_set: ScaleSetWire {
                 id: 17,
@@ -370,8 +524,55 @@ mod tests {
                 memory_bytes: 2 << 30,
                 disk_bytes: 20 << 30,
             },
+            host,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn host_block_sets_the_per_host_clone_ceiling_and_absence_keeps_one() {
+        let single = decode_disposable_worker_enrollment(&canonical_document())
+            .unwrap()
+            .into_parts();
+        assert_eq!(single.consumer_policy.host_budget().max_workers(), 1);
+        assert!(
+            !String::from_utf8(canonical_document())
+                .unwrap()
+                .contains("\"host\"")
+        );
+
+        let three =
+            decode_disposable_worker_enrollment(&canonical_document_with_host(Some(HostWire {
+                max_workers: 3,
+                memory_bytes: 6 << 30,
+            })))
+            .unwrap()
+            .into_parts();
+        let budget = three.consumer_policy.host_budget();
+        assert_eq!(budget.max_workers(), 3);
+        assert_eq!(budget.total().memory_bytes(), 6 << 30);
+        assert_eq!(budget.total().cpu_millis(), 6_000);
+
+        for refused in [
+            HostWire {
+                max_workers: 0,
+                memory_bytes: 6 << 30,
+            },
+            HostWire {
+                max_workers: 65,
+                memory_bytes: 1 << 40,
+            },
+            // Memory for less than one clone.
+            HostWire {
+                max_workers: 3,
+                memory_bytes: 1 << 30,
+            },
+        ] {
+            assert!(
+                decode_disposable_worker_enrollment(&canonical_document_with_host(Some(refused)))
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -400,9 +601,9 @@ mod tests {
     #[test]
     fn prior_future_unknown_and_noncanonical_documents_fail_closed() {
         let current = String::from_utf8(canonical_document()).unwrap();
-        for version in [0, 2] {
+        for version in [0, 3] {
             let changed = current.replacen(
-                "\"schema_version\": 1",
+                "\"schema_version\": 2",
                 &format!("\"schema_version\": {version}"),
                 1,
             );
@@ -472,6 +673,104 @@ mod tests {
                 "disposable_worker_enrollment_configuration_invalid"
             );
             assert!(!format!("{error:?}").contains("private"));
+        }
+    }
+
+    fn v1_document() -> String {
+        String::from_utf8(canonical_document())
+            .unwrap()
+            .replacen("\"schema_version\": 2", "\"schema_version\": 1", 1)
+            .replace(
+                "    \"credential\": {\n      \"kind\": \"keychain\",\n      \"client_id\": \"Iv1.0123456789abcdef\",\n      \"installation_id\": 42,\n      \"service\": \"smolrunner.github-app\",\n      \"account\": \"acme-ci\"\n    }\n",
+                "    \"client_id\": \"Iv1.0123456789abcdef\",\n    \"installation_id\": 42,\n    \"keychain_service\": \"smolrunner.github-app\",\n    \"keychain_account\": \"acme-ci\"\n",
+            )
+    }
+
+    fn token_file_document() -> String {
+        String::from_utf8(canonical_document()).unwrap().replace(
+            "    \"credential\": {\n      \"kind\": \"keychain\",\n      \"client_id\": \"Iv1.0123456789abcdef\",\n      \"installation_id\": 42,\n      \"service\": \"smolrunner.github-app\",\n      \"account\": \"acme-ci\"\n    }\n",
+            "    \"credential\": {\n      \"kind\": \"installation_token_file\",\n      \"app_id\": 5067688,\n      \"path\": \"/Users/runner/.config/glaeda/scaleset-token.json\"\n    }\n",
+        )
+    }
+
+    #[test]
+    fn schema_v1_keychain_document_still_decodes_as_the_keychain_kind() {
+        let v1 = v1_document();
+        assert!(v1.contains("\"keychain_service\""));
+        let enrollment = decode_disposable_worker_enrollment(v1.as_bytes()).unwrap();
+        let parts = enrollment.into_parts();
+        assert!(matches!(
+            parts.bridge_config.credential(),
+            ScaleSetBridgeCredential::GitHubAppKeychain(_)
+        ));
+        // A v1 document must stay in the v1 layout; the v2 credential object is refused there.
+        let mixed = String::from_utf8(canonical_document()).unwrap().replacen(
+            "\"schema_version\": 2",
+            "\"schema_version\": 1",
+            1,
+        );
+        assert_eq!(
+            decode_disposable_worker_enrollment(mixed.as_bytes())
+                .unwrap_err()
+                .kind(),
+            DisposableWorkerEnrollmentErrorKind::InvalidDocument
+        );
+    }
+
+    #[test]
+    fn installation_token_file_kind_builds_a_token_bridge_config() {
+        let document = token_file_document();
+        let enrollment = decode_disposable_worker_enrollment(document.as_bytes()).unwrap();
+        assert!(!format!("{enrollment:?}").contains("scaleset-token"));
+        let parts = enrollment.into_parts();
+        assert!(matches!(
+            parts.bridge_config.credential(),
+            ScaleSetBridgeCredential::InstallationTokenFile(_)
+        ));
+    }
+
+    #[test]
+    fn installation_token_file_kind_fails_closed() {
+        let document = token_file_document();
+        let invalid = [
+            document.replace(
+                "/Users/runner/.config/glaeda/scaleset-token.json",
+                "relative.json",
+            ),
+            document.replace(
+                "/Users/runner/.config/glaeda/scaleset-token.json",
+                "/Users/runner/../token.json",
+            ),
+            document.replace("\"app_id\": 5067688", "\"app_id\": 0"),
+        ];
+        for bytes in invalid {
+            assert_eq!(
+                decode_disposable_worker_enrollment(bytes.as_bytes())
+                    .unwrap_err()
+                    .kind(),
+                DisposableWorkerEnrollmentErrorKind::InvalidConfiguration
+            );
+        }
+        let malformed = [
+            // A token or key value is never accepted inline.
+            document.replace(
+                "      \"app_id\": 5067688,\n",
+                "      \"app_id\": 5067688,\n      \"token\": \"ghs_x\",\n",
+            ),
+            // Keychain fields do not mix into the token kind.
+            document.replace(
+                "      \"app_id\": 5067688,\n",
+                "      \"app_id\": 5067688,\n      \"service\": \"x\",\n",
+            ),
+            document.replace("\"installation_token_file\"", "\"token_env\""),
+        ];
+        for bytes in malformed {
+            assert_eq!(
+                decode_disposable_worker_enrollment(bytes.as_bytes())
+                    .unwrap_err()
+                    .kind(),
+                DisposableWorkerEnrollmentErrorKind::InvalidDocument
+            );
         }
     }
 

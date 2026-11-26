@@ -42,9 +42,28 @@ The optimization order is intentionally boring: avoid destroying valuable valid 
 
 ## Current status
 
-Glaeda is pre-alpha and already exercises real systems paths on operator-owned Apple silicon and Linux/x86-64 machines. Current dogfood includes resident repository-evidence execution on Linux; current `main` also contains the durable disposable-worker/control foundations, GitHub Runner Scale Set integration, prepared Lima/VZ worker support, trusted resident-state primitives, hot-state admission, task/source-view work, and bounded verification/performance receipts.
+Glaeda is pre-alpha. What runs every day is the fleet track, almost all of it in `scripts/`:
 
-The current production direction still has active gaps around complete hostile-work network/credential hardening and end-to-end composition of the trusted resident task path. Current issues, pull requests, Git history, and [`docs/ROADMAP.md`](docs/ROADMAP.md) own progression; this README describes the present product boundary.
+- **`cmux-gh`**: a local daemon that is the only process polling GitHub for a host's agent
+  sessions. Agents wait on PRs, runs and comments through it instead of polling
+  ([`skills/github-ci-wait`](skills/github-ci-wait/SKILL.md)).
+- **The cmux Mac mini runner fleet**: `glaeda-cmux-runner` and its job hook (admission, the
+  capacity ledger, listener gates, per-job telemetry), `glaeda-cmux-runner-fleet` (rollout),
+  `glaeda-mini-fleet` (inventory, onboarding, repair), `glaeda-fleet-status` and `glaeda-route`
+  (where each cmux job runs). See [`docs/CMUX_MINI_RUNNER.md`](docs/CMUX_MINI_RUNNER.md),
+  [`docs/GLAEDA_ROUTE.md`](docs/GLAEDA_ROUTE.md), [`docs/FLEET_OPERATIONS.md`](docs/FLEET_OPERATIONS.md)
+  and [`docs/FLEET_STATUS.md`](docs/FLEET_STATUS.md).
+- **Over-the-air updates**: every merge to `main` becomes a release; `glaeda-update` on every
+  host installs it (canary, then stable) every 10 minutes and brings the runners' staged copy and
+  hook files along ([`docs/GLAEDA_OTA.md`](docs/GLAEDA_OTA.md)).
+- **Host hygiene**: `glaeda-disk` (where the disk went, and safe reclaim), `glaeda-projects tidy`
+  and `glaeda-worktree` for developer checkouts
+  ([`docs/DEVBOX_DISK_AND_PROJECTS.md`](docs/DEVBOX_DISK_AND_PROJECTS.md)).
+
+The Rust runtime (`src/`, the `glaeda` binary) and its Lima/VZ disposable-worker programme
+(milestones M1 to M7 in [`docs/ROADMAP.md`](docs/ROADMAP.md)) are the older track. It is paused,
+not deleted: its contracts below still hold for that code, and the resident-repository result
+below came from it.
 
 ## Measured results
 
@@ -102,27 +121,37 @@ The first production host/backend is an operator-owned Apple-silicon Mac with Li
 
 ## Commands
 
-Inspect the current machine and plan repository work without applying it:
+The fleet and host tools install into `~/.local/bin` with `scripts/glaeda-mini-setup --apply`
+(`--hygiene-only` on a developer machine; plan is the default and changes nothing):
+
+```bash
+cmux-gh wait pr OWNER/REPO#N --sha FULL_SHA   # wait for CI without polling (skills/github-ci-wait)
+cmux-gh status pr OWNER/REPO#N
+cmux-gh runners OWNER[/REPO]                   # busy and idle self-hosted runners per label
+                                                 # (org pools this token cannot list come from CI_RUNNER_STATE, else "unknown", never 0)
+glaeda-disk report                               # where the disk went; --apply reclaims
+glaeda-projects tidy                             # report; --apply moves idle checkouts
+glaeda-worktree add --no-build REPO NAME         # a worktree under ~/Projects/worktrees/REPO/
+glaeda-update --status                           # this host's update config and state, read-only
+```
+
+From a glaeda checkout, for the runner fleet:
+
+```bash
+scripts/glaeda-fleet-status --no-lima            # what is wrong with the fleet; --output json
+scripts/glaeda-mini-fleet check                  # drift against the fleet manifest
+scripts/glaeda-cmux-runner-fleet                 # plan a runner rollout (OTA normally does it)
+```
+
+The paused Rust runtime still builds and plans read-only:
 
 ```bash
 cargo run --locked -- --output json doctor
 cargo run --locked -- plan --file examples/quarry.yml
-cargo run --locked -- host plan --file examples/quarry.yml
 ```
 
-`doctor` reports local readiness. `plan` validates a manifest and computes project actions. `host plan` adds host preparation decisions. Planning is read-only.
-
-Host preparation is an explicit privileged path:
-
-```bash
-cargo build --locked
-sudo ./target/debug/glaeda host prepare --file examples/quarry.yml
-sudo ./target/debug/glaeda host prepare --file examples/quarry.yml --confirm EXACT_CONFIRMATION
-```
-
-Review the exact built binary and plan before granting privilege. Repository code, scripts, and ordinary agent work never gain privilege merely because Glaeda can prepare a host.
-
-Project manifests describe project identity and desired execution policy; project repositories retain executable verification and build behavior. See [`docs/MANIFEST.md`](docs/MANIFEST.md) and [`examples/`](examples/) for the current schema and examples.
+See [`docs/MANIFEST.md`](docs/MANIFEST.md) and [`examples/`](examples/) for that track's
+manifest schema.
 
 ## Design principles
 
@@ -152,16 +181,27 @@ Documentation-only changes follow the repository's docs-only verification policy
 
 ## Project documents
 
-- [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md) — general compute-runtime boundary and typed workload seam.
-- [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md) — caller/request/physical-lease interoperability for shared CMUX-owned hardware.
-- [`docs/BLAZINGLY_HOT.md`](docs/BLAZINGLY_HOT.md) — trusted residency and hot execution.
-- [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — hostile/unknown execution boundary.
-- [`docs/AGENT_EXECUTION_SAFETY.md`](docs/AGENT_EXECUTION_SAFETY.md) — ownership, durable state, mutation, subprocess, and experiment safety.
-- [`docs/WORKSPACE_BOOTSTRAP.md`](docs/WORKSPACE_BOOTSTRAP.md) — repository bootstrap contract.
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — current sequencing and detailed programme state.
-- [`docs/MANIFEST.md`](docs/MANIFEST.md) — project manifest model.
-- [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated: every exported module and what reaches it.
-- [`AGENTS.md`](AGENTS.md) — repository instructions and task routing for agents.
+Live:
+
+- [`AGENTS.md`](AGENTS.md): repository instructions and task routing for agents (`CLAUDE.md`
+  imports it).
+- [`skills/github-ci-wait/SKILL.md`](skills/github-ci-wait/SKILL.md): waiting on GitHub with `cmux-gh`.
+- [`docs/CMUX_MINI_RUNNER.md`](docs/CMUX_MINI_RUNNER.md): the cmux mini runner, hook, capacity and rollout.
+- [`docs/GLAEDA_OTA.md`](docs/GLAEDA_OTA.md): releases, canary and stable, how hosts update.
+- [`docs/GLAEDA_ROUTE.md`](docs/GLAEDA_ROUTE.md): where cmux CI jobs run.
+- [`docs/FLEET_OPERATIONS.md`](docs/FLEET_OPERATIONS.md) and [`docs/FLEET_STATUS.md`](docs/FLEET_STATUS.md):
+  the fleet operator front door and the status document.
+- [`docs/DEVBOX_DISK_AND_PROJECTS.md`](docs/DEVBOX_DISK_AND_PROJECTS.md): disk and checkout hygiene.
+
+Runtime track (paused):
+
+- [`docs/ROADMAP.md`](docs/ROADMAP.md): milestones M1 to M7.
+- [`docs/COMPUTE_RUNTIME.md`](docs/COMPUTE_RUNTIME.md), [`docs/BLAZINGLY_HOT.md`](docs/BLAZINGLY_HOT.md),
+  [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md),
+  [`docs/AGENT_EXECUTION_SAFETY.md`](docs/AGENT_EXECUTION_SAFETY.md),
+  [`docs/MULTI_ORCHESTRATOR_INTEROP.md`](docs/MULTI_ORCHESTRATOR_INTEROP.md),
+  [`docs/WORKSPACE_BOOTSTRAP.md`](docs/WORKSPACE_BOOTSTRAP.md), [`docs/MANIFEST.md`](docs/MANIFEST.md).
+- [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md): generated; every exported module and what reaches it.
 
 ## License
 

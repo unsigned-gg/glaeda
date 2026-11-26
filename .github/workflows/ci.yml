@@ -2,11 +2,21 @@ name: Verify
 
 on:
   pull_request:
+    # A base edit is the change that most obviously demands a re-verify, and it is none of the default
+    # opened/synchronize/reopened: retargeting a pull request scheduled nothing here, so lanes pushed an empty
+    # commit to start CI. `edited` also fires for a title or body edit, which no job below reads: the
+    # github.event.changes.base gate on `changes` and `ci-status` skips every job for those, and the
+    # concurrency rule keeps such a run from cancelling a real one.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+  # A hand-run Verify of main in the fork (`gh workflow run ci.yml -R manaflow-ai/glaeda --ref main`): main's check of
+  # record when the push Verify there did not run, as when Sync main was red (glaeda#1859). It runs every job, as a
+  # main push does. Dispatched here, in teamleaderleo/glaeda, every job is skipped, like a main push (see below).
+  workflow_dispatch:
 
 # Keep pull requests active for documentation-only changes so the required
 # `ci-status` check is reported. Main pushes retain the path filter because
@@ -15,14 +25,18 @@ on:
 permissions:
   contents: read
 
-# manaflow-ai/glaeda, the fleet fork, runs this workflow for pull requests only. Its main is moved by
-# sync-main.yml in teamleaderleo/glaeda, and a push there must not run a second copy of every check:
-# the commit was verified as a pull request on one side and is verified on push here. The jobs that
-# need no other job carry the gate; the rest are skipped with them.
+# A push to main is verified in manaflow-ai/glaeda, the fleet fork, on Blacksmith, and not here: both mains hold
+# the same commits (sync-main.yml keeps them equal), so the fork's Verify at a commit is that commit's check of
+# record in both repositories (scripts/glaeda-gh reads it for a teamleaderleo/glaeda head); a documentation-only
+# push runs no Verify (paths-ignore above), in either repository, as before. teamleaderleo/glaeda
+# is a personal-account repository with no Blacksmith, so it runs this workflow for its own pull requests only,
+# whose heads exist only here. The jobs that need no other job carry the gate; the rest are skipped with them.
 
 concurrency:
-  group: verify-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A hand-run Verify never cancels the push Verify of the same ref, nor the other way round.
+  group: verify-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
+  # A title or body edit (every job skipped) never cancels the real Verify of the same ref.
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from != '' }}
 
 jobs:
   # Most pull requests change only Python and shell under scripts/, which the Rust and Go jobs cannot judge: of 60
@@ -32,8 +46,9 @@ jobs:
   # scripts and runner-tests run for any pull request that changes more than Markdown no script names, since several
   # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
-    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
-    runs-on: ubuntu-24.04
+    if: ${{ (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda')
+            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -107,7 +122,7 @@ jobs:
   go:
     needs: changes
     if: ${{ needs.changes.outputs.go == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
@@ -134,17 +149,20 @@ jobs:
           go build -trimpath -o /tmp/glaeda-scaleset-bridge .
 
 
-  # Script syntax and every script test file but the runner's, which runner-tests shards.
+  # Script syntax and every script test file but the runner's and glaeda-gh's, which runner-tests and
+  # glaeda-gh-tests shard.
   scripts:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          # HEAD^1 is the base: scripts/test-fleet-rule-lints.py refuses an allowlist that grew against it.
+          fetch-depth: 2
           persist-credentials: false
           show-progress: false
 
@@ -155,8 +173,16 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
+      # The gui and session runners hold cmux's tour floor, vendored in glaeda-cmux-runner-hook at a pinned cmux
+      # commit: a different file at the pin or on feat-cmux-next fails here, and a failed read is a warning.
+      - name: Check the vendored cmux tour floor against cmux
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/glaeda-cmux-tour-floor-check
+
       - name: Validate and test scripts
         run: |
+          python3 scripts/gh_auth_token_lint.py
           python3 - <<'PY'
           from pathlib import Path
 
@@ -171,6 +197,9 @@ jobs:
               Path("scripts/hot-run-python"),
               Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
+              Path("scripts/glaeda_hook_pin.py"),
+              Path("scripts/glaeda-cmux-tour-floor-check"),
+              Path("scripts/test-glaeda-cmux-tour-floor-check.py"),
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
@@ -195,6 +224,12 @@ jobs:
               Path("scripts/cmux_fleet_bootstrap.py"),
               Path("scripts/glaeda-mini-setup"),
               Path("scripts/test-glaeda-mini-setup.py"),
+              Path("scripts/glaeda-linux-vm-base"),
+              Path("scripts/test-glaeda-linux-vm-base.py"),
+              Path("scripts/glaeda-linux-vm-serve"),
+              Path("scripts/test-glaeda-linux-vm-serve.py"),
+              Path("scripts/glaeda-linux-vm-rollout"),
+              Path("scripts/test-glaeda-linux-vm-rollout.py"),
               Path("scripts/glaeda-mini-enroll"),
               Path("scripts/test-glaeda-mini-enroll.py"),
               Path("scripts/glaeda-cmux-runner"),
@@ -204,12 +239,22 @@ jobs:
               Path("scripts/test-glaeda-cmux-runner.py"),
               Path("scripts/glaeda-cmux-runner-fleet"),
               Path("scripts/test-glaeda-cmux-runner-fleet.py"),
+              Path("scripts/glaeda-promotion-admit"),
+              Path("scripts/glaeda-capture-admit"),
+              Path("scripts/test-glaeda-capture-admit.py"),
+              Path("scripts/test-glaeda-promotion-admit.py"),
+              Path("scripts/glaeda-runner-hook-lag"),
+              Path("scripts/test-glaeda-runner-hook-lag.py"),
               Path("scripts/glaeda-mini-fleet"),
               Path("scripts/test-glaeda-mini-fleet.py"),
               Path("scripts/glaeda-fleet-status"),
               Path("scripts/test-glaeda-fleet-status.py"),
               Path("scripts/glaeda-route"),
               Path("scripts/test-glaeda-route.py"),
+              Path("scripts/glaeda_never_cancel.py"),
+              Path("scripts/test-glaeda-never-cancel.py"),
+              Path("scripts/glaeda_runner_labels.py"),
+              Path("scripts/test-glaeda-runner-labels.py"),
               Path("scripts/cmux_execution_roles.py"),
               Path("scripts/test-cmux-fleet.py"),
               Path("scripts/test-cmux-execution-roles.py"),
@@ -224,15 +269,22 @@ jobs:
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-fleet-rule-lints.py"),
               Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
               Path("scripts/test-benchmark-linker-throughput.py"),
               Path("scripts/test-hot-observe.py"),
               Path("scripts/glaeda-disk"),
               Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-disk-registry"),
+              Path("scripts/test-glaeda-disk-registry.py"),
               Path("scripts/glaeda-runner-hygiene"),
               Path("scripts/test-glaeda-runner-hygiene.py"),
               Path("scripts/glaeda-procs"),
               Path("scripts/test-glaeda-procs.py"),
+              Path("scripts/cmux-disk"),
+              Path("scripts/cmux-procs"),
+              Path("scripts/cmux-disk-registry"),
+              Path("scripts/test-cmux-names.py"),
               Path("scripts/glaeda-local-guard"),
               Path("scripts/test-glaeda-local-guard.py"),
               Path("scripts/glaeda-update"),
@@ -241,14 +293,23 @@ jobs:
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
               Path("scripts/test-glaeda-fleet-cas.py"),
+              Path("scripts/test-glaeda-headless-services.py"),
               Path("scripts/fleet_cas_bundle.py"),
               Path("scripts/test-fleet-cas-bundle.py"),
+              Path("scripts/release_build_cache.py"),
+              Path("scripts/test-release-build-cache.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
+              Path("scripts/glaeda-git-mirror"),
+              Path("scripts/test-glaeda-git-mirror.py"),
               Path("scripts/glaeda-idle-warm"),
               Path("scripts/test-glaeda-idle-warm.py"),
+              Path("scripts/glaeda-idle-repair"),
+              Path("scripts/test-glaeda-idle-repair.py"),
               Path("scripts/glaeda-mini-health"),
               Path("scripts/test-glaeda-mini-health.py"),
+              Path("scripts/glaeda-daemon-heal"),
+              Path("scripts/test-glaeda-daemon-heal.py"),
               Path("scripts/glaeda-seed-serve"),
               Path("scripts/glaeda-seed-lan"),
               Path("scripts/test-glaeda-seed-lan.py"),
@@ -256,8 +317,14 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/test-glaeda-gh-edge.py"),
+              Path("scripts/test-cmux-gh-alias.py"),
+              Path("scripts/benchmark-land-forward.py"),
+              Path("scripts/measure-land-head-moved-after-own-update.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
+              Path("scripts/glaeda-nightly-only-admit"),
+              Path("scripts/test-glaeda-nightly-only-admit.py"),
               Path("scripts/test-glaeda-sync-main.py"),
               Path("scripts/test-glaeda-wallpaper-rotate.py"),
               Path("scripts/test-verify.py"),
@@ -280,6 +347,7 @@ jobs:
           PY
           test -x ./smolrunner
           sh -n scripts/hot-run
+          sh -n scripts/cmux-gh
           bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
           bash -n scripts/cmux-fleet
@@ -295,61 +363,153 @@ jobs:
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
-          bash scripts/test-bootstrap.sh
-          python3 scripts/test-benchmark-developer-loop.py
-          python3 scripts/test-benchmark-hot-state-fanout.py
-          python3 scripts/test-benchmark-pnpm-task-dependencies.py
-          python3 scripts/test-benchmark-linker-throughput.py
-          python3 scripts/test-hot-observe.py
-          python3 scripts/test-glaeda-disk.py
-          python3 scripts/test-glaeda-runner-hygiene.py
-          python3 scripts/test-glaeda-procs.py
-          python3 scripts/test-glaeda-local-guard.py
-          python3 scripts/test-glaeda-update.py
-          python3 scripts/test-glaeda-fleet-cas-prune.py
-          python3 scripts/test-glaeda-fleet-cas.py
-          python3 scripts/test-fleet-cas-bundle.py
-          bash scripts/test-glaeda-fleet-cas.sh
-          bash scripts/test-glaeda-fleet-cas-mount.sh
-          python3 scripts/test-glaeda-seed-prefetch.py
-          python3 scripts/test-glaeda-idle-warm.py
-          python3 scripts/test-glaeda-mini-health.py
-          python3 scripts/test-glaeda-seed-lan.py
-          python3 scripts/test-glaeda-lan-fetch.py
-          python3 scripts/test-glaeda-gh.py
-          python3 scripts/test-glaeda-wallpaper-rotate.py
-          python3 scripts/test-glaeda-sync-main.py
-          python3 scripts/test-hot-pressure-shadow.py
-          python3 scripts/test-hot-run.py
-          python3 scripts/test-verify-focused.py
-          python3 scripts/test-owned-linux-admission.py
-          python3 scripts/test-owned-linux-jit-task.py
-          python3 scripts/test-repository-agent-work.py
-          python3 scripts/test-external-execution-request.py
-          python3 scripts/test-trusted-agent-dispatch.py
-          python3 scripts/test-provider-neutral-request.py
-          python3 scripts/test-owner-local-dispatch.py
-          python3 scripts/test-cmux-fleet.py
-          python3 scripts/test-cmux-fleet-operator-summary.py
-          python3 scripts/test-cmux-fleet-bootstrap.py
-          python3 scripts/test-glaeda-mini-setup.py
-          python3 scripts/test-glaeda-mini-enroll.py
-          python3 scripts/test-glaeda-cmux-runner-fleet.py
-          python3 scripts/test-glaeda-mini-fleet.py
-          python3 scripts/test-glaeda-fleet-status.py
-          python3 scripts/test-glaeda-route.py
-          python3 scripts/test-cmux-execution-roles.py
-          python3 scripts/test-cmux-workload-request.py
-          python3 scripts/test-owned-fleet-benchmark.py
-          python3 scripts/test-verify.py
-          python3 scripts/test-verify-changed-rustfmt.py
-          python3 scripts/test-front-door.py
-          python3 scripts/test-quarry-sweep.py
-          python3 scripts/test-quarry-parallel.py
-          python3 scripts/test-status-page.py
-          python3 scripts/test-unittest-shard.py
+          # Every suite runs and reports on its own: one red suite no longer skips the rest (glaeda#1562's
+          # tests never ran while test-glaeda-disk was red). Each failure is an annotation and a summary row.
+          # Add a new test suite as `suite python3 scripts/test-x.py`: a bare line stops the step at its failure.
+          failed=()
+          timings=()
+          # A suite with no bound spends the job's whole remaining ceiling, and the suites behind it never run.
+          # In run 45089631085 scripts/test-glaeda-gh.py went quiet after 275 s and hung until the 15 min job
+          # ceiling killed the job 729 s later: no verdict about the code, and 48 of the 97 suites never ran,
+          # while every `glaeda-gh wait` watching it read "pending" for the whole 15 minutes. Each suite is now
+          # bounded and timed: a hang is killed, named as a timeout, and the suites behind it still run, so the
+          # step ends red with a verdict. The bound is about 3x the slowest healthy suite
+          # (test-glaeda-promotion-admit, 98 s of the step's 499 s).
+          suite_seconds=${GLAEDA_SUITE_TIMEOUT_SECONDS:-300}
+          # A python unittest suite is green only when its output ends with its own verdict: the last `Ran N tests`
+          # line (N > 0) followed by OK. Since glaeda#2376 a real os.execve in scripts/test-glaeda-gh.py replaced the
+          # test process with a stand-in that exits 0 at about test 298 of 2261: no verdict, and the step read green.
+          suite() {
+            echo "::group::$*"
+            local start=$SECONDS rc=0 out rcf
+            out=$(mktemp) rcf=$(mktemp)
+            { timeout --kill-after=10s "$suite_seconds" "$@" 2>&1 || echo "$?" > "$rcf"; } | tee "$out"
+            rc=$(cat "$rcf"); rc=${rc:-0}
+            local took=$((SECONDS - start))
+            echo "suite took ${took}s of its ${suite_seconds}s bound: $*"
+            echo "::endgroup::"
+            timings+=("$took $*")
+            local verdict="" i=1 j
+            if [ "${1:-}" = env ]; then  # (`suite env NAME=VALUE python3 X`)
+              i=2
+              while [[ "${!i:-}" == *=* ]]; do i=$((i + 1)); done
+            fi
+            j=$((i + 1))
+            if [ "$rc" -eq 0 ] && [ "${!i:-}" = python3 ] && [ -f "${!j:-}" ] \
+                && grep -qE '^[[:space:]]*(import .*\<unittest\>|from unittest[ .])' "${!j}"; then
+              verdict=$(awk '/^Ran [0-9]+ tests? in / { n = $2; seen = 1; ok = ""; next }
+                             seen && ok == "" && NF { ok = $1 }
+                             END { print (seen && n > 0 && ok == "OK") ? "ok" : "none" }' "$out")
+            fi
+            rm -f "$out" "$rcf"
+            if [ "$verdict" = none ]; then
+              echo "::error title=Suite ended without its unittest verdict::$* -- exit 0, but no final \`Ran N tests\` and OK"
+              failed+=("$* (exit 0 without a final \`Ran N tests\` and OK)")
+              return 0
+            fi
+            if [ "$rc" -eq 0 ]; then return 0; fi
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error title=Suite hit its ${suite_seconds}s bound::$* -- killed after ${took}s so the step still reports"
+              failed+=("$* (hit its ${suite_seconds}s bound)")
+            else
+              echo "::error title=Suite failed (exit $rc)::$*"
+              failed+=("$*")
+            fi
+          }
+          suite bash scripts/test-bootstrap.sh
+          suite python3 scripts/test-benchmark-developer-loop.py
+          suite python3 scripts/test-benchmark-hot-state-fanout.py
+          suite python3 scripts/test-benchmark-pnpm-task-dependencies.py
+          suite python3 scripts/test-benchmark-linker-throughput.py
+          suite python3 scripts/test-hot-observe.py
+          suite python3 scripts/test-glaeda-disk.py
+          suite python3 scripts/test-intent-glaeda.py
+          suite python3 scripts/test-glaeda-disk-registry.py
+          suite python3 scripts/test-glaeda-hook-pin.py
+          suite python3 scripts/test-glaeda-cmux-tour-floor-check.py
+          suite python3 scripts/test-glaeda-devbox.py
+          suite python3 scripts/test-glaeda-projects.py
+          suite python3 scripts/test-glaeda-worktree.py
+          suite python3 scripts/test-glaeda-worktree-reclaim-all.py
+          suite python3 scripts/test-glaeda-runner-hygiene.py
+          suite python3 scripts/test-glaeda-procs.py
+          suite python3 scripts/test-cmux-names.py
+          suite python3 scripts/test-glaeda-local-guard.py
+          suite python3 scripts/test-glaeda-update.py
+          suite python3 scripts/test-glaeda-fleet-cas-prune.py
+          suite python3 scripts/test-glaeda-fleet-cas.py
+          suite python3 scripts/test-fleet-cas-bundle.py
+          suite python3 scripts/test-release-build-cache.py
+          suite bash scripts/test-glaeda-fleet-cas.sh
+          suite python3 scripts/test-glaeda-headless-services.py
+          suite bash scripts/test-glaeda-fleet-cas-mount.sh
+          suite python3 scripts/test-glaeda-seed-prefetch.py
+          suite python3 scripts/test-glaeda-git-mirror.py
+          suite python3 scripts/test-glaeda-idle-warm.py
+          suite python3 scripts/test-glaeda-idle-repair.py
+          suite python3 scripts/test-glaeda-mini-health.py
+          suite python3 scripts/test-glaeda-daemon-heal.py
+          suite python3 scripts/test-glaeda-seed-lan.py
+          suite python3 scripts/test-glaeda-lan-fetch.py
+          suite python3 scripts/test-glaeda-gh-edge.py
+          suite python3 scripts/test-cmux-gh-alias.py
+          suite python3 scripts/test-glaeda-wallpaper-rotate.py
+          suite python3 scripts/test-glaeda-sync-main.py
+          suite python3 scripts/test-delivery-concurrency.py
+          suite python3 scripts/test-workflow-job-bounds.py
+          suite python3 scripts/test-ci-suite-bound.py
+          suite python3 scripts/test-hot-pressure-shadow.py
+          suite python3 scripts/test-hot-run.py
+          suite python3 scripts/test-verify-focused.py
+          suite python3 scripts/test-owned-linux-admission.py
+          suite python3 scripts/test-owned-linux-jit-task.py
+          suite python3 scripts/test-repository-agent-work.py
+          suite python3 scripts/test-external-execution-request.py
+          suite python3 scripts/test-trusted-agent-dispatch.py
+          suite python3 scripts/test-provider-neutral-request.py
+          suite python3 scripts/test-owner-local-dispatch.py
+          suite python3 scripts/test-cmux-fleet.py
+          suite python3 scripts/test-cmux-fleet-operator-summary.py
+          suite python3 scripts/test-cmux-fleet-bootstrap.py
+          suite python3 scripts/test-glaeda-mini-setup.py
+          suite python3 scripts/test-glaeda-linux-vm-base.py
+          suite python3 scripts/test-glaeda-linux-vm-serve.py
+          suite python3 scripts/test-glaeda-linux-vm-rollout.py
+          suite python3 scripts/test-glaeda-mini-enroll.py
+          suite python3 scripts/test-glaeda-cmux-runner-fleet.py
+          suite python3 scripts/test-glaeda-promotion-admit.py
+          suite python3 scripts/test-glaeda-capture-admit.py
+          suite python3 scripts/test-glaeda-nightly-only-admit.py
+          suite python3 scripts/test-glaeda-runner-hook-lag.py
+          suite python3 scripts/test-glaeda-mini-fleet.py
+          suite python3 scripts/test-glaeda-fleet-status.py
+          suite python3 scripts/test-glaeda-route.py
+          suite python3 scripts/test-glaeda-never-cancel.py
+          suite python3 scripts/test-glaeda-runner-labels.py
+          suite python3 scripts/test-cmux-execution-roles.py
+          suite python3 scripts/test-cmux-workload-request.py
+          suite python3 scripts/test-owned-fleet-benchmark.py
+          suite python3 scripts/test-verify.py
+          suite python3 scripts/test-verify-changed-rustfmt.py
+          suite python3 scripts/test-front-door.py
+          suite python3 scripts/test-quarry-sweep.py
+          suite python3 scripts/test-quarry-parallel.py
+          suite python3 scripts/test-status-page.py
+          suite python3 scripts/test-unittest-shard.py
+          suite env FLEET_RULE_BASE=HEAD^1 python3 scripts/test-fleet-rule-lints.py
           # a test that leaves files in the checkout fails, as it did before the split
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          dirty=$(git status --porcelain=v1 --untracked-files=all)
+          dirty=${dirty//%/%25}
+          if [ -n "$dirty" ]; then echo "::error title=A suite left files in the checkout::${dirty//$'\n'/%0A}"; failed+=("clean checkout"); fi
+          {
+            echo "### Script suites: ${#failed[@]} failed"
+            for f in "${failed[@]}"; do echo "- \`$f\`"; done
+            # Which suites own the step's wall clock, so the next read of a slow step needs no log archaeology.
+            echo "### Slowest suites of ${#timings[@]}, each bounded at ${suite_seconds}s"
+            printf '%s\n' "${timings[@]}" | sort -rn | head -10 |
+              while read -r took name; do echo "- ${took}s \`$name\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${#failed[@]}" -eq 0 ]
 
       - name: Validate Mac helper scripts
         run: |
@@ -389,6 +549,21 @@ jobs:
       - name: Validate repository verification wrappers
         run: bash -n examples/renderprove/run-renderprove-review.sh
 
+  # Python 3.9 compatibility is independent of the native script suite. In run 44640775409
+  # that suite passed, but left only 17 seconds for the updater before the shared timeout.
+  mini-python-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+
       # The PR minis run the LAN fetch broker under macOS's /usr/bin/python3, which is 3.9.
       - name: Set up the minis' Python
         id: mini-python
@@ -399,12 +574,22 @@ jobs:
       - name: Test the LAN fetch broker on the minis' Python
         run: '"${{ steps.mini-python.outputs.python-path }}" scripts/test-glaeda-lan-fetch.py'
 
+      # glaeda-update and glaeda-mini-health run from LaunchAgents under the same /usr/bin/python3.
+      - name: Test the updater and mini health on the minis' Python
+        env:
+          PY: ${{ steps.mini-python.outputs.python-path }}
+        run: |
+          "$PY" -c 'import ast, sys; [ast.parse(open(p).read(), p, feature_version=(3, 9)) for p in sys.argv[1:]]' \
+            scripts/glaeda-update scripts/glaeda-mini-health scripts/glaeda-mini-setup
+          "$PY" scripts/test-glaeda-mini-health.py
+          "$PY" scripts/test-glaeda-update.py
+
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -429,12 +614,49 @@ jobs:
           python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
+  # scripts/test-glaeda-gh.py runs whole again since glaeda#2691 (2263 tests, not the ~298 it stopped at): run whole,
+  # it hit the scripts job's 300 s suite bound while still passing (run 45410861432). Its shards run side by side.
+  # A shard must end with its own `Ran N tests` and OK, as `suite` asks in the scripts job: an exec that replaces
+  # the process exits 0 with no verdict.
+  glaeda-gh-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Run glaeda-gh tests (shard ${{ matrix.shard }} of 4)
+        run: |
+          out="$RUNNER_TEMP/glaeda-gh-shard.out"
+          set +e
+          timeout --kill-after=10s 600 python3 scripts/unittest-shard scripts/test-glaeda-gh.py ${{ matrix.shard }} 4 2>&1 | tee "$out"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then echo "::error title=glaeda-gh shard failed (exit $rc)::shard ${{ matrix.shard }}"; exit "$rc"; fi
+          verdict=$(awk '/^Ran [0-9]+ tests? in / { n = $2; seen = 1; ok = ""; next }
+                         seen && ok == "" && NF { ok = $1 }
+                         END { print (seen && n > 0 && ok == "OK") ? "ok" : "none" }' "$out")
+          if [ "$verdict" != ok ]; then
+            echo "::error title=Shard ended without its unittest verdict::exit 0, but no final \`Ran N tests\` and OK"
+            exit 1
+          fi
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
   # rust was one serial job of about 4.4 min (cache restore 69 s, check and two clippy runs 70 s, tests 100 s);
   # lint and test now run side by side.
   lint:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -481,22 +703,6 @@ jobs:
       - name: Check ARM64 Linux build
         run: cargo check --locked --target aarch64-unknown-linux-gnu
 
-      # Keep the operator CLI buildable on its supported Apple Silicon host.
-      - name: Install Apple Silicon target
-        run: rustup target add aarch64-apple-darwin
-
-      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
-      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
-      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
-      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
-      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
-      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
-      # closes that gap without needing a macOS runner.
-      - name: Lint Apple Silicon build
-        run: >-
-          cargo clippy --locked --all-targets --all-features
-          --target aarch64-apple-darwin -- -D warnings
-
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -511,10 +717,32 @@ jobs:
             target
           key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
 
+  lint-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-6vcpu-macos-15' || 'macos-15' }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint native macOS build
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   test:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -551,6 +779,11 @@ jobs:
           restore-keys: |
             verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
+      - name: No world-writable Cargo home
+        # Blacksmith's image ships ~/.cargo as mode 777. It is a `.cargo` directory above the checkout, so
+        # glaeda's Cargo config preflight rightly refuses that lineage (LineageUnsafe), and the local-install
+        # build tests would judge the runner image instead of the code.
+        run: chmod go-w "${CARGO_HOME:-$HOME/.cargo}"
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
@@ -570,7 +803,7 @@ jobs:
   cli:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
@@ -714,9 +947,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: macos-15
+          - runner: "${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-6vcpu-macos-15' || 'macos-15' }}"
             target: aarch64-apple-darwin
-          - runner: ubuntu-24.04
+          - runner: "${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -744,13 +977,33 @@ jobs:
           python3 scripts/fleet_cas_bundle.py verify "$archive" \
             --source "$GITHUB_SHA" --target "$TARGET" --sha256 "$sha256"
 
+  # No polling loops in scripts or workflows: waits go through one glaeda-gh wait. Same judge as the agents'
+  # block-gh-polling hook (tools/polling-guard, copied from manaflow-ai/cmuxterm-hq). Runs for every change,
+  # since any script or workflow can add a loop.
+  polling-guard:
+    needs: changes
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Scanner tests
+        run: python3 tools/polling-guard/test_polling_scan.py
+      - name: No polling loops in scripts or workflows
+        run: python3 tools/polling-guard/polling_scan.py --root .
+
   # One exact-head check that stands for the whole workflow. Keep this name stable so merge tooling can
   # require the aggregate without enumerating every conditional job above.
   ci-status:
     name: ci-status
-    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
-    needs: [changes, go, scripts, runner-tests, lint, test, cli, fleet-cas-build]
-    runs-on: ubuntu-24.04
+    # Skipped for a title or body edit with every other job: a run that verified nothing claims no green.
+    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda')
+            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
+    needs: [changes, go, scripts, mini-python-tests, runner-tests, glaeda-gh-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Require every Verify job

@@ -1739,14 +1739,19 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // PID and clock alone collided between two tests of one binary (glaeda#2244's CI): a counter keeps each
+    // fixture path distinct (router review of glaeda#2249, F1).
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn fixture() -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "glaeda-reflink-task-test-{}-{nonce}",
-            std::process::id()
+            "glaeda-reflink-task-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir(&root).expect("fixture root");
         root

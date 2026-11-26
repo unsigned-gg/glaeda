@@ -2,8 +2,9 @@
 """glaeda-seed-archive: keep the fleet's seed archive (cmux-lawrence) filled from the trusted seeder.
 
     glaeda-seed-archive                    plan: the seeds the seeder keeps that the archive lacks
-    glaeda-seed-archive --apply            fetch them newest first, then prune (the LaunchAgent, every 15 s)
-    glaeda-seed-archive install [--apply]  write and load that LaunchAgent (run on the archive host)
+    glaeda-seed-archive --apply            fetch them newest first, then prune (the LaunchDaemon, every 15 s)
+    glaeda-seed-archive install [--apply]  write and load that LaunchDaemon (run on the archive host)
+    glaeda-seed-archive uninstall [--apply]  boot out and remove the daemon and any old LaunchAgent
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
 keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
@@ -11,7 +12,14 @@ X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seed
 then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within about a minute of
 the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
 
-The LaunchAgent asks every INTERVAL (15 s) seconds. It used to ask every 5 minutes, and a PR mini's prefetch
+The job is a system LaunchDaemon (/Library/LaunchDaemons, UserName this user, `launchctl bootstrap system`), not a
+LaunchAgent: the archive host serves the fleet headless, and an agent stops when its login session ends (cmux-lawrence
+rebooted 2026-11-20 ~09:00Z and every agent of its user stopped with the session). `install --apply` needs root for the plist and launchctl: `sudo -n` (SUDO_PREFIX, overridable by
+GLAEDA_SEED_ARCHIVE_SUDO; none as root); without passwordless sudo it prints the root commands (run them with
+`fleet-sudo HOST ...`) and exits 1, never falling back to an agent. It migrates: the old gui/UID agent is booted out
+and its plist removed first. A daemon already loaded from hand under the same label is adopted, not duplicated.
+
+The job asks every INTERVAL (15 s) seconds. It used to ask every 5 minutes, and a PR mini's prefetch
 (also every 5 minutes) that came between the seeder keeping a seed and the archive's next run missed here and
 fell back to R2 at about 3 MB/s beside a job (755 to 1163 s instead of 63 to 184 s over the LAN): 14 of the
 68 misses on 2026-09-28 05:22-12:20Z were that wait. Asking costs one `seed-list-v1` round trip (a directory
@@ -37,8 +45,10 @@ Prune: oldest mtime first (glaeda-seed-serve touches a seed it serves) while the
 BUDGET bytes or HOST_VOLUME has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
 anything touched in the last GRACE seconds stay.
 
-Local Network Privacy: the LaunchAgent's program is /usr/bin/python3 and its children are /usr/bin/ssh and
-Homebrew zstd (which only reads a pipe), so the LAN connection is allowed (glaeda-seed-prefetch's notes).
+Local Network Privacy: the job's program is /bin/sh (an Apple platform binary that stays the job's
+process) running /usr/bin/python3, whose children are /usr/bin/ssh and Homebrew zstd (which only reads a
+pipe), so the LAN connection is allowed. On macOS 27 a /usr/bin/python3 program alone is refused: it runs
+Xcode's python3 (glaeda-mini-setup LAN_PARENT).
 Prints one JSON line, also appended to LOG.
 """
 
@@ -51,6 +61,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -80,6 +91,9 @@ LIST_TIMEOUT = 30
 FETCH_TIMEOUT = 420  # the seeder may wait 60 s for a slot, then streams within its 180 s limit
 STALE_INCOMING = 3600
 LABEL = "com.teamleaderleo.glaeda.seed-archive"
+DAEMON_DIR = Path(os.environ.get("GLAEDA_SEED_ARCHIVE_DAEMON_DIR", "/Library/LaunchDaemons"))
+SUDO_PREFIX = os.environ.get("GLAEDA_SEED_ARCHIVE_SUDO", "/usr/bin/sudo -n").split()
+LAUNCHCTL = "/bin/launchctl"
 INTERVAL = 15  # seconds between runs; launchd never starts one while the last still runs
 
 
@@ -89,6 +103,7 @@ def prefetch_module():
                                                   os.fspath(SCRIPT_DIR / "glaeda-seed-prefetch"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # dataclasses look their module up in sys.modules while it loads
     loader.exec_module(module)
     return module
 
@@ -96,18 +111,50 @@ def prefetch_module():
 pm = prefetch_module()
 
 
-def archived(archive: Path) -> dict[str, os.stat_result]:
-    """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst)."""
+def archived(archive: Path, unreadable: dict[str, str] | None = None) -> dict[str, os.stat_result]:
+    """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst).
+
+    A seed whose entry cannot be read (EIO from a bad disk image or volume) is left out and, when UNREADABLE is
+    given, recorded there as KEY -> error: one bad seed must not crash the run (the daemon did, 2026-11-21).
+    """
     found = {}
     try:
         entries = list(os.scandir(archive))
-    except OSError:
+    except OSError as error:
+        if unreadable is not None:
+            unreadable[""] = f"listing {archive}: {error}"
         return found
     for entry in entries:
         key = entry.name[:-len(SUFFIX)]
-        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key) and entry.is_file(follow_symlinks=False):
-            found[key] = entry.stat(follow_symlinks=False)
+        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key):
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    found[key] = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                if unreadable is not None:
+                    unreadable[key] = f"{type(error).__name__} errno {error.errno}: {error.strerror}"
     return found
+
+
+def quarantine(archive: Path, unreadable: dict[str, str], apply: bool) -> list[dict]:
+    """Move each unreadable seed aside to .corrupt-<name> (a dot-file the archive and the server never list), and
+    report it. A rename that fails too (the entry is as bad as its data) leaves it, reported, and the seed is not
+    fetched over it. Nothing else on the volume is written, and never a repair: a disk check is the host's job."""
+    report = []
+    for key, why in sorted(unreadable.items()):
+        if not key:
+            report.append({"error": why})
+            continue
+        name = key + SUFFIX
+        item = {"key": key, "error": why, "quarantined": False}
+        if apply:
+            try:
+                os.rename(archive / name, archive / f".corrupt-{name}")
+                item["quarantined"] = True
+            except OSError as error:
+                item["quarantine_error"] = f"errno {error.errno}: {error.strerror}"
+        report.append(item)
+    return report
 
 
 def ask(config: dict, request: str) -> subprocess.Popen:
@@ -117,27 +164,8 @@ def ask(config: dict, request: str) -> subprocess.Popen:
 
 
 def seeder_list(config: dict) -> tuple[list[tuple[str, int]], str]:
-    """The seeder's kept seeds (key, mtime), newest first, or [] and why."""
-    proc = ask(config, "seed-list-v1")
-    try:
-        out, err = proc.communicate(timeout=LIST_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        return [], "seed-list-v1 timed out"
-    head, _, body = out.partition(b"\n")
-    while head and not head.startswith(pm.SERVE_HEADER) and body:  # a noisy login shell printed first
-        head, _, body = body.partition(b"\n")
-    words = head[len(pm.SERVE_HEADER):].decode(errors="replace").split()
-    if not head.startswith(pm.SERVE_HEADER) or len(words) != 2 or words[0] != "list" or not words[1].isdigit():
-        detail = " ".join(words)[:120] or err.decode(errors="replace").strip()[-160:] or f"exit {proc.returncode}"
-        return [], f"seeder: {detail}"
-    kept = []
-    for line in body.decode(errors="replace").splitlines()[:int(words[1])]:
-        parts = line.split()
-        if len(parts) == 2 and pm.KEY_RE.fullmatch(parts[0]) and parts[1].isdigit():
-            kept.append((parts[0], int(parts[1])))
-    return kept, ""
+    """The seeder's kept seeds (key, mtime), newest first, or [] and why (glaeda-seed-prefetch's client)."""
+    return pm.seed_list(config, config["addresses"][0], LIST_TIMEOUT)
 
 
 def check(path: Path, key: str) -> str:
@@ -312,8 +340,15 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         kept, why = seeder_list(config)
         if why:
             return {**record, "state": "error", "reason": why}
-        have = archived(archive)
-        missing = list(dict.fromkeys(key for key, _ in kept if key not in have))
+        unreadable: dict[str, str] = {}
+        have = archived(archive, unreadable)
+        if unreadable:
+            record["unreadable"] = quarantine(archive, unreadable, apply)
+            for item in record["unreadable"]:
+                if item.get("quarantined"):
+                    unreadable.pop(item["key"])
+        # A seed still sitting unreadable is not fetched over (the rename would hit the same bad entry).
+        missing = list(dict.fromkeys(key for key, _ in kept if key not in have and key not in unreadable))
         record["seeder_kept"] = len(kept)
         record["missing"] = len(missing)
         fetched = []
@@ -344,6 +379,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
 def quiet(record: dict) -> bool:
     """A run that fetched, pruned and reported nothing: not logged, or the log would be one line every 15 s."""
     return (record.get("state") == "applied" and not record.get("missing") and not record.get("fetched")
+            and not record.get("unreadable")
             and not record.get("pruned") and not record.get("full"))
 
 
@@ -358,13 +394,25 @@ def append_log(record: dict) -> None:
         pass
 
 
+# Keep in step with glaeda-mini-setup LAN_PARENT (this script installs itself without setup).
+LAN_PARENT = ["/bin/sh", "-c",
+              '"$@" & p=$!; trap "kill -TERM $p 2>/dev/null" TERM HUP INT; s=0; wait $p || s=$?; '
+              'while kill -0 $p 2>/dev/null; do wait $p; s=$?; done; exit $s', "glaeda-lan"]
+
+
 def plist(program: Path) -> dict:
     return {
         "Label": LABEL,
-        # /usr/bin/python3 as the program: Local Network Privacy lets its /usr/bin/ssh reach the LAN.
-        "ProgramArguments": ["/usr/bin/python3", "-I", os.fspath(program), "--apply"],
+        # A system daemon runs as the user that owns the archive and its keys, with that user's HOME.
+        "UserName": pwd.getpwuid(os.getuid()).pw_name,
+        # /bin/sh as the job's process, /usr/bin/python3 under it: Local Network Privacy then lets its
+        # /usr/bin/ssh reach the LAN on macOS 27 too (glaeda-mini-setup LAN_PARENT, the same wrapper).
+        "ProgramArguments": [*LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(program), "--apply"],
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
+        # hdiutil attach leaves diskimages-helper serving the mount. launchd ends what a finished job left in its
+        # process group unless told not to, which would pull the image from under the volume every 15 s run.
+        "AbandonProcessGroup": True,
         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.fspath(HOME)},
         # Every run prints its record; LOG (bounded) keeps the ones that did something.
         "StandardOutPath": "/dev/null",
@@ -372,9 +420,72 @@ def plist(program: Path) -> dict:
     }
 
 
+def root(*argv: str) -> subprocess.CompletedProcess:
+    prefix = [] if os.geteuid() == 0 else SUDO_PREFIX
+    return subprocess.run([*prefix, *argv], capture_output=True, text=True)
+
+
+def have_root() -> bool:
+    return os.geteuid() == 0 or root("true").returncode == 0
+
+
+def retire_agent() -> bool:
+    """Boot out the old gui/UID LaunchAgent and remove its plist; True if there was one."""
+    old = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
+    loaded = subprocess.run([LAUNCHCTL, "print", f"gui/{os.getuid()}/{LABEL}"], capture_output=True).returncode == 0
+    subprocess.run([LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    existed = old.exists()
+    old.unlink(missing_ok=True)
+    return existed or loaded
+
+
+def daemon_loaded() -> bool:
+    return subprocess.run([LAUNCHCTL, "print", f"system/{LABEL}"], capture_output=True).returncode == 0
+
+
+def install_daemon(report: dict, want: bytes) -> None:
+    path = DAEMON_DIR / f"{LABEL}.plist"
+    current = path.read_bytes() if path.exists() else b""
+    if current == want and daemon_loaded():
+        report["retired_agent"] = retire_agent()
+        report["loaded"], report["daemon"] = True, "current"
+        return
+    if not have_root():
+        if daemon_loaded():
+            report["retired_agent"] = retire_agent()
+            report["loaded"], report["daemon"] = True, "adopted"
+            report["warning"] = "the loaded LaunchDaemon differs and there is no passwordless sudo to replace it"
+            return
+        staged = STATE.parent / f"{LABEL}.plist"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(want)
+        report["loaded"] = False
+        report["error"] = (f"no passwordless sudo; as root: install -m 644 {staged} {path} && chown root:wheel {path} "
+                           f"&& launchctl bootstrap system {path} (from a controller: fleet-sudo HOST ...)")
+        return
+    report["retired_agent"] = retire_agent()
+    staged = STATE.parent / f"{LABEL}.plist.{os.getpid()}"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(want)
+    try:
+        root(LAUNCHCTL, "bootout", f"system/{LABEL}")
+        for step in (("install", "-m", "0644", os.fspath(staged), os.fspath(path)),
+                     ("chown", "root:wheel", os.fspath(path))):
+            done = root(*step)
+            if done.returncode:
+                report["loaded"], report["error"] = False, done.stderr.strip()[-200:]
+                return
+        boot = root(LAUNCHCTL, "bootstrap", "system", os.fspath(path))
+        report["loaded"], report["daemon"] = boot.returncode == 0, "installed"
+        if boot.returncode:
+            report["error"] = boot.stderr.strip()[-200:]
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def install(apply: bool) -> dict:
     program = SCRIPT_DIR / "glaeda-seed-archive"
-    path = HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
+    path = DAEMON_DIR / f"{LABEL}.plist"
     want = plistlib.dumps(plist(program))
     current = path.read_bytes() if path.exists() else b""
     report = {"tool": "glaeda-seed-archive", "mode": "install", "apply": apply, "plist": os.fspath(path),
@@ -403,30 +514,48 @@ def install(apply: bool) -> dict:
             except OSError as error:
                 report["old_archive"] = f"left in place: {error}"
         report["moved"] = moved
-        if current != want:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(f".tmp-{os.getpid()}")
-            tmp.write_bytes(want)
-            os.replace(tmp, path)
-        domain = f"gui/{os.getuid()}"
-        subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
-        boot = subprocess.run(["/bin/launchctl", "bootstrap", domain, os.fspath(path)], capture_output=True, text=True)
-        report["loaded"] = boot.returncode == 0
-        if boot.returncode:
-            report["error"] = boot.stderr.strip()[-200:]
+        install_daemon(report, want)
+    return report
+
+
+def uninstall(apply: bool) -> dict:
+    """Remove both the daemon and any old agent; the archive and its image stay."""
+    path = DAEMON_DIR / f"{LABEL}.plist"
+    report = {"tool": "glaeda-seed-archive", "mode": "uninstall", "apply": apply, "plist": os.fspath(path),
+              "daemon": "present" if path.exists() else "absent",
+              "agent": "present" if (HOME / "Library/LaunchAgents" / f"{LABEL}.plist").exists() else "absent"}
+    if not apply:
+        return report
+    retire_agent()
+    report["agent"] = "removed"
+    if path.exists():
+        if not have_root():
+            report["error"] = f"ROOT STEP NEEDED: sudo launchctl bootout system/{LABEL}; sudo rm {path}"
+            return report
+        root(LAUNCHCTL, "bootout", f"system/{LABEL}")
+        root("rm", "-f", os.fspath(path))
+        report["daemon"] = "removed"
     return report
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", nargs="?", choices=("install",))
+    parser.add_argument("command", nargs="?", choices=("install", "uninstall"))
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "uninstall":
+        report = uninstall(args.apply)
+        print(json.dumps(report))
+        return 1 if report.get("error") else 0
     if args.command == "install":
         report = install(args.apply)
         print(json.dumps(report))
         return 1 if report.get("error") or (args.apply and not report.get("loaded")) else 0
-    record = run(args.apply)
+    try:
+        record = run(args.apply)
+    except OSError as error:  # EIO from the volume or image anywhere else in a run: reported, not a traceback
+        record = {"tool": "glaeda-seed-archive", "time": int(time.time()), "apply": args.apply, "state": "error",
+                  "reason": f"{type(error).__name__} errno {error.errno}: {error.strerror} ({error.filename})"}
     if args.apply and not quiet(record):
         append_log(record)
     print(json.dumps(record))

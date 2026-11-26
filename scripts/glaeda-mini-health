@@ -20,28 +20,187 @@ Each run checks, as the runner user and without sudo:
                                      (Stopped, stuck Starting). Healed after two runs in a row: `tailscale up` when
                                      Stopped, else a stop and start of the Tailscale VPN service (scutil --nc), as
                                      mini-ops tailscale-unstick.sh does by hand. A standalone tailscaled (root daemon)
-                                     or a logged-out node is reported only.
+                                     or a logged-out node is reported only. A capture-only mini (no glaeda runner) is
+                                     checked too and gets only the `tailscale up` when Stopped (cmux-mac-mini,
+                                     2026-11-17: Stopped after a power loss until a person ran it); a stuck Starting
+                                     and a tailscale_no_route there are reported only.
+  tailscale_no_route                BackendState is Running but the OS sends tailnet traffic elsewhere:
+                                     `route -n get 100.100.100.100` (Tailscale's own address) leaves by a
+                                     non-utun interface (en0 to the LAN gateway), so no tailnet host reaches
+                                     ssh here while `tailscale ping --tsmp` still answers (cmuxs-mac-mini-5,
+                                     2026-10-21: 100.64/10 gone from the routing table). Reported after two
+                                     runs in a row (one when run by hand). Healed under --apply by a restart of
+                                     Tailscale, never a config, auth or flag change, behind every one of these
+                                     gates (heal_tailscale_route): a CI runner mini (registered glaeda runners,
+                                     update.json setupArgs and mini-setup role fleet-mini, not --hygiene-only,
+                                     --gh-only or --headless) that the fleet registry opted in:
+                                     ~/.config/glaeda/tailscale-self-heal.json (schema glaeda-tailscale-self-heal/v1)
+                                     names one of its names (hostname, LocalHostName, ComputerName, update.json host,
+                                     tailnet name; an unreadable tailnet name refuses), and none of them holds
+                                     "lawrence"; the two-runs rule met; glaeda-disk's host_busy idle, then the
+                                     fleet host.lock held exclusively for the restart so no job is admitted, and
+                                     no Runner.Worker or build under it (a mini never idle for TAILSCALE_DRAIN_AFTER_S,
+                                     1 h, drains first: a glaeda-reservation/v1 marker owned by glaeda-mini-health in
+                                     FLEET_DIR/reservation.json admits no new job while running ones finish; capped at
+                                     TAILSCALE_DRAIN_MAX_S, 2 h, then it ends, alerts and does not drain again for 6 h;
+                                     never on a host the fleet reservation list holds, glaeda-disk host_reservation,
+                                     or that has anyone else's marker; the marker goes after the restart, when the route
+                                     is back, or when a gate refuses); no attempt in the last 6 h (the attempt
+                                     is written to tailscale-restart.json beside STATE before the restart runs;
+                                     an unreadable file refuses). The app (App Store or System Extension) gets
+                                     `scutil --nc stop/start` of its VPN service as this user; a standalone
+                                     tailscaled gets `sudo -n launchctl kickstart -k system/com.tailscale.tailscaled`
+                                     only where `sudo -n -l` lists an exact NOPASSWD rule for it (or NOPASSWD: ALL)
+                                     as the last match (glaeda-mini-fleet sudo-plan --sudoers), else it is reported
+                                     with that rule. One 30 s wait, one re-check of BackendState and the route.
+                                     auto_fix is pending only for a short wait (busy or host lock held right now,
+                                     the two-runs rule unmet); whenever no restart is coming it is impossible (an
+                                     alert): a failed restart (until fixed; retried after 6 h, after 3 failed in a
+                                     row not until the route is seen clear), the 6 h window, a kill switch, a gate
+                                     that cannot answer, a restart state that cannot be read or written. Off with TAILSCALE_RESTART_OFF
+                                     (~/.config/glaeda/tailscale-restart-off) or GLAEDA_TAILSCALE_RESTART=off.
+  tailscale_cli_missing              a host with runner LaunchAgents has no Tailscale CLI at all (neither the
+                                     standalone /usr/local/bin/tailscale nor the app bundle's): the tunnel is not
+                                     checked, which is no answer, not a healthy tunnel. Reported only.
+                                     A CLI that gave no BackendState while `route -n get` names a non-utun
+                                     interface is tailscale_no_route too (the route is its own look).
   tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
-                                     a loaded mini can time out with the tunnel up). The check could not look, so the
-                                     tunnel is not judged down: reported only, never healed.
+                                     a loaded mini can time out with the tunnel up), or `route -n get` named no
+                                     interface for the tailnet address. The check could not look, so the
+                                     tunnel is not judged down: reported only, never healed. It keeps
+                                     tailscale_no_route's count as it was (it did not look at the route).
+  sandboxd_wedged                    the root glaeda-daemon-heal's sandbox probe (an ad-hoc signed binary under
+                                     `(deny mach-lookup)`) hangs again on a mini it rebooted for that within the
+                                     last 7 days, so it does not reboot it again (its report's sandbox.needs_operator;
+                                     at most one such reboot a day and one a week). An error: ci-dash keeps it as an
+                                     HQ fleet-alert issue. A healed reboot shows under healed as sandboxd_wedged.
   runner_stopped:<agent>             a runner LaunchAgent is loaded but not running (KeepAlive leaves it after a clean
                                      exit). Healed after two runs in a row with `launchctl kickstart`; nothing runs
                                      in it, so no job is disturbed. The listener gate's holds keep the agent running,
                                      and a runner cmux_mini_fix.sh runner_hold stopped (HELD) is no finding.
   runner_unloaded:<agent>            a runner LaunchAgent plist is not loaded: reported only (an operator may have
                                      unloaded it; glaeda-cmux-runner-fleet --apply loads it).
+  runner_below_pin:<agent>           a runner runs an actions/runner older than glaeda-cmux-runner's
+                                     PINNED_RUNNER_VERSION (RUNNER_PIN): its bin symlink names bin.X (the runner's
+                                     self-update layout), else its install receipt's runnerVersion. A runner only
+                                     self-updates when its listener connects, so one the listener gate holds off for
+                                     days stays behind (GitHub deleted 33 such offline registrations on one day, all
+                                     on an older release). Reported only (a warning): it self-updates on its next
+                                     connect, or an operator moves it while it is idle.
+  unmanaged_service:<label>          a fleet-looking launchd service (a label config/fleet-services.json's match names:
+                                     ai.manaflow.*, com.cmux*, actions.runner.*, or any label naming a runner, worker or
+                                     builder) in ~/Library/LaunchAgents, /Library/LaunchAgents or /Library/LaunchDaemons
+                                     that glaeda does not install (com.teamleaderleo.glaeda.*) and that the file does not
+                                     declare with its installer: a hand-made service no reconciler keeps (Leo,
+                                     2026-10-27: "why the fuck not manage it with glaeda????????"). A service that
+                                     starts a GitHub runner is runner_unmanaged's. Reported only (a warning): it is never
+                                     unloaded, booted out or deleted. Also run on a host without glaeda runners.
+  checkout_slow                      the runners' checkout steps (actions/checkout: "Checkout ..." and "Run
+                                     actions/checkout@..." steps, never their "Post" cleanup) took a median over
+                                     CHECKOUT_SLOW_S (60 s) across at least CHECKOUT_MIN_SAMPLES of them in the
+                                     last CHECKOUT_WINDOW_S (3 days); the fleet's median is under 10 s. Read from
+                                     the timings the runners already log (each runner's _diag/Worker_*.log
+                                     StepsRunner lines, the newest CHECKOUT_MAX_LOGS of them, at most
+                                     CHECKOUT_PASS_BYTES read a pass, each parsed once and kept in
+                                     checkout-steps.json beside STATE). A mini whose console never answers
+                                     a macOS privacy (TCC) prompt stalls every git script for its timeout (about
+                                     100 s per `git submodule` call, 2026-10-27), as can a slow network or disk.
+                                     The finding says where the time went: when the median is slow, one
+                                     `git submodule status` (killed past CHECKOUT_PROBE_S, reused for an hour) in
+                                     the newest runner checkout over CHECKOUT_LOCAL_SLOW_S is local git work,
+                                     under it the step is waiting on the network.
+                                     Reported only (a warning); it never refuses or delays a job.
+  load_high                         the five-minute load average is over LOAD_HIGH_FACTOR times hw.ncpu. The
+                                     finding is emitted after LOAD_HIGH_SUSTAINED_S of consecutive high passes,
+                                     and includes the most frequent commands in a bounded ps sample. Reported only;
+                                     inspect admission and those commands before changing the host.
+  node_toolchain_missing              the runner hook named one exact Rust toolchain that is absent. Healed as the
+                                     runner user with `rustup toolchain install ... --profile minimal`, then the
+                                     next health pass revalidates the hook. Only the exact version/triple from the
+                                     refusal is accepted; receipt/enrollment failures remain operator-owned.
   node_ineligible                    the runner hook's node_refusal, for the fleet class its job-started hook requires
                                      (--require-eligible --fleet-class), names a reason, so job-started refuses every
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
+  toolchain_missing                  rustup, rustc or cargo cannot run on a fleet build node (the runner hook's
+                                     fleet_toolchain_missing, on the runners' WORKLOAD_PATH): it names each tool
+                                     and whether a link to it dangles, it is not installed, or it is in ~/.cargo/bin
+                                     but off the job PATH (2026-10-26: rustup deleted fleet-wide). job-started
+                                     refuses every job, the gate holds the listeners off at once and ci-step fits
+                                     advertises nothing. Names each missing path. Reported only.
+  toolchain_mismatch                 xcrun, in the env the runner gives its jobs (no SDKROOT or TOOLCHAINS,
+                                     DEVELOPER_DIR on the job-started hook's --toolchain-xcode), resolves an SDK
+                                     outside that Xcode, a swiftc of another Swift version than its toolchain's, an
+                                     SDK of a newer major than its own, a cmux tool `xcrun --find` cannot find, or a
+                                     python3 (PATH's, the /usr/bin/python3 shim) that does not start (the runner
+                                     hook's xcode_refusal): cmux21,
+                                     2026-10-21, Command Line Tools 27 on macOS 27 past Xcode_26.6. job-started refuses
+                                     every job and the gate holds the listener off. Root's: reported only.
+  git_mirror_stale                   glaeda-git-mirror's last good fetch of the runner mirror (FLEET_DIR/git/cmux.json
+                                     fetched_at) is over GIT_MIRROR_STALE_S (30 min) old, on a macOS host with a mirror
+                                     source configured. Its passes heal it (a repair fetches first); pending while a
+                                     pass runs, else impossible. Reported only.
+  disk_pass_stale                    glaeda-disk has not finished a pass in DISK_PASS_STALE_S (26 h): sizes.json's newest
+                                     per-item measurement or accounting.json's newest record is older, or either is
+                                     missing, on a macOS host with glaeda-disk's LaunchAgent or snapshots (its agent
+                                     runs every 15 min and rewrites both; the runner-cache profile writes no
+                                     accounting.json, so only sizes.json counts there). Names the agent's launchd
+                                     state and last exit.
+                                     The disk table and eviction read these snapshots. Reported only.
+  ota_not_converging                 glaeda-update's converge.json (its step 8) says this host does not run the release
+                                     its ring wants, by installed tool and runner hook digests, past the alertAfter
+                                     time it wrote: "running X, wants Y, because Z". glaeda-update keeps retrying with
+                                     backoff, so it is pending (warn), or an error when converge.json marks the reason
+                                     blocking (a quarantined or refused release, a hook --refresh-hooks will not
+                                     replace). The heal is glaeda-update's own; this only reports.
+  ota_stale                          no glaeda-update run has finished since converge.json's staleAfter: its agent is
+                                     not running, or every run dies. Reported only.
 
-A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
+  daemon_heal_stale                  the root LaunchDaemon from scripts/glaeda-daemon-heal is missing, or its own
+                                     report says it is not running its passes or has not kept itself on the stable
+                                     release (glaeda-daemon-heal judge). Healed where `sudo -n` works (headless AWS
+                                     hosts) by reinstalling it; elsewhere the root command is the note. Also run on a
+                                     host without glaeda runners.
+  daemon_hot:<name>                  a macOS daemon from config/macos-daemons.json has held hot_cores (fseventsd,
+                                     audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
+                                     daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
+                                     busy_hot_hours). Reported here so ci-dash sees the wait; the heal is root's.
+  disk_root_copy_stale:<uid>         a runner account's root-pinned glaeda-disk job (glaeda-runner-hygiene) is not the
+                                     bytes its release's --apply leaves, from glaeda-daemon-heal's root report
+                                     (runnerHygiene): that pass reinstalls it, so stale is pending and a failed check
+                                     or reinstall is an error the report's why names. The heal is root's.
+  claude_route                       Claude Code (~/.local/bin/claude, the capture jobs' agent) does not go through a
+                                     fleet route from config/claude-routes.json that answers: ~/.claude/settings.json
+                                     names no route (a personal login, which expires: cmux-mac-mini, 2026-10-21), a
+                                     route outside the list, or a personal token; or a real `claude -p` through it
+                                     failed (checked once per probe_every_s; a dead route hangs until killed).
+                                     Healed at once by routing to the first listed route that answers (the failed
+                                     one last), keeping a backup of settings.json. cmuxterm-hq build-fleet/capture-host
+                                     admits no capture lease on a host whose report has it. Also run on a host
+                                     without glaeda runners (a capture-only mini). While tailscale_down or
+                                     tailscale_no_route is seen, it is not probed (without a fresh cached answer it
+                                     reports "not probed: the Tailscale tunnel is down"), its probe is not kept and
+                                     it is not rerouted (a broken tunnel, not the route, is why it does not answer),
+                                     so it never acts in the same run as tailscale_no_route's restart.
+  claude_missing                     a fleet mini has no Claude Code (~/.local/bin/claude), so a capture there has no
+                                     real agent and claude_route is never checked (cmux8s, 9s, 10s, 12s, 13s, 14,
+                                     2026-10-28: only four minis could run a real-Claude capture). Healed as the
+                                     runner user the way Anthropic's install.sh does it: the channel config/claude-
+                                     routes.json names (claude_code.channel) resolves to a version, the binary is
+                                     downloaded from that version's manifest and kept only when its sha256 matches,
+                                     then `claude install VERSION` links ~/.local/bin/claude. No login is made: the
+                                     next pass's claude_route routes it through a fleet gateway. Never on a personal
+                                     Mac. cmuxterm-hq build-fleet/capture-host admits no capture lease on a host whose
+                                     report has it, as for claude_route.
+
+A heal (other than tailscale_no_route's, above) is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
 {id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
-kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
+kept under "healed" for a day (auto_fix "done"), as is each restart the runner gate made of a listener stuck
+acquiring a job (listener_acquire_stuck, from the gate's listener-restarts.jsonl). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
 build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
-finding's first sighting and the heal tries. It exits at once on a host with no glaeda runner. With KILL_SWITCH
+finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route, runner_unmanaged and unmanaged_service (and the daemon healer). With KILL_SWITCH
 present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
 """
 
@@ -50,16 +209,24 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import fcntl
+import heapq
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import plistlib
+import pwd
 import re
 import shlex
+import shutil
 import signal
+import stat
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -68,18 +235,86 @@ HOME = Path.home()
 STATE_DIR = HOME / ".local/state/glaeda/mini-health"
 REPORT = STATE_DIR / "health.json"
 STATE = STATE_DIR / "state.json"
+NO_RUNNER_HEAL = STATE_DIR / "daemon-heal-attempt.json"  # the last daemon-heal reinstall on a host with no runner
 KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
+# ROLE_DAEMON (glaeda-cmux-runner): a gateway or small runner is a system LaunchDaemon (system/<label>), which the
+# root step's sudoers drop-in lets this user kickstart
+DAEMONS = Path("/Library/LaunchDaemons")
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
-RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+)?")
+# an instance (.K) or a dedicated runner (.dedicated.NAME, glaeda-cmux-runner --dedicated;
+# never its .watch or .relay agent)
+GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."  # every agent glaeda installs (watch loops included)
+LISTENER_RE = re.compile(r"(/\S+?)/bin(?:\.[0-9.]+)?/Runner\.Listener(?:\s|$)")
+
+
+def starts_runner(word: str, cwd: str = "") -> bool:
+    """A plist program word that starts a GitHub runner: a Runner.Listener, or a run.sh, runsvc.sh or run-helper.sh
+    that sits in a directory holding a runner registration (.runner). A bare "run.sh" is found through the plist's
+    WorkingDirectory, which the caller passes as `cwd`; a working directory or an argument naming a runner
+    directory is not a runner by itself (a cleaner or a tool may run there)."""
+    if re.search(r"/Runner\.Listener$", word):
+        return True
+    with contextlib.suppress(OSError):
+        if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$", word):
+            script = Path(word) if os.path.isabs(word) else (Path(cwd) / word if cwd else None)
+            return script is not None and (script.parent / ".runner").is_file()
+    return False
+
+
+def job_starts_runner(words: list[str], cwd: str = "") -> bool:
+    """A launchd job whose program words start a GitHub runner (starts_runner; cwd only finds a bare run.sh)."""
+    return any(starts_runner(w, cwd) for w in words if w)
+
+
+RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
+RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
+RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
+RUNNER_VERSION_RE = r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
+RUNNER_RECEIPTS = ".local/state/glaeda/cmux-runner"  # glaeda-cmux-runner's install receipts, under HOME
+# checkout_slow: the runners' own step timings, from the worker logs actions/runner writes under _diag.
+CHECKOUT_SLOW_S = 60  # the fleet's checkout median is 8 s (2026-10-27); a mini at 10x that is not a slow day
+CHECKOUT_MIN_SAMPLES = 10
+CHECKOUT_WINDOW_S = 3 * 86400
+CHECKOUT_MAX_LOGS = 300  # the newest worker logs (one per job) across this mini's runners; many jobs run no checkout
+CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read (checkout
+# runs at a job's start, so a longer log's checkout steps are in this prefix; its cache entry says "truncated")
+CHECKOUT_PASS_BYTES = 64 << 20  # read per pass at most: logs past it wait for the next pass (2 minutes later)
+CHECKOUT_MAX_DIR_ENTRIES = 20000  # _diag entries looked at per pass, all runners (each keeps a few hundred)
+CHECKOUT_MAX_STEPS = 200  # checkout steps kept per log (a job has one to a few)
+CHECKOUT_CACHE = "checkout-steps.json"  # beside STATE: each parsed log's (size, mtime) and its checkout times
+CHECKOUT_CACHE_SCHEMA = "glaeda-mini-health-checkout-steps/v1"
+WORKER_LOG = re.compile(r"Worker_[0-9]{8}-[0-9]{6}-utc\.log")
+STEPS_LINE = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z INFO StepsRunner\] "
+                        r"(?:Processing step: DisplayName='(.*)'|(Step result:)|(Skipping step))")
+# Where a slow checkout's time goes: one bounded `git submodule status` in a runner's checkout, with the runners' git.
+# A healthy mini answers in well under a second; a mini whose Xcode git waits on unanswered privacy prompts takes
+# about 100 s. Over CHECKOUT_LOCAL_SLOW_S the time is local git work; under it, the step is waiting on the network.
+CHECKOUT_PROBE_S = 15  # the probe is killed (its whole process group) past this
+CHECKOUT_LOCAL_SLOW_S = 5
+CHECKOUT_PROBE_TTL_S = 3600  # a probe result is reused for an hour (kept in CHECKOUT_CACHE)
+CHECKOUT_PROBE_MAX_ENTRIES = 200  # _work entries looked at, all runners, to find a checkout
+CHECKOUT_PROBE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # the runners' WORKLOAD_PATH
+CHECKOUT_STEP = re.compile(r"(?:Checkout\b.*|Run actions/checkout@\S+)")
+# load_high: a sustained host overload is actionable, while one scheduler spike is not.  The
+# process sample is deliberately capped: this runs from a two-minute LaunchAgent on every mini.
+LOAD_HIGH_FACTOR = 2
+LOAD_HIGH_SUSTAINED_S = 5 * 60
+LOAD_PROCESS_SAMPLE_MAX = 512
+LOAD_PROCESS_TOP = 5
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# Tailscale's own address: on a healthy node the OS sends it into the tunnel (a utun interface).
+TAILNET_PROBE_IP = "100.100.100.100"
 TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
 # The app's binary is its CLI only when it sees a terminal or this; from a LaunchAgent it otherwise starts as the GUI
 # and prints "The Tailscale GUI failed to start" instead of the status.
 TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}
 TESTMANAGERD = "/usr/libexec/testmanagerd"
 SCHEMA = "glaeda-mini-health/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DAEMON_HEAL = SCRIPT_DIR / "glaeda-daemon-heal"  # beside this file in the repo, a release and ~/.local/bin
+SYSTEM_PYTHON = "/usr/bin/python3"  # what the root LaunchDaemon runs; never a user-writable interpreter
 
 HEAL_EVERY_S = 600
 HEAL_TRIES = 3
@@ -88,6 +323,9 @@ HEALED_MAX = 20
 WEDGE_AGE_S = 90  # a teardown finishes in the same millisecond; a signature this old with nothing after is a wedge
 LOG_WINDOW_MIN = 720  # how far back the testmanagerd log is read (never before the daemon started)
 TAILSCALE_WAIT_S = 60
+TOOLCHAIN_OFF_PATH = "is not on the job PATH"  # glaeda-cmux-runner-hook's: a tool installed but off the PATH
+RUST_TOOLCHAIN_RE = re.compile(r"rust toolchain ([0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9.-]*) is not installed")
+RUST_TOOLCHAIN_MAX_S = 900
 # The newest of these lines decides: the signature alone means a session teardown that never finished.
 WEDGE_SIGNATURE = "XCIDESession is responsible for cleaning up its socket"
 SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created session")
@@ -95,13 +333,85 @@ SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created se
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
+DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a day without a pass is a stall
+# glaeda-git-mirror's runner mirror: its LaunchAgent fetches every minute, and a job reads its commit from it, so
+# a mirror whose last good fetch is older than this is stalled (cmuxterm-hq docs/repo-mirrors.md: fresh within 30).
+GIT_MIRROR_STALE_S = 30 * 60
+GIT_MIRROR_SOURCE = ".config/glaeda/lan-cache/config.json"  # glaeda-git-mirror's SOURCE_CONFIG, under HOME
+GIT_MIRROR_SOURCES = ("direct", "lan")  # glaeda-git-mirror's SOURCES
+DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
+DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
+RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
+PROFILE_SNAPSHOT = "sizes.runner-caches.json"  # glaeda-disk's PROFILE_SNAPSHOT, in DISK_CACHE
+PROFILE_SUMMARY = "summary.runner-caches.json"  # glaeda-disk's PROFILE_HEALTH_SUMMARY, beside summary.json
+SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
+OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
+CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
+FLEET_SERVICES = "fleet-services.json"  # config/: the owned launchd services that are not glaeda's (unmanaged_service)
+CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
+CLAUDE_PROMPT = "Reply with exactly PONG"
+CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
+CLAUDE_INSTALL_S = 600  # one download (about 250 MB) and `claude install`
+CLAUDE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?")  # install.sh's shape, prereleases too
 
 
-def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
+def install_env(environ: dict[str, str]) -> dict[str, str]:
+    """The environment `claude install` runs with: no Anthropic or Claude Code credential or route at all (the
+    install needs none; ANTHROPIC_AUTH_TOKEN is a credential too, even where it is the gateway placeholder)."""
+    return {k: v for k, v in environ.items()
+            if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_")) and k not in CLAUDE_PERSONAL}
+
+# tailscale_no_route's self-heal (Leo, 2026-10-21): a restart of Tailscale, only on an idle CI runner mini, at most
+# once every TAILSCALE_RESTART_EVERY_S per mini, never on cmux-lawrence, the AWS Macs or a person's Mac.
+TAILSCALE_RESTART_EVERY_S = 6 * 3600
+TAILSCALE_RESTART_SETTLE_S = 30  # the one bounded wait between the restart and its re-check
+TAILSCALE_RESTART_STATE = "tailscale-restart.json"  # beside STATE: the last attempt, written before it runs
+TAILSCALE_RESTART_SCHEMA = "glaeda-mini-health-tailscale-restart/v1"
+# Failed restarts in a row (tailscale-restart.json's failures) after which it stops restarting until the route is
+# seen clear again: a restart that does not fix it is an operator's to look at, not a 6-hourly ritual.
+TAILSCALE_RESTART_GIVE_UP = 3
+# The kill switch, as glaeda-disk's disk-off: this file, or GLAEDA_TAILSCALE_RESTART=off|0|false|no in the agent's env.
+TAILSCALE_RESTART_OFF = HOME / ".config/glaeda/tailscale-restart-off"
+TAILSCALE_RESTART_ENV = "GLAEDA_TAILSCALE_RESTART"
+TAILSCALED_LABEL = "com.tailscale.tailscaled"  # the standalone tailscaled's LaunchDaemon (tailscaled install-system-daemon)
+# Which hosts may restart is declared in leo-workspace's machines/fleet-registry.json, not here: the registry side
+# writes this opt-in on each host it allows ({"schema": TAILSCALE_OPT_IN_SCHEMA, "host": "<registry name>",
+# "source": "fleet-registry.json"}), and a host whose opt-in is missing, unreadable or names another host refuses.
+TAILSCALE_OPT_IN = ".config/glaeda/tailscale-self-heal.json"  # under the runner user's home
+TAILSCALE_OPT_IN_SCHEMA = "glaeda-tailscale-self-heal/v1"
+# Belt and braces under the opt-in: cmux-lawrence (Lawrence's controller, the subrouter every session streams
+# through) is never restarted, whatever an opt-in says.
+NEVER_RESTART_WORD = "lawrence"
+# What the runner hook's FLEET_DIR is: its host.lock is the lock every job's admission takes (glaeda-cmux-runner-hook).
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+# The drain (cmuxs-mac-mini-5, 2026-10-26: 12 runners, never idle, so the idle-only restart never came and its
+# controller worker sat out of placement from 05:40Z on). Once tailscale_no_route has waited TAILSCALE_DRAIN_AFTER_S
+# for an idle mini, mini-health writes a glaeda-reservation/v1 marker (FLEET_DIR/reservation.json, the file the runner
+# hook reads): job-started refuses new jobs fast and the listener gate stops idle listeners, so GitHub hands the work to
+# other runners, as under any reservation. Running jobs finish; once none is left, the restart runs under the host lock
+# as before, and the marker goes. 1 h: a mini with any gap between jobs restarts long before (most cmux jobs are
+# minutes), so only a mini that is never idle drains, and an hour off the tailnet (no controller heartbeat, no ssh) is
+# already more than draining costs (one mini's slots for one job's length).
+TAILSCALE_DRAIN_AFTER_S = 3600
+# The cap on the drain's wait for running jobs: 2 h covers 284 of the 303 timeout-minutes in cmux's workflows (the
+# longer ones are Linux jobs and notarization polls). Past it the marker goes, the finding alerts (impossible) with
+# the job still running, and no drain starts again for TAILSCALE_RESTART_EVERY_S.
+TAILSCALE_DRAIN_MAX_S = 2 * 3600
+TAILSCALE_DRAIN_LAPSE_S = 600  # the marker's own until is this past the cap: a mini-health that stops leaves no hold
+TAILSCALE_DRAIN_OWNER = "glaeda-mini-health"
+TAILSCALE_DRAIN_STATE = "tailscale-drain.json"  # beside STATE: the last drain that hit the cap
+RESERVATION_SCHEMA = "glaeda-reservation/v1"
+# glaeda-disk's host_reservation is asked with this as its host-local file, so it answers for the fleet's reservation
+# list only (the host-local marker is read here, where our own drain marker is told from anyone else's).
+NO_LOCAL_RESERVATION = Path("/nonexistent/glaeda-mini-health/reservation.json")
+
+
+def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None,
+       cwd: str | None = None) -> tuple[int, str]:
     """(exit code, stdout); 127 when it could not run or timed out."""
     try:
         p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, check=False, env=env)
+                           timeout=timeout, check=False, env=env, cwd=cwd)
     except (OSError, subprocess.SubprocessError):
         return 127, ""
     return p.returncode, p.stdout
@@ -128,6 +438,11 @@ def leaked_test_app_pids(table: dict[int, tuple[int, int, str, str]]) -> list[tu
     return result
 
 
+class NoAnswer(str):
+    """A gate's reason that is no answer (it could not read or run something), not a short wait: no restart is
+    coming until someone fixes it, so tailscale_no_route reports it impossible."""
+
+
 def finding(fid: str, severity: str, evidence: str, auto_fix: str, note: str = "") -> dict[str, Any]:
     return {"id": fid, "code": fid.split(":")[0], "severity": severity, "evidence": evidence[:300],
             "auto_fix": auto_fix, "note": note[:300]}
@@ -138,11 +453,37 @@ class Mini:
 
     def __init__(self, home: Path = HOME) -> None:
         self.home = home
+        self.daemons_dir = Path("/Library/LaunchDaemons")
+        self.global_agents_dir = Path("/Library/LaunchAgents")
         self.uid = os.getuid()
         self._hook: Any = None
+        self.tailnet_route_ok = False  # check_tailscale saw the tailnet route on the tunnel this run
+        self.route_on_tunnel = False  # route -n get named a utun this run, whatever the CLI said (ends a drain)
 
     def runner_dirs(self) -> list[Path]:
         return sorted(p for p in self.home.glob("actions-runner-glaeda*") if (p / "glaeda-hooks").is_dir())
+
+    def runner_version(self, d: Path) -> str | None:
+        """The actions/runner version d runs, read as glaeda-cmux-runner's installed_versions does: only for an
+        installed runner (d/config.sh and an owned receipt for d), its bin symlink's bin.X (the self-updater's
+        layout) over the receipt's runnerVersion. None when d is no such runner or neither says."""
+        if not (d / "config.sh").is_file():
+            return None
+        base = self.home / RUNNER_RECEIPTS
+        recorded = None
+        for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
+            doc = load_json(path)
+            if doc.get("runnerDirOwned") and doc.get("runnerDir") == os.fspath(d):
+                recorded = str(doc.get("runnerVersion") or "")
+                break
+        if recorded is None:
+            return None
+        live = None
+        with contextlib.suppress(OSError):
+            hit = re.fullmatch(rf"(?:.*/)?bin\.({RUNNER_VERSION_RE})/?", os.readlink(d / "bin"))
+            live = hit.group(1) if hit else None
+        version = live or recorded
+        return version if re.fullmatch(RUNNER_VERSION_RE, version) else None
 
     def hook(self) -> Any:
         """The runner hook module the jobs run (console state, testmanagerd recycler), or None."""
@@ -153,13 +494,118 @@ class Mini:
             try:
                 loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook_for_health", os.fspath(path))
                 module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+                sys.modules[loader.name] = module  # before exec_module: a dataclass in the module looks its module up here
                 loader.exec_module(module)
                 self._hook = module
             except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)
                 self._hook = False
         return self._hook or None
 
+    def worker_logs(self) -> list[tuple[str, Path, int, float]]:
+        """(key, path, size, mtime) of the runners' newest CHECKOUT_MAX_LOGS worker logs that are regular files;
+        key is "<runner dir>/<file>". At most CHECKOUT_MAX_DIR_ENTRIES _diag entries are looked at in all."""
+        newest: list[tuple[float, str, str, int]] = []  # a min-heap of (mtime, key, path, size)
+        seen = 0
+        for d in self.runner_dirs():
+            with contextlib.suppress(OSError), os.scandir(d / "_diag") as it:
+                for e in it:
+                    seen += 1
+                    if seen > CHECKOUT_MAX_DIR_ENTRIES:
+                        break
+                    if not WORKER_LOG.fullmatch(e.name):
+                        continue
+                    with contextlib.suppress(OSError):
+                        st = e.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        item = (st.st_mtime, f"{d.name}/{e.name}", e.path, st.st_size)
+                        if len(newest) < CHECKOUT_MAX_LOGS:
+                            heapq.heappush(newest, item)
+                        elif item > newest[0]:
+                            heapq.heapreplace(newest, item)
+            if seen > CHECKOUT_MAX_DIR_ENTRIES:
+                break
+        return [(key, Path(path), size, mtime) for mtime, key, path, size in newest]
+
+    def checkout_probe(self) -> float | None:
+        """Seconds one `git submodule status` takes in the newest runner checkout (_work/<repo>/<repo>) with the git
+        the runners' PATH resolves; CHECKOUT_PROBE_S when it had to be killed; None when there is no checkout or git.
+        Read-only: GIT_OPTIONAL_LOCKS=0, no prompts, stdio closed, its own process group killed on timeout."""
+        newest: tuple[float, str] | None = None
+        seen = 0
+
+        def entries(path: Path) -> list[os.DirEntry]:
+            """At most what is left of CHECKOUT_PROBE_MAX_ENTRIES of path's entries, never following a symlink."""
+            nonlocal seen
+            out: list[os.DirEntry] = []
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                return out
+            with contextlib.suppress(OSError), os.scandir(path) as it:
+                for e in it:
+                    if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                        break
+                    seen += 1
+                    with contextlib.suppress(OSError):
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("_"):
+                            out.append(e)
+            return out
+
+        for d in self.runner_dirs():
+            for group in entries(d / "_work"):
+                for repo in entries(Path(group.path)):
+                    with contextlib.suppress(OSError):
+                        st = os.stat(os.path.join(repo.path, ".git"), follow_symlinks=False)
+                        if stat.S_ISDIR(st.st_mode) and (newest is None or st.st_mtime > newest[0]):
+                            newest = (st.st_mtime, repo.path)
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                break
+        git = shutil.which("git", path=CHECKOUT_PROBE_PATH)
+        if newest is None or git is None:
+            return None
+        env = {"PATH": CHECKOUT_PROBE_PATH, "HOME": os.fspath(self.home), "GIT_OPTIONAL_LOCKS": "0",
+               "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+        start = time.monotonic()
+        try:
+            # core.fsmonitor=false: a configured monitor hook would run otherwise, even with optional locks off.
+            p = subprocess.Popen([git, "-c", "core.fsmonitor=false", "-C", newest[1], "submodule", "status"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        except OSError:
+            return None
+        try:
+            code = p.wait(timeout=CHECKOUT_PROBE_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.SubprocessError):
+                p.wait(timeout=5)
+            return float(CHECKOUT_PROBE_S)
+        # A git that failed (a checkout removed under it, a broken config) timed nothing: where stays unknown.
+        return time.monotonic() - start if code == 0 else None
+
+    def read_log(self, path: Path, limit: int) -> str | None:
+        """The first `limit` bytes of a regular file (never a symlink, FIFO or device), or None."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                return fh.read(limit).decode("utf-8", "replace")
+        except OSError:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     # ---- reads
+
+    def ota_converge(self) -> dict[str, Any]:
+        """glaeda-update's converge.json, or {} before an updater that writes one."""
+        doc = load_json(self.home / OTA_CONVERGE)
+        return doc if doc.get("schema") == "glaeda-ota-converge/v1" else {}
 
     def console(self) -> tuple[str, str | None] | None:
         hook = self.hook()
@@ -183,6 +629,36 @@ class Mini:
             if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
                 rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
         return rows
+
+    def load_facts(self) -> dict[str, Any] | None:
+        """Return the 1/5/15-minute load and a bounded process-command sample.
+
+        `ps` is a cheap point-in-time listing; unlike `top -l` it does not run a
+        multi-sample scan that can outlive the health process.  Only the first
+        bounded set of commands is retained for the diagnostic counts.
+        """
+        code, text = sh(["/usr/sbin/sysctl", "-n", "hw.ncpu"], timeout=5)
+        try:
+            cores = int(text.strip()) if code == 0 else 0
+        except ValueError:
+            cores = 0
+        code, text = sh(["/usr/sbin/sysctl", "-n", "vm.loadavg"], timeout=5)
+        match = re.search(r"\{\s*([^\s}]+)\s+([^\s}]+)\s+([^\s}]+)", text) if code == 0 else None
+        try:
+            load5 = float(match.group(2)) if match else float("nan")
+        except (TypeError, ValueError):
+            load5 = float("nan")
+        if cores <= 0 or not math.isfinite(load5):
+            return None
+        _code, commands = sh(["/bin/ps", "-Aww", "-o", "command="], timeout=10)
+        counts: dict[str, int] = {}
+        for line in commands.splitlines()[:LOAD_PROCESS_SAMPLE_MAX]:
+            word = line.strip().split(None, 1)[0] if line.strip() else ""
+            command = os.path.basename(word) if word else "<unknown>"
+            counts[command] = counts.get(command, 0) + 1
+        top = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:LOAD_PROCESS_TOP]
+        return {"cores": cores, "load5": load5,
+                "processes": [{"command": command, "count": count} for command, count in top]}
 
     def process_tree(self) -> list[tuple[int, int, str]]:
         """(pid, ppid, command) for ownership checks that need ancestry."""
@@ -245,18 +721,117 @@ class Mini:
         said = " ".join((p.stderr + " " + p.stdout).split())[:160] or "no output"
         return flavor, None, f"{cli} status --json exited {p.returncode} without a BackendState: {said}"
 
+    def tailnet_route(self) -> str | None:
+        """The interface the OS sends Tailscale's own address (100.100.100.100) out of, or None if it cannot tell."""
+        code, out = sh(["/sbin/route", "-n", "get", TAILNET_PROBE_IP], timeout=10)
+        m = re.search(r"^\s*interface:\s*(\S+)", out, re.M) if code == 0 else None
+        return m.group(1) if m else None
+
     def vpn_service(self) -> str | None:
         m = re.search(r"([0-9A-F-]{36}).*io\.tailscale\.", sh(["/usr/sbin/scutil", "--nc", "list"])[1])
         return m.group(1) if m else None
 
-    def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
-        """(label, loaded, running, last exit) for each runner LaunchAgent plist."""
+    def runner_registrations(self) -> list[dict[str, Any]]:
+        """The listener gate's registration_deleted records (glaeda-cmux-runner-hook registration_file), one per
+        runner GitHub no longer knows, for the runners this tool watches (runner_dirs(), as runner_agents()). A
+        record whose runner was uninstalled (its directory or .runner gone) is stale: nothing will clear it."""
         out = []
-        for plist in sorted(AGENTS.glob("com.teamleaderleo.glaeda.cmux-runner*.plist")):
+        dirs = {d.name: d for d in self.runner_dirs()}
+        for path in sorted((self.home / ".local/state/glaeda/cmux-runner").glob("registration-*.json")):
+            doc = load_json(path)
+            name = path.name[len("registration-"):-len(".json")]
+            if doc.get("cause") == "registration_deleted" and name in dirs and (dirs[name] / ".runner").is_file():
+                out.append({**doc, "dir": name})
+        return out
+
+    def launchd_jobs(self, strict: bool = False) -> list[tuple[Path, str, list[str], str]]:
+        """(plist, label, program words, working directory) for every *.plist in the user's LaunchAgents, /Library's
+        LaunchAgents and its LaunchDaemons that reads as a launchd job. The label is launchd's own name for the job
+        (its Label), not the file's: a renamed file changes neither way. Read only; a file that is not a plist, or
+        not a dict, says nothing (a .plist.disabled or .retired-* copy is no job). With strict, only a dict launchd
+        would load counts: a non-empty string Label and a program (Program, or a non-empty ProgramArguments whose
+        first word is a non-empty string); an empty {} or a label-only stub under a fleet-looking name is no job."""
+        out = []
+        for folder in (self.home / "Library/LaunchAgents", self.global_agents_dir, self.daemons_dir):
+            try:
+                plists = sorted(folder.glob("*.plist")) if folder.is_dir() else []
+            except OSError:
+                continue
+            for plist in plists:
+                try:
+                    doc = plistlib.loads(plist.read_bytes())
+                except Exception:  # unreadable or not a plist: nothing to say about it
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                args = doc.get("ProgramArguments")
+                if strict and not (isinstance(doc.get("Label"), str) and doc["Label"].strip()
+                                   and ((isinstance(doc.get("Program"), str) and doc["Program"].strip())
+                                        or (isinstance(args, list) and args and isinstance(args[0], str)
+                                            and args[0].strip()))):
+                    continue
+                label = str(doc.get("Label") or plist.name[:-len(".plist")])
+                words = [str(w) for w in (args if isinstance(args, list) else [])] + [str(doc.get("Program") or "")]
+                out.append((plist, label, [w for w in words if w], str(doc.get("WorkingDirectory") or "")))
+        return out
+
+    def fleet_services(self) -> dict[str, Any]:
+        """config/fleet-services.json: the repo's or release's beside this script, else the copy mini-setup installs;
+        {} when neither is there or readable (an install that predates it: nothing is judged)."""
+        for path in (SCRIPT_DIR.parent / "config" / FLEET_SERVICES, self.home / ".local/share/glaeda" / FLEET_SERVICES):
+            if path.is_file():
+                return load_json(path)
+        return {}
+
+    def foreign_runners(self) -> list[tuple[str, str]]:
+        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent (the user's or /Library's) or
+        LaunchDaemon plist that is not
+        glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
+        or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+        out = []
+        for plist, label, words, cwd in self.launchd_jobs():
+            if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
+                continue
+            if job_starts_runner(words, cwd):
+                out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
+        own = os.path.realpath(self.home) + "/actions-runner-glaeda"
+        for _pid, _uid, _stat, command in self.processes():
+            m = LISTENER_RE.search(command)
+            if m and not (os.path.realpath(m.group(1)) + "-").startswith(own + "-") \
+                    and os.path.realpath(m.group(1)) != own:
+                out.append((m.group(1), f"Runner.Listener runs from {m.group(1)}, not a glaeda runner directory"))
+        return sorted(set(out))
+
+    def runner_daemons(self) -> set[str]:
+        """The runner labels installed as system LaunchDaemons (ROLE_DAEMON) whose UserName is this user."""
+        out = set()
+        for plist in sorted(DAEMONS.glob("com.teamleaderleo.glaeda.cmux-runner*.plist")):
             label = plist.name[:-len(".plist")]
+            try:
+                doc = plistlib.loads(plist.read_bytes())
+            except Exception:  # noqa: BLE001 - unreadable: not this user's runner to report
+                continue
+            if RUNNER_AGENT.fullmatch(label) and isinstance(doc, dict) and doc.get("UserName") == self.user():
+                out.add(label)
+        return out
+
+    def user(self) -> str:
+        return pwd.getpwuid(self.uid).pw_name
+
+    def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
+        """(label, loaded, running, last exit) for each runner LaunchAgent plist, and each runner LaunchDaemon of this
+        user's (system/<label>, which an unprivileged print reads too). A label with both is the daemon: the agent
+        plist is the one an apply removes once the runner is idle."""
+        out = []
+        daemons = self.runner_daemons()
+        plists = [(p.name[:-len(".plist")], False) for p in sorted(AGENTS.glob("com.teamleaderleo.glaeda.cmux-runner*.plist"))
+                  if p.name[:-len(".plist")] not in daemons] + [(label, True) for label in sorted(daemons)]
+        for label, daemon in plists:
             if not RUNNER_AGENT.fullmatch(label):
                 continue
-            code, text = sh(["/bin/launchctl", "print", f"gui/{self.uid}/{label}"])
+            code, text = sh(["/bin/launchctl", "print", f"system/{label}" if daemon else f"gui/{self.uid}/{label}"])
+            if code == 127:
+                continue  # launchctl did not answer in time (a loaded mini) or could not run: unknown, not unloaded
             state = re.search(r"^\s*state = (\S+)", text, re.M)
             last = re.search(r"^\s*last exit code = (.+)$", text, re.M)
             out.append((label, code == 0, bool(state and state.group(1) == "running"),
@@ -279,10 +854,16 @@ class Mini:
         sh(["/usr/sbin/scutil", "--nc", "start", service])
 
     def kickstart(self, label: str) -> None:
-        sh(["/bin/launchctl", "kickstart", f"gui/{self.uid}/{label}"])
+        if label in self.runner_daemons():  # the root step's sudoers rule allows exactly this, without a password
+            sh(["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", f"system/{label}"])
+        else:
+            sh(["/bin/launchctl", "kickstart", f"gui/{self.uid}/{label}"])
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
+
+    def clock(self) -> float:
+        return time.monotonic()
 
     def leaked_test_apps(self) -> list[tuple[int, str]]:
         hook = self.hook()
@@ -326,20 +907,608 @@ class Mini:
             argv = shlex.split(next(line for line in text.splitlines() if line.startswith("exec ")))
         except (IndexError, StopIteration, OSError, ValueError):
             return None
+
         if "--require-eligible" not in argv or "--fleet-class" not in argv[:-1]:
             return None
         hook = self.hook()
+        fleet_class = argv[argv.index("--fleet-class") + 1]
+        answer = getattr(hook, "node_answer", None) if hook is not None else None
         refusal = getattr(hook, "node_refusal", None) if hook is not None else None
-        if refusal is None:
-            return None
         try:
-            return refusal(argv[argv.index("--fleet-class") + 1])[0]
+            if answer is not None:
+                why, _want, timed_out = answer(fleet_class)
+                # A probe that ran out of time on a loaded mini is no answer: never node_ineligible, whose remedy
+                # restages the generation and re-adopts a receipt that is fine.
+                return None if timed_out else why
+            return refusal(fleet_class)[0] if refusal is not None else None
         except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
             return None
+
+    def toolchain_mismatch(self) -> str | None:
+        """Why xcrun on this host, in the env the runner gives its jobs, does not build with the runner's pool Xcode
+        (the runner hook's xcode_refusal for its job-started hook's --toolchain-xcode), or None when it does, the
+        runner names no pool Xcode, or the hook cannot answer."""
+        dirs = self.runner_dirs()
+        try:
+            text = (dirs[0] / "glaeda-hooks" / "job-started.sh").read_text(encoding="utf-8")
+            argv = shlex.split(next(line for line in text.splitlines() if line.startswith("exec ")))
+        except (IndexError, StopIteration, OSError, ValueError):
+            return None
+        if "--toolchain-xcode" not in argv[:-1]:
+            return None
+        xcode = argv[argv.index("--toolchain-xcode") + 1]
+        hook = self.hook()
+        refusal = getattr(hook, "xcode_refusal", None) if hook is not None else None
+        clean = getattr(hook, "listener_env", None) if hook is not None else None
+        if refusal is None or clean is None:
+            return None
+        try:
+            return refusal(xcode, clean(os.environ, xcode))
+        except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
+            return None
+
+    def toolchain_missing(self) -> str | None:
+        """Why the runner hook's toolchain_missing says this fleet node cannot run rustup, rustc or cargo (each
+        missing path), or None when they run, no runner here requires eligibility, or the hook cannot answer."""
+        hook = self.hook()
+        missing = getattr(hook, "fleet_toolchain_missing", None) if hook is not None else None
+        if missing is None:
+            return None
+        try:
+            return missing(self.home)  # on the runners' WORKLOAD_PATH, never this agent's own launchd PATH
+        except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
+            return None
+
+    def install_rust_toolchain(self, toolchain: str) -> tuple[bool, str]:
+        """Install one exact rustup toolchain named by the runner hook refusal."""
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9.-]*", toolchain):
+            return False, "refused unsafe Rust toolchain name"
+        code, _ = sh(["rustup", "toolchain", "install", toolchain, "--profile", "minimal"],
+                     timeout=RUST_TOOLCHAIN_MAX_S)
+        if code != 0:
+            return False, f"rustup toolchain install {toolchain} failed (exit {code})"
+        listed_code, listed = sh(["rustup", "toolchain", "list"], timeout=30)
+        if listed_code != 0 or not any(line.split()[0] == toolchain for line in listed.splitlines() if line.split()):
+            return False, f"rustup installed {toolchain} but it is not listed afterward"
+        return True, f"installed Rust toolchain {toolchain}"
+
+    def daemon_policy(self) -> Path | None:
+        """config/macos-daemons.json: the repo's or release's beside this script, else the copy mini-setup installs."""
+        env = os.environ.get("GLAEDA_DAEMON_POLICY")
+        for path in ([Path(env)] if env else []) + [SCRIPT_DIR.parent / "config/macos-daemons.json",
+                                                     self.home / ".local/share/glaeda/macos-daemons.json"]:
+            if path.is_file():
+                return path
+        return None
+
+    def fleet_host(self) -> bool:
+        """A fleet mini, not a personal Mac (mini-setup --hygiene-only). glaeda-update's own default: no setupArgs
+        (or no update.json) means --hygiene-only."""
+        return "--hygiene-only" not in load_json(self.home / ".config/glaeda/update.json").get(
+            "setupArgs", ["--hygiene-only"])
+
+    def claude_bin(self) -> Path | None:
+        """The runner user's Claude Code (the capture jobs' agent), or None where it is not installed."""
+        path = self.home / ".local/bin/claude"
+        return path if os.access(path, os.X_OK) else None
+
+    def install_claude(self, source: dict[str, Any]) -> tuple[bool, str]:
+        """Claude Code for the runner user, as install.sh does it: SOURCE's channel (config/claude-routes.json
+        claude_code) names a version, its manifest the platform binary's sha256; a binary that does not match is
+        deleted unrun. `claude install VERSION` then links ~/.local/bin/claude, with no credential in its
+        environment (install_env). Logs in nobody. Every request stays on https (a redirect elsewhere is refused),
+        and the download is removed on every path; one that cannot be removed fails the heal."""
+        import hashlib  # noqa: PLC0415
+        import urllib.error  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+        base, channel = str(source.get("downloads") or ""), str(source.get("channel") or "")
+        if not base.startswith("https://") or not re.fullmatch(r"stable|latest", channel):
+            return False, "config/claude-routes.json claude_code needs an https downloads URL and channel stable or latest"
+        machine = os.uname().machine
+        platform = {"arm64": "darwin-arm64", "x86_64": "darwin-x64"}.get(machine) if sys.platform == "darwin" else None
+        if platform is None:
+            return False, f"no Claude Code build for {sys.platform}/{machine} here"
+
+        class HttpsOnly(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                if not str(newurl).startswith("https://"):
+                    raise urllib.error.URLError(f"refused a redirect off https to {str(newurl)[:80]}")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        opener = urllib.request.build_opener(HttpsOnly)
+
+        def fetch(url: str) -> bytes:
+            with opener.open(url, timeout=60) as r:
+                return r.read()
+        folder = self.home / ".local/share/glaeda/claude-install"
+        made: list[Path] = []  # the download, once it exists
+
+        def attempt() -> tuple[bool, str] | tuple[int, str, str]:
+            version = fetch(f"{base}/{channel}").decode().strip()
+            if not CLAUDE_VERSION.fullmatch(version):
+                return False, f"the {channel} channel named no version"
+            manifest = json.loads(fetch(f"{base}/{version}/manifest.json"))
+            platforms = manifest.get("platforms") if isinstance(manifest, dict) else None
+            entry = platforms.get(platform) if isinstance(platforms, dict) else None
+            want = entry.get("checksum") if isinstance(entry, dict) else None
+            if not isinstance(want, str) or not re.fullmatch(r"[0-9a-f]{64}", want):
+                return False, f"the {version} manifest has no {platform} checksum"
+            folder.mkdir(parents=True, exist_ok=True)
+            binary = folder / f"claude-{version}-{platform}"
+            made.append(binary)
+            digest = hashlib.sha256()
+            with opener.open(f"{base}/{version}/{platform}/claude", timeout=CLAUDE_INSTALL_S) as r, \
+                    open(binary, "wb") as out:
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+            if digest.hexdigest() != want:
+                return False, f"Claude Code {version} for {platform} did not match its manifest's sha256; not run"
+            binary.chmod(0o755)
+            code, out_text = sh([os.fspath(binary), "install", version], timeout=CLAUDE_INSTALL_S,
+                                env=install_env(dict(os.environ)),
+                                cwd=tempfile.gettempdir())
+            return code, out_text, version
+        try:
+            result = attempt()
+        except Exception as e:  # noqa: BLE001  any transport, disk or shape failure is a failed heal, never a crash
+            result = (False, f"Claude Code download failed: {type(e).__name__}: {e}"[:200])
+        for path in made:
+            with contextlib.suppress(FileNotFoundError):
+                try:
+                    path.unlink()
+                except OSError as e:  # a download left behind (a mismatched one above all) is never healed
+                    return False, f"could not remove the download {path.name}: {e}"[:200]
+        if len(result) == 2:
+            return result  # type: ignore[return-value]
+        code, out_text, version = result  # type: ignore[misc]
+        if code != 0:
+            return False, f"`claude install {version}` exit {code}: {' '.join(out_text.split())[-160:]}"
+        if self.claude_bin() is None:
+            return False, f"`claude install {version}` left no ~/.local/bin/claude"
+        return True, f"installed Claude Code {version} ({platform}, sha256 checked) at ~/.local/bin/claude"
+
+    def claude_routes(self) -> dict[str, Any]:
+        """config/claude-routes.json: the repo's or release's beside this script, else the copy mini-setup installs."""
+        for path in (SCRIPT_DIR.parent / "config" / CLAUDE_ROUTES, self.home / ".local/share/glaeda" / CLAUDE_ROUTES):
+            if path.is_file():
+                return load_json(path)
+        return {}
+
+    def claude_settings(self) -> dict[str, Any]:
+        return load_json(self.home / ".claude/settings.json")
+
+    def claude_probe(self, url: str, token: str) -> tuple[bool, str]:
+        """One `claude -p` through URL (--settings outranks ~/.claude/settings.json), without a personal token."""
+        claude = self.claude_bin()
+        if claude is None:
+            return False, "no ~/.local/bin/claude"
+        settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token}})
+        env = {k: v for k, v in os.environ.items() if k not in CLAUDE_PERSONAL}
+        code, out = sh([os.fspath(claude), "-p", "--settings", settings, CLAUDE_PROMPT],
+                       timeout=CLAUDE_PROBE_S, env=env, cwd=tempfile.gettempdir())
+        if code == 0 and "PONG" in out:
+            return True, "PONG"
+        if code == 127:
+            return False, f"no answer in {CLAUDE_PROBE_S} s"
+        return False, f"exit {code}: {' '.join(out.split())[-160:]}"
+
+    def set_claude_route(self, url: str, token: str) -> str:
+        """Point ~/.claude/settings.json at URL, keeping every other setting and a backup of the file."""
+        path = self.home / ".claude/settings.json"
+        doc = load_json(path)
+        backup = None
+        if path.exists():
+            backup = path.with_name(f"settings.json.bak-mini-health-{int(time.time())}")
+            shutil.copy2(path, backup)
+            os.chmod(backup, 0o600)
+        env = doc.get("env") if isinstance(doc.get("env"), dict) else {}
+        env = {k: v for k, v in env.items() if k not in CLAUDE_PERSONAL}
+        env.update(ANTHROPIC_BASE_URL=url, ANTHROPIC_AUTH_TOKEN=token)
+        doc["env"] = env
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(doc, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return f"~/.claude/settings.json routes Claude to {url}" + (f" (was kept in {backup.name})" if backup else "")
+
+    def claude_probe_last(self) -> dict[str, Any]:
+        return load_json(self.home / ".local/state/glaeda/mini-health/claude-probe.json")
+
+    def save_claude_probe(self, doc: dict[str, Any]) -> None:
+        write_json(self.home / ".local/state/glaeda/mini-health/claude-probe.json", doc)
+
+    def daemon_heal_status(self) -> dict[str, Any] | None:
+        """glaeda-daemon-heal --status: is the root LaunchDaemon this release's copy; None off macOS or without it."""
+        policy = self.daemon_policy()
+        if sys.platform != "darwin" or policy is None or not DAEMON_HEAL.is_file():
+            return None
+        if not self.fleet_host():  # a personal Mac's daemons are its owner's
+            return None
+        code, out = sh([sys.executable, "-I", os.fspath(DAEMON_HEAL), "--status", "--policy", os.fspath(policy)])
+        try:
+            doc = json.loads(out) if code == 0 else None
+        except ValueError:
+            doc = None
+        return doc if isinstance(doc, dict) else None
+
+    def sudo_ok(self) -> bool:
+        return sh(["/usr/bin/sudo", "-n", "/usr/bin/true"])[0] == 0
+
+    def install_daemon_heal(self) -> tuple[bool, str]:
+        policy = self.daemon_policy()
+        if policy is None:
+            return False, "no config/macos-daemons.json"
+        code, out = sh(["/usr/bin/sudo", "-n", SYSTEM_PYTHON, "-I", os.fspath(DAEMON_HEAL), "--install",
+                        "--policy", os.fspath(policy), "--apply"], timeout=60)
+        try:
+            state = json.loads(out).get("state")
+        except (ValueError, AttributeError):
+            state = None
+        ok = code == 0 and state in {"applied", "unchanged"}
+        return ok, f"sudo -n glaeda-daemon-heal --install --apply: {state or f'exit {code}'}"
 
     def disk_summary(self) -> dict[str, Any]:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
+
+    def disk_pass(self) -> dict[str, Any] | None:
+        """glaeda-disk's own snapshots and the launchd state of the job that runs its pass, or None on a host with
+        neither. The pass runs from this user's LaunchAgent (glaeda-mini-setup), or the same label as a system
+        LaunchDaemon run as this user on a headless host, or glaeda-runner-hygiene's per-account LaunchDaemon."""
+        if sys.platform != "darwin":  # Linux hosts run glaeda-disk from a systemd timer with its own cadence
+            return None
+        cache = self.home / DISK_CACHE
+        installed = [(plist, target) for plist, target in
+                     [(self.home / "Library/LaunchAgents" / f"{DISK_AGENT}.plist", f"gui/{self.uid}/{DISK_AGENT}")]
+                     if plist.exists()]
+        # a fake HOME (tests, an overridden $HOME) never reads the system's daemons, and a system daemon is this
+        # account's pass only when its UserName is this account: a headless host's disk-pressure, or
+        # glaeda-runner-hygiene's runner-cache profile (com.teamleaderleo.glaeda.runner-hygiene.<uid>)
+        if self.home == account_home():
+            for label in (DISK_AGENT, f"{RUNNER_HYGIENE}.{self.uid}"):
+                daemon = SYSTEM_DAEMONS / f"{label}.plist"
+                if daemon_user(daemon) == account_name():
+                    installed.append((daemon, f"system/{label}"))
+        # the runner-cache profile alone (no disk-pressure job for this account) keeps its own snapshot, or sizes.json
+        # from a pinned copy older than that split, and writes no accounting.json by design
+        primary = any(not target.startswith(f"system/{RUNNER_HYGIENE}.") for _, target in installed)
+        summaries = [self.disk_summary(), load_json(self.home / ".local/state/glaeda/disk" / PROFILE_SUMMARY)]
+        profile = not primary and (bool(installed) or any(
+            isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
+            for summary in summaries for x in summary.get("accounting") or []))
+        sizes_path = cache / "sizes.json"
+        if profile:
+            sizes_path = max((cache / PROFILE_SNAPSHOT, sizes_path), key=lambda p: mtime(p) or 0.0)
+        snapshots = [sizes_path, cache / "accounting.json"]
+        if not installed and not any(p.exists() for p in [*snapshots, cache / PROFILE_SNAPSHOT]):
+            return None
+        agent, last_exit = "not installed", None
+        for plist, target in installed:
+            code, text = sh(["/bin/launchctl", "print", target])
+            agent = f"{target} " + ("loaded" if code == 0 else "not loaded")
+            last = re.search(r"^\s*last exit code = (.+)$", text, re.M)
+            last_exit = last.group(1).strip() if code == 0 and last else None
+            if code == 0:
+                break
+        written = {name: t for name, t in (("sizes.json", mtime(snapshots[0])), ("accounting.json", mtime(snapshots[1])))
+                   if t is not None}
+        return {"sizes": load_json(snapshots[0]), "sizes_name": snapshots[0].name,
+                "accounting": None if profile else load_json(snapshots[1]),
+                "written": written, "agent": agent, "last_exit": last_exit}
+
+    def git_mirror(self) -> dict[str, Any] | None:
+        """glaeda-git-mirror's record (FLEET_DIR/git/cmux.json) and whether a pass is running now, or None where no
+        mirror is kept: not macOS, or no mirror source configured (glaeda-git-mirror does nothing there)."""
+        config = load_json(self.home / GIT_MIRROR_SOURCE)
+        if sys.platform != "darwin" or config.get("schema") != 1 or config.get("source") not in GIT_MIRROR_SOURCES:
+            return None  # glaeda-git-mirror's source(): it does nothing without one of these
+        git_dir = FLEET_DIR / "git"
+        running = False
+        try:
+            pid = int(json.loads((git_dir / ".pass.json").read_text())["pid"])
+            os.kill(pid, 0)
+            running = True
+        except PermissionError:
+            running = True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return {"record": load_json(git_dir / "cmux.json"), "running": running}
+
+    # ---- tailscale_no_route's restart: its gates' reads and the restart itself
+
+    def tailscale_restart_off(self) -> str:
+        return restart_switch_off(os.environ, os.path.lexists(TAILSCALE_RESTART_OFF))
+
+    def tailnet_names(self) -> list[str] | None:
+        """This node's tailnet HostName and DNS name (tailscale status --json's Self), or None when the CLI cannot say:
+        it failed, timed out, printed no JSON or no Self name."""
+        standalone = os.path.exists(TAILSCALE_STANDALONE) and "Tailscale.app" not in os.path.realpath(TAILSCALE_STANDALONE)
+        cli = TAILSCALE_STANDALONE if standalone else TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else None
+        if cli is None:
+            return None
+        code, out = sh([cli, "status", "--json"], env={**os.environ, **TAILSCALE_CLI_ENV})
+        try:
+            me = json.loads(out).get("Self") if code == 0 else None
+        except (ValueError, AttributeError):
+            me = None
+        if not isinstance(me, dict):
+            return None
+        names = [me.get("HostName"), me.get("DNSName").split(".")[0] if isinstance(me.get("DNSName"), str) else None]
+        names = [name for name in names if isinstance(name, str) and name.strip()]
+        return names or None
+
+    def host_names(self) -> list[str] | None:
+        """Every name this host goes by: hostname, LocalHostName, ComputerName, update.json's host and its tailnet
+        name; None when the tailnet name cannot be read (the restart refuses: fail closed)."""
+        tailnet = self.tailnet_names()
+        if tailnet is None:
+            return None
+        names = [socket.gethostname()]
+        for key in ("LocalHostName", "ComputerName"):
+            names.append(sh(["/usr/sbin/scutil", "--get", key], timeout=5)[1].strip())
+        host = load_json(self.home / ".config/glaeda/update.json").get("host")
+        names.append(host if isinstance(host, str) else "")
+        return [name for name in names + tailnet if name]
+
+    def tailscale_opt_in(self) -> tuple[dict[str, Any] | None, str]:
+        """(the registry's opt-in for this host's Tailscale restart, "") or (None, why there is none)."""
+        path = self.home / TAILSCALE_OPT_IN
+        try:
+            doc = json.loads(path.read_text())
+        except FileNotFoundError:
+            return None, f"no ~/{TAILSCALE_OPT_IN} (the fleet registry has not opted this host in)"
+        except (OSError, ValueError) as error:
+            return None, f"~/{TAILSCALE_OPT_IN} is unreadable ({type(error).__name__})"
+        if not isinstance(doc, dict):
+            return None, f"~/{TAILSCALE_OPT_IN} is unreadable (not a JSON object)"
+        return doc, ""
+
+    def ci_mini_facts(self) -> dict[str, Any]:
+        """What makes this a CI runner mini, as glaeda set it up: registered glaeda runners (a .runner beside the
+        hooks), update.json's setupArgs (None when missing or unreadable: no answer) and mini-setup's role."""
+        try:
+            runners: int | None = sum(1 for d in self.runner_dirs() if (d / ".runner").is_file())
+        except OSError:
+            runners = None
+        setup_args: list[str] | None = None
+        try:
+            doc = json.loads((self.home / ".config/glaeda/update.json").read_text())
+            args = doc.get("setupArgs", ["--hygiene-only"]) if isinstance(doc, dict) else None  # glaeda-update's default
+            if isinstance(args, list) and all(isinstance(a, str) for a in args):
+                setup_args = args
+        except (OSError, ValueError):
+            pass
+        receipt = load_json(self.home / ".local/state/glaeda/mini-setup/receipt.json")
+        role = receipt.get("role")
+        if "role" in receipt and not isinstance(role, str):
+            role = None  # a role that is no string is unreadable: no role, not a fallback
+        elif role not in {"fleet-mini", "devbox"}:  # mini-setup's reading of old receipts
+            role = "fleet-mini" if receipt.get("profile") == "build-host" else None
+        return {"platform": sys.platform, "runners": runners, "setup_args": setup_args, "role": role}
+
+    def disk_path(self) -> Path:
+        return Path(os.environ.get("GLAEDA_DISK") or SCRIPT_DIR / "glaeda-disk")
+
+    def disk_module(self) -> Any:
+        """glaeda-disk, for its host gate (host_busy) and job patterns: the idle check glaeda-idle-repair uses."""
+        if getattr(self, "_disk", None) is None:
+            sys.dont_write_bytecode = True
+            loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_health", os.fspath(self.disk_path()))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+            sys.modules[loader.name] = module  # its dataclasses look their module up there while it loads
+            try:
+                loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(loader.name, None)
+                raise
+            self._disk = module
+        return self._disk
+
+    def host_busy(self) -> str:
+        """glaeda-disk's host_busy (a CI job or build, a dev-build worker job, a reservation, the host lock held), or
+        why it could not answer: anything it cannot read is busy."""
+        try:
+            disk = self.disk_module()
+            busy = disk.host_busy(FLEET_DIR)
+            unreadable = disk.host_busy_unreadable(busy) if isinstance(busy, str) and busy else False
+        except Exception as error:  # noqa: BLE001  (no answer is not idle)
+            return NoAnswer(f"glaeda-disk's host gate could not answer ({type(error).__name__})")
+        if not isinstance(busy, str):
+            return NoAnswer("glaeda-disk's host gate gave no answer")
+        return NoAnswer(busy) if unreadable else busy
+
+    def jobs_running(self) -> str:
+        """After the host lock is held: a CI job or build that started before it was, by glaeda-disk's patterns."""
+        try:
+            disk = self.disk_module()
+            patterns = (disk.CI_WORKER, disk.BUILD_PROCESS)
+        except Exception as error:  # noqa: BLE001
+            return NoAnswer(f"glaeda-disk's job patterns could not be read ({type(error).__name__})")
+        rows = self.processes()
+        if not rows:
+            return NoAnswer("cannot list processes")
+        for _pid, _uid, _stat, command in rows:
+            if any(p.search(command) for p in patterns):
+                return f"a CI job or build is running ({command[:120]})"
+        return self.listener_taking()
+
+    def listener_taking(self) -> str:
+        """A runner whose listener has acknowledged a job and not finished it (the runner hook's listener_request):
+        between the acknowledge and its Runner.Worker the job is this runner's, and no Worker shows it yet. Read
+        with the hook the runner runs; no hook, or a diag it cannot read, is no answer."""
+        dirs = self.runner_dirs()
+        if not dirs:
+            return ""
+        hook = self.hook()
+        taking = getattr(hook, "listener_request", None) if hook is not None else None
+        if taking is None:
+            return NoAnswer("the runner hook's listener_request could not be loaded")
+        for d in dirs:
+            try:
+                request = taking(d)
+            except (OSError, ValueError) as error:
+                return NoAnswer(f"cannot read {d.name}'s listener log ({type(error).__name__})")
+            if request:
+                return f"{d.name}'s listener took job {str(request)[:60]} and its Worker has not finished it"
+        return ""
+
+    @contextlib.contextmanager
+    def hold_host_lock(self):
+        """Hold the fleet host lock exclusively, as with-host-lock and a fleet build do, so no job is admitted (the
+        runner hook refuses or waits, and idle listeners stop) while Tailscale restarts. Yields "" when held, else why
+        not; never waits."""
+        if not FLEET_DIR.is_dir() or FLEET_DIR.is_symlink():
+            yield NoAnswer(f"no fleet dir {FLEET_DIR}: nothing would hold jobs off during the restart")
+            return
+        try:
+            fd = os.open(FLEET_DIR / "host.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+        except OSError as error:
+            yield NoAnswer(f"cannot open the fleet host lock ({type(error).__name__})")
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield "a job or a fleet build holds the fleet host lock"
+                return
+            yield ""
+        finally:
+            os.close(fd)  # closing the only fd drops the flock
+
+    def sudo_allows(self, argv: list[str]) -> bool:
+        """Whether sudoers lets this user run exactly argv (after `sudo -n`) as root without a password; runs nothing.
+        `sudo -n -l <cmd>` exits 0 for a rule that still asks for a password, so the rules listing is read instead."""
+        code, out = sh(["/usr/bin/sudo", "-n", "-l"], timeout=10)
+        return code == 0 and sudo_nopasswd(out, " ".join(argv[2:]))
+
+    def run_restart(self, commands: list[list[str]]) -> tuple[bool, str]:
+        said = []
+        for i, argv in enumerate(commands):
+            if i:
+                self.sleep(3)
+            code = sh(argv, timeout=30)[0]
+            said.append(f"{' '.join(argv)}: exit {code}")
+        return all(s.endswith(": exit 0") for s in said), "; ".join(said)
+
+    # ---- the drain before tailscale_no_route's restart
+
+    def reservation_path(self) -> Path:
+        return FLEET_DIR / "reservation.json"
+
+    def host_reservation(self) -> tuple[str, dict[str, Any] | None]:
+        """The host-local reservation marker: ("none", None), ("ours", marker) for a drain's, ("other", marker or
+        None) for anyone else's or one that cannot be read (never ours to remove). An "ours" marker carries the
+        exact bytes read under "raw", which end_drain compares before it removes anything."""
+        try:
+            raw = self.reservation_path().read_bytes()
+            doc = json.loads(raw)
+        except FileNotFoundError:
+            return "none", None
+        except (OSError, ValueError):
+            return "other", None
+        if not isinstance(doc, dict):
+            return "other", None
+        ours = (doc.get("schema") == RESERVATION_SCHEMA and doc.get("owner") == TAILSCALE_DRAIN_OWNER
+                and isinstance(doc.get("since"), int) and not isinstance(doc.get("since"), bool)
+                and isinstance(doc.get("until"), int) and not isinstance(doc.get("until"), bool))
+        return ("ours", {**doc, "raw": raw}) if ours else ("other", doc)
+
+    def fleet_reservation(self) -> str:
+        """Why the fleet's reservation list holds this host (glaeda-disk's host_reservation, glaeda#1626: cmux16-24 are
+        Lawrence's until 2026-10-28), "" when it does not. No answer is reserved: no drain on a guess."""
+        try:
+            why = self.disk_module().host_reservation(local=NO_LOCAL_RESERVATION)
+        except Exception as error:  # noqa: BLE001
+            return NoAnswer(f"glaeda-disk cannot say whether the fleet reserved this host ({type(error).__name__})")
+        return why if isinstance(why, str) else NoAnswer("glaeda-disk's host_reservation gave no answer")
+
+    @contextlib.contextmanager
+    def reservation_lock(self):
+        """glaeda-mini-fleet's writer lock, FLEET_DIR/.reservation.lock (flock, exclusive): a reserve or release
+        there and a drain here never interleave their check and their write. Yields "" when held, else why not
+        (it waits at most 20 s, as mini-fleet does)."""
+        path = FLEET_DIR / ".reservation.lock"
+        if not FLEET_DIR.is_dir() or FLEET_DIR.is_symlink() or path.is_symlink():
+            yield f"no usable fleet dir or reservation lock at {FLEET_DIR}"
+            return
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o664)
+        except OSError as error:
+            yield f"cannot open {path} ({type(error).__name__})"
+            return
+        try:
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        yield "another reserve or release is still running on this host"
+                        return
+                    time.sleep(0.2)
+            yield ""
+        finally:
+            os.close(fd)
+
+    def start_drain(self, now: float, purpose: str) -> str:
+        """Write a drain's reservation marker, never over another one: "" when written, else why not."""
+        marker = {"schema": RESERVATION_SCHEMA, "owner": TAILSCALE_DRAIN_OWNER, "purpose": purpose[:300],
+                  "since": int(now), "until": int(now + TAILSCALE_DRAIN_MAX_S + TAILSCALE_DRAIN_LAPSE_S)}
+        path = self.reservation_path()
+        with self.reservation_lock() as locked:
+            if locked:
+                return locked
+            tmp = path.with_name(f".reservation.json.health-{os.getpid()}")
+            try:
+                tmp.write_text(json.dumps(marker) + "\n")
+                os.chmod(tmp, 0o664)
+                os.link(tmp, path)  # fails if any marker is there: a reservation is never overwritten
+            except FileExistsError:
+                return "another reservation appeared"
+            except OSError as error:
+                return f"cannot write {path} ({type(error).__name__})"
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+        return ""
+
+    def end_drain(self, seen: dict[str, Any] | None) -> bool:
+        """Remove the drain marker seen (host_reservation's "ours" marker), under the writer lock and only while
+        the file still holds exactly those bytes: a marker anyone wrote since is never removed. True when removed."""
+        if not seen or "raw" not in seen:
+            return False
+        path = self.reservation_path()
+        with self.reservation_lock() as locked:
+            if locked:
+                return False
+            try:
+                if path.is_symlink() or path.read_bytes() != seen["raw"]:
+                    return False
+                path.unlink()
+                return True
+            except OSError:
+                return False
+
+    def drain_busy(self) -> str:
+        """While draining: what still runs (host_busy without the reservation, which is our own marker). The host
+        lock is checked when the restart takes it."""
+        busy = self.jobs_running()
+        if busy:
+            return busy
+        jobs = FLEET_DIR / "jobs"
+        try:
+            with os.scandir(jobs) as it:
+                if any(not e.name.startswith(".") for e in it):
+                    return f"a dev-build worker job is in {jobs}"
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return NoAnswer(f"cannot read {jobs}")
+        return ""
 
 
 # ---------------------------------------------------------------- checks
@@ -370,12 +1539,183 @@ def check_power(mini: Mini) -> list[dict[str, Any]]:
     return out
 
 
+def check_load_high(mini: Mini) -> list[dict[str, Any]]:
+    """Report a five-minute load that exceeds twice the host's CPU count.
+
+    The caller keeps this finding across passes and only publishes it after
+    LOAD_HIGH_SUSTAINED_S, so a single build burst does not page an operator.
+    """
+    facts = mini.load_facts()
+    if not isinstance(facts, dict):
+        return []
+    cores, load5 = facts.get("cores"), facts.get("load5")
+    if not finite(cores) or not isinstance(cores, int) or cores <= 0 or not finite(load5):
+        return []
+    threshold = LOAD_HIGH_FACTOR * cores
+    if load5 <= threshold:
+        return []
+    top = facts.get("processes")
+    labels = []
+    if isinstance(top, list):
+        for item in top[:LOAD_PROCESS_TOP]:
+            if isinstance(item, dict) and isinstance(item.get("command"), str) and finite(item.get("count")):
+                labels.append(f"{item['command']} ({int(item['count'])})")
+    processes = ", ".join(labels) or "unavailable"
+    evidence = (f"5-min load {load5:.1f} exceeds {threshold} ({LOAD_HIGH_FACTOR}x {cores} cores); "
+                f"top process commands by count: {processes}")
+    return [finding("load_high", "error", evidence, "impossible",
+                    "sustained host overload; inspect admission and the listed process commands")]
+
+
 def check_leaked_test_apps(mini: Mini) -> list[dict[str, Any]]:
     apps = mini.leaked_test_apps()
     if not apps:
         return []
     return [finding("leaked_test_apps", "warn", f"{len(apps)} orphaned cmux DEV.app process(es) under runner _temp",
                     "pending", "killed by the runner post-job hook or mini-health backstop")]
+
+
+def daemon_user(plist: Path) -> str | None:
+    try:
+        user = plistlib.loads(plist.read_bytes()).get("UserName")
+    except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
+        return None
+    return user if isinstance(user, str) else None
+
+
+def account_name() -> str | None:
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def account_home() -> Path | None:
+    """This account's real home from the password database ($HOME can be anything)."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def newest_stamp(values: Any) -> float | None:
+    stamps = []
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            try:
+                v = float(v)
+            except OverflowError:
+                continue
+            if math.isfinite(v):
+                stamps.append(v)
+    return max(stamps) if stamps else None
+
+
+def disk_pass_times(facts: dict[str, Any]) -> dict[str, float | None]:
+    """When glaeda-disk last ran a pass, per snapshot: sizes.json's newest per-item measurement (its global `at`
+    is when the oldest size was measured, so it lags a working pass by design), and accounting.json's newest
+    volume record, or either file's write time. This asks whether a pass ran, not whether every size is fresh: a pass rewrites the items it
+    measured, and one item measured within the window means the pass is alive. accounting.json is left out
+    (facts None) for the runner-cache profile, which never writes it."""
+    written = facts.get("written") if isinstance(facts.get("written"), dict) else {}
+    sizes = facts.get("sizes") if isinstance(facts.get("sizes"), dict) else {}
+    if (not isinstance(sizes.get("sizes"), dict) or newest_stamp([sizes.get("at")]) is None
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in sizes["sizes"].values())):
+        sizes = {}  # glaeda-disk's load_snapshot_meta rejects it too: no pass wrote this
+    measured = sizes.get("measured_at") if isinstance(sizes.get("measured_at"), dict) else {}
+    # every --apply pass rewrites sizes.json, also one that re-measured nothing (an idle mini's report-only items),
+    # so the file's own write time counts; a snapshot that does not parse is missing whatever its time
+    sizes_at = newest_stamp([*measured.values(), sizes.get("at"), written.get("sizes.json") if sizes else None])
+    out = {str(facts.get("sizes_name") or "sizes.json"): sizes_at}
+    if facts.get("accounting") is not None:
+        accounting = facts["accounting"] if isinstance(facts["accounting"], dict) else {}
+        if not all(isinstance(r, dict) and newest_stamp([r.get("at")]) is not None for r in accounting.values()):
+            accounting = {}  # one record glaeda-disk did not write makes the whole snapshot suspect
+        out["accounting.json"] = newest_stamp([*(r.get("at") for r in accounting.values() if isinstance(r, dict)),
+                                               written.get("accounting.json") if accounting else None])
+    return out
+
+
+def check_disk_pass(mini: Mini, now: float) -> list[dict[str, Any]]:
+    """disk_pass_stale: glaeda-disk has not completed a pass for DISK_PASS_STALE_S. Its LaunchAgent runs every 15
+    min and rewrites both snapshots, so a missing or day-old one is a stalled pass (an unloaded agent, a pass that
+    dies, a lock that never frees), not a quiet disk. The disk table and eviction read these snapshots."""
+    facts = mini.disk_pass()
+    if facts is None:
+        return []
+    stale = []
+    for name, at in disk_pass_times(facts).items():
+        if at is None:
+            stale.append(f"{name} missing")
+        elif now - at > DISK_PASS_STALE_S:
+            stale.append(f"{name} last pass {(now - at) / 3600:.0f} h ago")
+    if not stale:
+        return []
+    agent = facts.get("agent") or "?"
+    if facts.get("last_exit"):
+        agent += f", last exit {facts['last_exit']}"
+    return [finding("disk_pass_stale", "warn", f"{'; '.join(stale)} (limit {DISK_PASS_STALE_S // 3600} h); "
+                    f"disk pass job {agent}", "impossible",
+                    "glaeda-disk --pressure --idle --apply --top 0 shows why a pass does not finish; "
+                    "~/Library/Logs/glaeda-disk.err; glaeda-mini-setup reloads the agent")]
+
+
+def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
+    """git_mirror_stale: glaeda-git-mirror's last good fetch (its record's fetched_at, or the pass time of a record
+    whose fetch succeeded) is older than GIT_MIRROR_STALE_S, or there is none. Its passes heal it themselves (a
+    repair fetches first); a finding that stays is a pass that cannot finish or a fetch that keeps failing."""
+    facts = mini.git_mirror()
+    if facts is None:
+        return []
+    record = facts.get("record") if isinstance(facts.get("record"), dict) else {}
+    fetched = record.get("fetched_at")
+    if fetched is None and (record.get("fetch") or {}).get("ok") is True:
+        fetched = record.get("time")  # a record from before fetched_at
+    at = utc(fetched)
+    # a repair whose pass is gone (it failed or was killed) left the mirror incomplete, however fresh its tips
+    stopped = record.get("state") == "repairing" and not facts.get("running")
+    if at is not None and now - at <= GIT_MIRROR_STALE_S and not stopped:
+        return []
+    age = "no good fetch on record" if at is None else f"last good fetch {(now - at) / 60:.0f} min ago"
+    if stopped:
+        age = f"a repair stopped part way, {age}"
+    state = f"last pass {record.get('state') or '?'}" + (f": {str(record.get('reason'))[:120]}" if record.get("reason") else "")
+    return [finding("git_mirror_stale", "warn",
+                    f"{age} (fresh within {GIT_MIRROR_STALE_S // 60}); {state}; "
+                    f"{'a pass is running' if facts.get('running') else 'no pass running'}",
+                    "pending" if facts.get("running") else "impossible",
+                    "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")]
+
+
+PRESSURE_BLOCKED_MIN = 20 * 1024**3  # blocked bytes worth a look
+PRESSURE_BLOCKED_SHARE = 0.05  # reclaimable under this share of blocked, under pressure: the classifier keeps too much
+
+
+def pressure_blocked_findings(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """disk_pressure_blocked: a filesystem is under pressure while glaeda-disk calls almost nothing reclaimable and
+    holds tens of GiB blocked. A fleet mini sat at 27 GB free of 460 with 372 GB measured build/cache and
+    "Reclaimable 0.0 GB" (2026-11-18): a stale socket, a 12 h mirror window and a 2-day image window kept 108 GiB."""
+    under = [f for f in summary.get("filesystems") or [] if isinstance(f, dict) and f.get("under")]
+    reclaimable, blocked = summary.get("reclaimable"), summary.get("blocked")
+    if not under or not isinstance(reclaimable, (int, float)) or not isinstance(blocked, (int, float)):
+        return []
+    if blocked < PRESSURE_BLOCKED_MIN or reclaimable >= PRESSURE_BLOCKED_SHARE * blocked:
+        return []
+    mounts = ", ".join(str(f.get("mount")) for f in under)
+    return [finding("disk_pressure_blocked", "warn",
+                    f"under pressure on {mounts}: reclaimable {reclaimable / 1024**3:.1f} GiB, blocked "
+                    f"{blocked / 1024**3:.1f} GiB", "pending",
+                    "run `glaeda-disk --pressure --json` and fix the verdict that keeps the biggest build/cache items "
+                    "(handbook: build-caches-classified-keep)")]
 
 
 def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
@@ -443,6 +1783,7 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         findings.append(finding("eviction_contention", "warn",
                                 f"eviction skipped while pid {pid} ({account}, {state}) held the lock",
                                 "impossible", "the next scheduled pass retries; live scans are never killed"))
+    findings.extend(pressure_blocked_findings(summary))
     accounting = summary.get("accounting") or []
     # The enrolled-runner profile deliberately measures only its rebuildable cache allowlist.
     # Its df-used remainder includes unrelated system and account data, so comparing it with the
@@ -461,6 +1802,15 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
             if isinstance(entry, dict) and entry.get("path") and isinstance(entry.get("bytes"), (int, float)):
                 top.append(f"{entry['path']} {entry['bytes'] / 1024**3:.1f} GiB")
     where = "; top level: " + ", ".join(top[:5]) if top else ""
+    residuals = [x.get("residual") for x in accounting if isinstance(x, dict)]
+    if residuals and all(isinstance(r, dict) and str(r.get("category", "")).startswith("apfs-invisible")
+                         for r in residuals):
+        # glaeda-disk's volume census walked every directory: what is left is not a measurement to refresh
+        findings.append(finding("disk_unmeasured", "warn",
+                                f"{missing / 1024**3:.1f} GiB used space is outside every walked directory: "
+                                f"{residuals[0]['category']}", "impossible",
+                                "open-deleted files, purgeable space or root-only dirs; the census repeats daily"))
+        return findings
     findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space remains outside measured items and complete shared-runner coverage{where}",
                             "pending", "glaeda-disk reports bounded known-heavy roots and refreshes their accounting"))
     return findings
@@ -490,11 +1840,42 @@ def check_testmanagerd(mini: Mini, now: float) -> list[dict[str, Any]] | None:
 
 
 def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
+    mini.tailnet_route_ok = False  # seen clear this run: tailscale_no_route's failed restarts start again from 0
+    mini.route_on_tunnel = False
     got = mini.tailscale()
-    if got is None or got[1] == "Running":
-        return []
+    if got is None:  # a runner host is on the tailnet: no CLI to ask is no answer, not a healthy tunnel
+        if not mini.runner_agents():
+            return []
+        return [finding("tailscale_cli_missing", "warn", f"no Tailscale CLI at {TAILSCALE_STANDALONE} (standalone) "
+                        f"or {TAILSCALE_APP} (app) on a runner host: the tunnel is not checked", "impossible",
+                        "install Tailscale (the standalone tailscaled or the app) as the mini's setup does")]
+    if got[1] == "Running":
+        via = mini.tailnet_route()
+        if via is None:  # route -n get named no interface (a loaded mini): the check could not look, as above
+            return [finding("tailscale_probe_error", "warn", f"/sbin/route -n get {TAILNET_PROBE_IP} named no "
+                            "interface", "impossible", "the probe could not read the tailnet route; the tunnel "
+                            "is not judged on it")]
+        if via.startswith("utun"):
+            mini.tailnet_route_ok = mini.route_on_tunnel = True
+            return []
+        f = finding("tailscale_no_route", "error", f"Tailscale ({got[0]}) BackendState Running, but the OS "
+                    f"routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
+                    "pending", restart_fix(got[0]))
+        f["flavor"] = got[0]  # which restart heal_tailscale_route runs
+        return [f]
     flavor, state, said = got
-    if state is None:  # the check could not look: never a tailscale_down, a heal or an unstick on a guess
+    if state is None:
+        # The CLI times out on a loaded mini (cmuxs-mac-mini-5, 2026-10-26, every other run), but the route is
+        # its own look: off the tunnel is tailscale_no_route whatever the CLI said, so the timeout cannot mask it.
+        via = mini.tailnet_route()
+        mini.route_on_tunnel = via is not None and via.startswith("utun")
+        if via is not None and not via.startswith("utun"):
+            f = finding("tailscale_no_route", "error", f"Tailscale ({flavor}) gave no BackendState ({said[:80]}), and "
+                        f"the OS routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh "
+                        "here", "pending", restart_fix(flavor))
+            f["flavor"] = flavor
+            return [f]
+        # otherwise the check could not look: never a tailscale_down, a heal or an unstick on a guess
         return [finding("tailscale_probe_error", "warn", said, "impossible",
                         "the probe got no BackendState from the Tailscale CLI; the tunnel is not judged down on it")]
     evidence = f"Tailscale BackendState {state}"
@@ -509,8 +1890,16 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
 
 def check_runners(mini: Mini) -> list[dict[str, Any]]:
     out = []
+    for doc in mini.runner_registrations():
+        agent = RUNNER_DIR.fullmatch(doc["dir"])
+        agent = (agent.group(1) or "0") if agent else doc["dir"]
+        out.append(finding(f"registration_deleted:{agent}", "error",
+                           f"GitHub deleted runner {doc.get('runner') or doc['dir']}'s registration "
+                           f"({doc.get('exits')} listener exit(s) since {doc.get('first_seen')})", "impossible",
+                           "the mini holds no admin token: re-register it from an operator host "
+                           "(glaeda-cmux-runner with a runner token); the gate retries every 10 minutes"))
     for label, loaded, running, last in mini.runner_agents():
-        agent = label.rsplit(".", 1)[1] if label[-1].isdigit() else "0"
+        agent = label.rsplit(".", 1)[1] if label[-1].isdigit() or ".dedicated." in label else "0"
         if (HELD / ("actions-runner-glaeda" + ("" if agent == "0" else f"-{agent}"))).exists():
             continue  # cmux_mini_fix.sh runner_hold stopped it on purpose (an ineligible node)
         if not loaded:
@@ -522,16 +1911,457 @@ def check_runners(mini: Mini) -> list[dict[str, Any]]:
     return out
 
 
+def check_foreign_runners(mini: Mini) -> list[dict[str, Any]]:
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A runner glaeda does not install gets none of
+    its reconcilers (.path repair, toolchain hold, hook refresh, disk eviction, this heal)."""
+    return [finding(f"runner_unmanaged:{Path(where).name}", "error", f"{what} ({where})", "impossible",
+                    "declare it as runner.dedicated in mini-fleet.json, apply it with glaeda-cmux-runner-fleet --apply "
+                    "--hosts <this mini>, then remove the hand-made one between jobs (docs/CMUX_MINI_RUNNER.md 2e1)")
+            for where, what in mini.foreign_runners()]
+
+
+def check_unmanaged_services(mini: Mini) -> list[dict[str, Any]]:
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" (rulebook: every fleet runner is
+    glaeda-managed; no hand-made runner services). A fleet-looking launchd job (config/fleet-services.json match) that
+    glaeda did not install and the file does not declare with its installer: nothing reconciles it, so it is reported.
+    A warning only: this never unloads, boots out or deletes it. A job that starts a runner is runner_unmanaged's."""
+    policy = mini.fleet_services()
+    try:
+        match = [re.compile(m) for m in policy.get("match") or [] if isinstance(m, str) and m]
+    except re.error:
+        match = []
+    if not match:
+        return []  # no readable policy (an install that predates it): nothing to judge
+    declared = policy.get("services") if isinstance(policy.get("services"), dict) else {}
+    prefixes = tuple(k for k in (policy.get("prefixes") or {}) if isinstance(k, str) and k)
+    out = []
+    for plist, label, words, cwd in mini.launchd_jobs(strict=True):  # a stub launchd would refuse is no service
+        if label.startswith(GLAEDA_LABEL_PREFIX) or RUNNER_AGENT.fullmatch(label) or label in declared \
+                or (prefixes and label.startswith(prefixes)) or not any(m.search(label) for m in match) \
+                or job_starts_runner(words, cwd):
+            continue
+        program = words[0] if words else "no program"
+        out.append(finding(f"unmanaged_service:{label}", "warn", f"{label} ({plist}) runs {program}", "impossible",
+                           "no reconciler keeps it: have glaeda install it, or declare it with its installer in "
+                           "glaeda config/fleet-services.json; glaeda never unloads it"))
+    return sorted(out, key=lambda f: f["id"])
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in version.split("."))
+
+
+def check_runner_versions(mini: Mini) -> list[dict[str, Any]]:
+    out = []
+    for d in mini.runner_dirs():
+        hit = RUNNER_DIR.fullmatch(d.name)
+        version = mini.runner_version(d) if hit else None
+        if not version or version_key(version) >= version_key(RUNNER_PIN):
+            continue
+        out.append(finding(f"runner_below_pin:{hit.group(1) or '0'}", "warn",
+                           f"{d.name} runs actions/runner {version}, below the pin {RUNNER_PIN}", "impossible",
+                           "it self-updates when its listener next connects; while it is idle an operator can "
+                           f"point bin/externals at a sibling's bin.{RUNNER_PIN}/externals.{RUNNER_PIN}"))
+    return out
+
+
+def checkout_durations(text: str) -> list[tuple[float, float]]:
+    """(end time, seconds) of each checkout step a worker log ran to a result, oldest first."""
+    out, cur = [], None
+    for line in text.splitlines():
+        if "StepsRunner]" not in line:
+            continue
+        m = STEPS_LINE.match(line)
+        if not m:
+            continue
+        try:
+            at = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            continue
+        if m.group(2) is not None:
+            cur = (m.group(2), at)
+        elif m.group(3) and cur:
+            if CHECKOUT_STEP.fullmatch(cur[0]):
+                out.append((at, max(0.0, at - cur[1])))
+            cur = None
+        else:  # a skipped step logs no result
+            cur = None
+    return out
+
+
+def finite(x: Any) -> bool:
+    """A real number of a sane size (an int too large for a float is not)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    if isinstance(x, int):
+        return abs(x) < 10 ** 11
+    return math.isfinite(x) and abs(x) < 1e11
+
+
+def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
+    """A cache entry's steps when it is for this size and mtime and every step is a finite (end, seconds) pair."""
+    if not isinstance(hit, dict) or hit.get("size") != size or hit.get("mtime") != mtime:
+        return None
+    steps = hit.get("steps")
+    if not isinstance(steps, list) or len(steps) > CHECKOUT_MAX_STEPS:
+        return None
+    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) for v in st) and st[1] >= 0 for st in steps):
+        return None
+    return steps
+
+
+def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool = True) -> list[dict[str, Any]]:
+    """checkout_slow: the median checkout step over this mini's recent jobs, from its worker logs. Each log is
+    parsed once (cached by size and mtime), so a pass reads only the logs that changed. Observation only: a
+    failure here is no finding and never stops the rest of the pass."""
+    try:
+        return _check_checkout_steps(mini, now, cache_path, remember)
+    except Exception:  # noqa: BLE001  (an unreadable log or cache must not cost the other checks)
+        return []
+
+
+def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool) -> list[dict[str, Any]]:
+    recent = sorted((w for w in mini.worker_logs() if 0 <= now - w[3] <= CHECKOUT_WINDOW_S),
+                    key=lambda w: w[3], reverse=True)[:CHECKOUT_MAX_LOGS]  # worker_logs is already the newest
+    cache = load_json(cache_path)
+    logs = cache.get("logs") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
+    logs = logs if isinstance(logs, dict) else {}
+    kept: dict[str, Any] = {}
+    samples: list[float] = []
+    budget = CHECKOUT_PASS_BYTES
+    for key, path, size, mtime in recent:
+        hit = logs.get(key)
+        steps = cached_steps(hit, size, mtime)
+        truncated = bool(hit.get("truncated")) if steps is not None else False
+        if steps is None:
+            if budget <= 0:
+                continue  # read on a later pass
+            limit = min(CHECKOUT_MAX_LOG_BYTES, budget)
+            text = mini.read_log(path, limit)
+            if text is None:
+                continue
+            budget -= min(size, limit)
+            if size > limit and limit < CHECKOUT_MAX_LOG_BYTES:
+                continue  # cut short by the pass budget, not the per-log cap: read whole on a later pass
+            truncated = size > limit
+            steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)][-CHECKOUT_MAX_STEPS:]
+        kept[key] = {"size": size, "mtime": mtime, "steps": steps, **({"truncated": True} if truncated else {})}
+        samples += [float(sec) for at, sec in steps if 0 <= now - at <= CHECKOUT_WINDOW_S]
+    slow = len(samples) >= CHECKOUT_MIN_SAMPLES
+    samples.sort()
+    n = len(samples)
+    p50 = (samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2) if n else 0.0
+    slow = slow and p50 > CHECKOUT_SLOW_S
+    old = cache.get("probe") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
+    # Kept for its hour whatever this pass's median says, so a median near the line never probes more often.
+    probe = old if (isinstance(old, dict) and finite(old.get("at")) and finite(old.get("s"))
+                    and old["s"] >= 0 and 0 <= now - old["at"] <= CHECKOUT_PROBE_TTL_S) else None
+    if slow and probe is None:
+        try:
+            sec = mini.checkout_probe()
+        except Exception:  # noqa: BLE001  (a probe that cannot run leaves "where" unknown, never the finding)
+            sec = None
+        probe = None if sec is None else {"at": round(now), "s": round(sec, 2)}
+    doc = {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept, **({"probe": probe} if probe else {})}
+    if remember and doc != cache:
+        with contextlib.suppress(OSError):
+            write_json(cache_path, doc)
+    if not slow:
+        return []
+    p90 = samples[max(0, math.ceil(0.9 * n) - 1)]  # nearest rank
+    stats = (f"checkout steps took a median {p50:.0f} s (p90 {p90:.0f} s, slowest {samples[-1]:.0f} s) over "
+             f"{n} steps in the last {CHECKOUT_WINDOW_S // 86400} days; over {CHECKOUT_SLOW_S} s is slow")
+    if probe is None:
+        where, note = ("where: unknown (no runner checkout or git to time)",
+                       "time `git submodule status` in a runner's _work checkout: slow there is local git work, "
+                       "fast there means the step waits on the network")
+    elif probe["s"] >= CHECKOUT_LOCAL_SLOW_S:
+        took = f"over {CHECKOUT_PROBE_S}" if probe["s"] >= CHECKOUT_PROBE_S else f"{probe['s']:.0f}"
+        where, note = (f"where: local (git submodule status took {took} s here; under 1 s on a healthy mini)",
+                       "each git call waiting about 6 s is an unanswered macOS privacy (TCC) prompt: grant Full "
+                       "Disk Access and App Management at the console, or give the host git.source homebrew in "
+                       "the mini-fleet manifest")
+    else:
+        where, note = (f"where: network (local git is fast: git submodule status took {probe['s']:.1f} s)",
+                       "the step is waiting on the fetch: look at the uplink and the route to GitHub, then the disk")
+    return [finding("checkout_slow", "warn", f"{stats}; {where}", "impossible", note)]
+
+
 def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
     why = mini.node_refusal()
     if not why:
         return []
+    match = RUST_TOOLCHAIN_RE.search(why)
+    if match:
+        toolchain = match.group(1)
+        return [finding(f"node_toolchain_missing:{toolchain}", "error", why, "pending",
+                        f"rustup will install the exact missing toolchain {toolchain}; no receipt or enrollment state is changed")]
     return [finding("node_ineligible", "error", why, "impossible",
                     "job-started refuses every job here; restage the class receipt's generation or re-enroll "
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
 
 
+def check_toolchain_missing(mini: Mini) -> list[dict[str, Any]]:
+    why = mini.toolchain_missing()
+    if not why:
+        return []
+    held = ("job-started refuses every job, the listener gate holds every runner off at once and ci-step fits "
+            "advertises no class until rustup, rustc and cargo run on the job PATH again: ")
+    fix = ("put the runner's PATH back on WORKLOAD_PATH (glaeda-cmux-runner-fleet --apply)" if TOOLCHAIN_OFF_PATH in why
+           else "reinstall rustup (glaeda-mini-setup, or brew reinstall rustup)")
+    return [finding("toolchain_missing", "error", why, "impossible", held + fix + "; the next poll admits the host")]
+
+
+def check_toolchain(mini: Mini) -> list[dict[str, Any]]:
+    why = mini.toolchain_mismatch()
+    if not why:
+        return []
+    return [finding("toolchain_mismatch", "error", why, "impossible",
+                    "job-started refuses every job and the gate holds the listener off; root: move "
+                    "/Library/Developer/CommandLineTools aside (or xcode-select -s the pool Xcode), then the next "
+                    "look admits the host")]
+
+
+def utc(stamp: Any) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def ota_summary(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """The report's `ota`: what the host runs, what its ring wants, and why they differ (converge.json)."""
+    if not doc:
+        return None
+    running = doc.get("running") or {}
+    return {"at": doc.get("at"), "running": running.get("tag"), "wants": (doc.get("wants") or {}).get("tag"),
+            "converged": doc.get("converged"), "why": (doc.get("why") or [])[:5], "since": doc.get("since"),
+            "blocking": doc.get("blocking"), "toolDrift": (running.get("tools") or {}).get("drift") or [],
+            "hooks": [{"runner": Path(str(h.get("runnerDir") or h.get("receipt") or "?")).name,
+                       "sha256": h.get("glaeda-cmux-runner-hook"), "current": h.get("current")}
+                      for h in running.get("hooks") or []]}
+
+
+def check_ota(mini: Mini, now: float) -> list[dict[str, Any]]:
+    doc = mini.ota_converge()
+    if not doc:
+        return []
+    out = []
+    stale = utc(doc.get("staleAfter"))
+    if stale is None or now >= stale:
+        out.append(finding("ota_stale", "warn", f"no glaeda-update run has finished since {doc.get('at') or '?'}",
+                           "impossible", "glaeda-update --status says why; its agent should run every 10 min"))
+    alert = utc(doc.get("alertAfter"))
+    if doc.get("converged") is not False or alert is None or now < alert:
+        return out
+    running = (doc.get("running") or {}).get("tag") or "no release"
+    wants = (doc.get("wants") or {}).get("tag") or "nothing"
+    evidence = f"running {running}, wants {wants}, because " + "; ".join(str(w) for w in doc.get("why") or ["?"])
+    if doc.get("blocking"):
+        out.append(finding("ota_not_converging", "error", evidence, "impossible",
+                           "retrying the same release cannot fix this: a newer release, or glaeda-cmux-runner "
+                           "--apply for a hook it will not replace"))
+    else:
+        out.append(finding("ota_not_converging", "warn", evidence, "pending",
+                           f"glaeda-update retries with backoff ({doc.get('attempts')} tries since "
+                           f"{doc.get('since')}; next {doc.get('nextAttempt')})"))
+    return out
+
+
+def daemon_heal_command(mini: Mini) -> str:
+    """The operator's root step. The hashes come from the release, not this host: the runner user can edit these files."""
+    policy = mini.daemon_policy()
+    return (f"sudo {SYSTEM_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
+            "--expect-sha256 $(git show <release commit this host runs>:scripts/glaeda-daemon-heal | shasum -a 256) "
+            "--expect-policy-sha256 $(git show <that commit>:config/macos-daemons.json | shasum -a 256)")
+
+
+def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
+    status = mini.daemon_heal_status()
+    if status is None:
+        return []
+    out = []
+    why = None
+    fixable = True
+    verdict = status.get("verdict")
+    if isinstance(verdict, dict) and verdict.get("state") in ("current", "stale", "missing"):
+        # A copy that keeps itself on stable: its own report says whether it does, not this user's release bytes.
+        if verdict["state"] != "current":
+            why = str(verdict.get("why") or verdict["state"])[:300]
+            fixable = verdict.get("reinstall") is not False
+        elif status.get("loaded") is False:  # a report from before it was booted out reads current for a while
+            why = "the root daemon-heal LaunchDaemon is installed but not loaded"
+    elif not status.get("installed"):
+        why = "the root daemon-heal LaunchDaemon is not installed"
+    elif not status.get("current"):
+        why = "the root daemon-heal LaunchDaemon is not this release's copy: " + ", ".join(status.get("stale") or [])
+    elif status.get("loaded") is False:
+        why = "the root daemon-heal LaunchDaemon is installed but not loaded"
+    elif not status.get("reportFresh"):  # loaded, or launchctl could not say: an old report alone means no passes
+        age = status.get("reportAgeS")
+        why = ("the root daemon-heal LaunchDaemon is loaded but its report is "
+               + ("missing" if age is None else f"{age} s old") + ": its passes are not running")
+    if why and not fixable:  # a reinstall cannot make it read its channel or take a release it refused
+        out.append(finding("daemon_heal_stale", "warn", why, "impossible",
+                           "its report's release.error says why; it retries every release.every_s"))
+    elif why:
+        out.append(finding("daemon_heal_stale", "warn", why,
+                           "pending" if mini.sudo_ok() else "impossible",
+                           "reinstalled with sudo -n" if mini.sudo_ok() else
+                           "no passwordless sudo here; root: " + daemon_heal_command(mini)))
+    if status.get("installed"):
+        report = load_json(Path(str(status.get("report") or "")))
+        mini.daemon_healed = [  # the root daemon's restarts, in this report's healed list for ci-dash
+            {"id": f"{code}:{h['name']}", "code": code, "t": h.get("t") or 0, "at": h.get("at"),
+             "since": h.get("since"), "evidence": f"sandbox probe took {h.get('probe_s')} s"
+             if code == "sandboxd_wedged" else f"{h['name']} at {h.get('cores')} cores",
+             "action": str(h.get("action") or "")[:200], "auto_fix": "done"}
+            for h in report.get("healed") or [] if isinstance(h, dict) and h.get("name")
+            for code in ["sandboxd_wedged" if "probe_s" in h else "daemon_hot"]]
+        hygiene = report.get("runnerHygiene") if isinstance(report.get("runnerHygiene"), dict) else {}
+        accounts = hygiene.get("accounts") if isinstance(hygiene.get("accounts"), dict) else {}
+        if hygiene.get("error"):
+            out.append(finding("disk_root_copy_stale:all", "error",
+                               f"the root pass could not check runner accounts' root-pinned glaeda-disk: "
+                               f"{str(hygiene['error'])[:200]}", "impossible",
+                               "glaeda-daemon-heal's report runnerHygiene.error"))
+        for uid, a in sorted(accounts.items()):
+            if not isinstance(a, dict) or a.get("state") not in ("stale", "error"):
+                continue
+            stale = a["state"] == "stale"
+            out.append(finding(f"disk_root_copy_stale:{uid}", "warn" if stale else "error",
+                               f"runner account {a.get('user') or uid}'s root-pinned glaeda-disk "
+                               f"({str(a.get('sha256') or 'none')[:12]}) is not its release's "
+                               f"({str(a.get('wants') or 'none')[:12]}): {a.get('why')}",
+                               "pending" if stale else "impossible",
+                               "the root glaeda-daemon-heal pass reinstalls it" if stale else
+                               "root: the release's glaeda-runner-hygiene --user "
+                               f"{a.get('user') or '<account>'} --apply (docs/RUNNER_ACCOUNT_HYGIENE.md)"))
+        # A CI mini with no enrolled account: the root pass keeps the host's root census alone (rootCensus).
+        census = hygiene.get("rootCensus") if isinstance(hygiene.get("rootCensus"), dict) else {}
+        if census.get("state") in ("stale", "error"):
+            stale = census["state"] == "stale"
+            out.append(finding("disk_root_census_stale", "warn" if stale else "error",
+                               f"the host's root census (glaeda-disk --root-census) is not its release's: "
+                               f"{census.get('why')}", "pending" if stale else "impossible",
+                               "the root glaeda-daemon-heal pass reinstalls it" if stale else
+                               "root: the release's glaeda-runner-hygiene --root-census --apply "
+                               "(docs/RUNNER_ACCOUNT_HYGIENE.md)"))
+        sandbox = report.get("sandbox") if isinstance(report.get("sandbox"), dict) else {}
+        if sandbox.get("needs_operator"):  # the root heal would reboot a second time within its window: a person's
+            out.append(finding("sandboxd_wedged", "error", str(sandbox["needs_operator"])[:400], "impossible",
+                               "the root glaeda-daemon-heal reboots a wedged sandboxd at most once a week per mini; "
+                               "find why it wedges again (sample sandboxd's com.apple.sandboxd.approval queue)"))
+        for h in report.get("hot") or []:
+            if not isinstance(h, dict) or not h.get("name"):
+                continue
+            hours = (h.get("hot_for_s") or 0) / 3600
+            out.append(finding(f"daemon_hot:{h['name']}", "warn",
+                               f"{h['name']} (macOS, pid {h.get('pid')}) has used {h.get('cores')} cores for "
+                               f"{hours:.1f} h, since {h.get('since')}", "pending",
+                               f"the root glaeda-daemon-heal restarts it: {h.get('waiting') or 'next pass'}"))
+    return out
+
+
+def claude_route_settings(mini: Mini) -> tuple[list[str], dict[str, Any]]:
+    """(the fleet routes, the env of ~/.claude/settings.json)."""
+    routes = [r for r in mini.claude_routes().get("routes") or [] if isinstance(r, str) and r]
+    env = mini.claude_settings().get("env")
+    return routes, env if isinstance(env, dict) else {}
+
+
+def check_claude_missing(mini: Mini) -> list[dict[str, Any]]:
+    """A fleet mini whose config names a Claude Code source has Claude Code: a capture's real agent runs there."""
+    if mini.claude_bin() is not None or not mini.fleet_host():  # a personal Mac's tools are its owner's
+        return []
+    if not isinstance(mini.claude_routes().get("claude_code"), dict):
+        return []
+    return [finding("claude_missing", "error", "no ~/.local/bin/claude: a capture's real agent cannot run here",
+                    "pending", "installed from config/claude-routes.json claude_code (sha256 checked); until then "
+                    "capture-host admits no capture lease here")]
+
+
+def check_claude_route(mini: Mini, now: float, remember: bool = True,
+                       tunnel_down: bool = False) -> list[dict[str, Any]]:
+    """Claude Code goes through a fleet route that answers a real `claude -p`, checked once per probe_every_s
+    (remember=False, a check-only run: the probe's answer is not kept). tunnel_down (TUNNEL_DOWN seen this run):
+    without a fresh cached answer it is not probed (a probe through a broken tunnel hangs up to 60 s every run)."""
+    if mini.claude_bin() is None or not mini.fleet_host():  # a personal Mac's Claude login is its owner's
+        return []
+    routes, env = claude_route_settings(mini)
+    if not routes:
+        return []
+    url, token = env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_AUTH_TOKEN")
+    note = "rerouted to the first fleet route in config/claude-routes.json that answers; until then capture-host " \
+           "admits no capture lease here"
+    personal = [k for k in CLAUDE_PERSONAL if env.get(k)]
+    if personal:
+        why = f"~/.claude/settings.json sets {', '.join(personal)}, a personal login that overrides the fleet route"
+    elif not url:
+        why = "~/.claude/settings.json sets no ANTHROPIC_BASE_URL, so Claude uses a personal login, which expires"
+    elif url not in routes:
+        why = f"~/.claude/settings.json routes Claude to {url}, not a fleet route ({', '.join(routes)})"
+    elif not token:
+        why = f"~/.claude/settings.json routes Claude to {url} with no ANTHROPIC_AUTH_TOKEN placeholder"
+    else:
+        why = None
+    if why:
+        return [finding("claude_route", "error", why, "pending", note)]
+    last = mini.claude_probe_last()
+    every = mini.claude_routes().get("probe_every_s") or 1800
+    if last.get("route") == url and 0 <= now - (last.get("at") or 0) < every:
+        ok, detail = bool(last.get("ok")), str(last.get("detail") or "")
+    elif tunnel_down:  # the finding stays (capture-host stays closed); the first run after recovery probes
+        return [finding("claude_route", "error", "not probed: the Tailscale tunnel is down", "pending", note)]
+    else:
+        ok, detail = mini.claude_probe(url, token)
+        if remember:
+            mini.save_claude_probe({"at": now, "at_iso": iso(now), "route": url, "ok": ok, "detail": detail})
+    if ok:
+        return []
+    return [finding("claude_route", "error", f"`claude -p` through {url}: {detail}", "pending", note)]
+
+
 # ---------------------------------------------------------------- heals
+
+
+def heal_claude_route(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    """Route Claude to the first fleet route that answers, in the config's order; a route whose probe just failed
+    is tried last. The token is the config's placeholder unless Claude already went to a fleet route with one (a
+    token meant for another URL never goes to a gateway)."""
+    routes, env = claude_route_settings(mini)
+    current = env.get("ANTHROPIC_BASE_URL")
+    token = (env.get("ANTHROPIC_AUTH_TOKEN") if current in routes else None) or mini.claude_routes().get("placeholder")
+    if not token:
+        return False, "config/claude-routes.json has no placeholder token"
+    failed_route = current if f.get("evidence", "").startswith("`claude -p` through ") else None
+    order = [r for r in routes if r != failed_route] + [r for r in routes if r == failed_route]
+    failed = []
+    for url in order:
+        ok, detail = mini.claude_probe(url, token)
+        if ok:
+            what = mini.set_claude_route(url, token)
+            at = time.time()
+            mini.save_claude_probe({"at": at, "at_iso": iso(at), "route": url, "ok": True, "detail": detail})
+            return True, what
+        failed.append(f"{url}: {detail}")
+    return False, "no fleet route answered: " + "; ".join(failed)
+
+
+
+def heal_claude_missing(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    """Install Claude Code, then route it at once: the finding is healed only when the new Claude goes through a
+    fleet route that answers, so capture-host never admits a host whose Claude is installed but unrouted."""
+    ok, what = mini.install_claude(mini.claude_routes().get("claude_code") or {})
+    if not ok:
+        return False, what
+    try:
+        routed, how = heal_claude_route(mini, {"evidence": "installed just now"})
+    except Exception as e:  # noqa: BLE001  a settings or probe-cache write that fails is a failed heal, kept
+        routed, how = False, f"{type(e).__name__}: {e}"[:160]
+    return routed, f"{what}; {how}" if routed else f"{what}, but not routed yet: {how}"
 
 
 def heal_testmanagerd(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
@@ -562,8 +2392,453 @@ def heal_tailscale(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return False, f"{what}: still {state or 'no BackendState'}"
 
 
+def restart_fix(flavor: str) -> str:
+    """What restarts this flavor of Tailscale (the finding's note before any gate speaks)."""
+    if flavor == "standalone":
+        return f"root: sudo launchctl kickstart -k system/{TAILSCALED_LABEL}"
+    return "stop and start the Tailscale VPN service (scutil --nc)"
+
+
+def restart_switch_off(env: Any, switch_exists: bool) -> str:
+    """Why the Tailscale restart's kill switch is on, or "": TAILSCALE_RESTART_OFF exists, or the env says off."""
+    if switch_exists:
+        return f"{TAILSCALE_RESTART_OFF} exists"
+    value = str(env.get(TAILSCALE_RESTART_ENV, "")).strip().lower()
+    if value in {"0", "off", "false", "no"}:
+        return f"{TAILSCALE_RESTART_ENV}={value}"
+    return ""
+
+
+def host_key(name: str) -> str:
+    return (name.strip().lower().split(".")[0].replace(" ", "-")
+            .replace("’", "").replace("'", ""))
+
+
+def ci_mini_refusal(names: list[str] | None, facts: dict[str, Any]) -> str:
+    """Why this host is not a CI runner mini whose Tailscale may be restarted, or "" when it is. Fails closed: no
+    tailnet name (names None), no name, an unreadable fact or an unknown role refuses. Which minis may restart at
+    all is the registry's opt-in (opt_in_refusal); this is what glaeda itself knows."""
+    if names is None:
+        return "this host's tailnet name cannot be read (tailscale status --json has no Self name)"
+    if not names:
+        return "this host's name cannot be read"
+    for name in names:
+        if NEVER_RESTART_WORD in host_key(name):
+            return f"{host_key(name)} never has its Tailscale restarted by mini-health"
+    if facts.get("platform") != "darwin":
+        return "not a macOS mini"
+    runners = facts.get("runners")
+    if runners is None:
+        return "its glaeda runners cannot be read"
+    if not runners:
+        return "no registered glaeda runner here"
+    args = facts.get("setup_args")
+    if args is None:
+        return "~/.config/glaeda/update.json's setupArgs cannot be read"
+    for flag in ("--hygiene-only", "--gh-only", "--headless"):
+        if flag in args:
+            return f"set up {flag} (not a CI runner mini)"
+    for i, arg in enumerate(args):
+        role = arg.split("=", 1)[1] if arg.startswith("--role=") else (
+            args[i + 1] if arg == "--role" and i + 1 < len(args) else None)
+        if role is not None and role != "fleet-mini":
+            return f"set up --role={role}, not fleet-mini"
+    if facts.get("role") != "fleet-mini":
+        return f"mini-setup's role is {facts.get('role') or 'unknown'}, not fleet-mini"
+    return ""
+
+
+def opt_in_refusal(opt_in: tuple[dict[str, Any] | None, str], names: list[str]) -> str:
+    """Why the fleet registry's opt-in (Mini.tailscale_opt_in) does not allow this host's restart, or "" when it
+    names one of the names this host goes by. Missing, unreadable, another schema or another host refuses."""
+    doc, why = opt_in
+    if doc is None:
+        return why or f"no ~/{TAILSCALE_OPT_IN}"
+    if doc.get("schema") != TAILSCALE_OPT_IN_SCHEMA:
+        return f"~/{TAILSCALE_OPT_IN}'s schema is {doc.get('schema')!r}, not {TAILSCALE_OPT_IN_SCHEMA}"
+    host = doc.get("host")
+    if not isinstance(host, str) or not host.strip():
+        return f"~/{TAILSCALE_OPT_IN} names no host"
+    if host_key(host) not in {host_key(name) for name in names}:
+        return f"~/{TAILSCALE_OPT_IN} names {host}, not this host ({', '.join(sorted(set(names)))})"[:200]
+    return ""
+
+
+SUDO_TAG = re.compile(r"([A-Z_]+):\s*")  # NOPASSWD:, SETENV:, ... before a command
+
+
+def sudo_nopasswd(listing: str, command: str) -> bool:
+    # Conservative by intent only (wildcard negation and runas !root are not modeled); `sudo -n` still enforces.
+    """Whether `sudo -n -l`'s listing lets this user run command as root without a password: the last rule that
+    matches it (exactly, or ALL) wins, as in sudoers, and must carry NOPASSWD; a negated match refuses. Anything
+    it cannot read is no."""
+    lines = listing.splitlines()
+    start = next((i + 1 for i, line in enumerate(lines) if "may run the following commands" in line), None)
+    if start is None:
+        return False
+    allowed = False
+    root = nopasswd = False
+    for line in lines[start:]:
+        if not line.strip():
+            continue
+        m = re.match(r"\s*\(([^)]*)\)\s*(.*)$", line)
+        if m:  # a new entry: its runas users, and tags that start from the defaults
+            users = {u.strip() for u in m.group(1).split(":")[0].split(",")}
+            root, nopasswd, rest = bool(users & {"root", "ALL"}), False, m.group(2)
+        elif line[:1].isspace():
+            rest = line  # a continuation of the entry above
+        else:
+            break  # another section
+        for item in (part.strip() for part in rest.split(",")):
+            while True:  # tags carry to the rest of the entry until another sets them
+                tag = SUDO_TAG.match(item)
+                if not tag:
+                    break
+                if tag.group(1) in {"NOPASSWD", "PASSWD"}:
+                    nopasswd = tag.group(1) == "NOPASSWD"
+                item = item[tag.end():]
+            negated = item.startswith("!")
+            if root and item.lstrip("!") in {command, "ALL"}:
+                allowed = nopasswd and not negated
+    return allowed
+
+
+def restart_state_path(state_path: Path) -> Path:
+    return state_path.with_name(TAILSCALE_RESTART_STATE)
+
+
+def load_restart_state(path: Path) -> dict[str, Any] | None:
+    """The restart state: {} when there was never an attempt, None when it cannot be read (fail closed)."""
+    try:
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def attempt_time_ok(at: Any, now: float) -> bool:
+    """A last_attempt_at that can be a real attempt: a finite number from 0 to one window past now (a clock step
+    back is allowed, NaN, Infinity, 1e300 or a negative stamp is not)."""
+    return (isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)
+            and 0 <= at <= now + TAILSCALE_RESTART_EVERY_S)
+
+
+def restart_window_refusal(doc: dict[str, Any] | None, now: float) -> str:
+    """Why the once-per-TAILSCALE_RESTART_EVERY_S window forbids a restart now, or "" when it allows one."""
+    if doc is None:
+        return f"the restart state ({TAILSCALE_RESTART_STATE}) is unreadable, so the 6 h window cannot be checked"
+    if "last_attempt_at" not in doc:
+        return ""
+    at = doc.get("last_attempt_at")
+    if not attempt_time_ok(at, now):
+        return f"the restart state's last attempt is unreadable ({at!r}), so the 6 h window cannot be checked"
+    if at > now:  # a clock step back: the attempt still happened, so the window starts from now
+        return f"the last restart is stamped in the future ({iso(at)}); none before {iso(now + TAILSCALE_RESTART_EVERY_S)}"
+    if now - at < TAILSCALE_RESTART_EVERY_S:
+        result = f" ({doc['result']})" if isinstance(doc.get("result"), str) else ""
+        return (f"restarted at {iso(at)}{result}; at most once per 6 h, next after "
+                f"{iso(at + TAILSCALE_RESTART_EVERY_S)}")
+    return ""
+
+
+def restart_failures(doc: dict[str, Any] | None, now: float) -> int | None:
+    """Failed restarts in a row the restart state records (an attempt that crashed mid-restart counts: its failure is
+    written before it runs), 0 when none; None when the state, its last attempt's time or its count is unreadable."""
+    if doc is None or ("last_attempt_at" in doc and not attempt_time_ok(doc.get("last_attempt_at"), now)):
+        return None
+    if "failures" not in doc:
+        return 0 if doc.get("ok") or "last_attempt_at" not in doc else 1
+    n = doc.get("failures")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
+def restart_failed_note(doc: dict[str, Any], failures: int, now: float) -> str:
+    """What the last failed restart left: when it ran, what the re-check saw, and when the next try is allowed."""
+    at = doc.get("last_attempt_at")
+    result = doc.get("result") if isinstance(doc.get("result"), str) and doc.get("result") != "started" else (
+        "it never finished")
+    if not attempt_time_ok(at, now):
+        return f"the last Tailscale restart did not restore the route ({result})"
+    if failures >= TAILSCALE_RESTART_GIVE_UP:
+        return (f"{failures} Tailscale restarts in a row did not restore the route (last at {iso(at)}: {result}); "
+                "no more until the route is seen clear")
+    return (f"Tailscale restart at {iso(at)} did not restore the route ({result}); next try after "
+            f"{iso(at + TAILSCALE_RESTART_EVERY_S)}")
+
+
+def clear_restart_failures(path: Path, now: float) -> None:
+    """The route is seen clear: failed restarts in a row start again from 0 (the give-up ends)."""
+    doc = load_restart_state(path)
+    if doc is None or restart_failures(doc, now) == 0:
+        return
+    with contextlib.suppress(OSError):
+        write_json(path, {**doc, "failures": 0, "cleared_at": iso(now)})
+
+
+def restart_commands(flavor: str, service: str | None) -> list[list[str]]:
+    """The restart for this flavor, and nothing else: no config, auth or flag changes. A standalone tailscaled is
+    its LaunchDaemon's kickstart -k (root, through one exact NOPASSWD sudoers rule); the app (the App Store app or
+    the standalone System Extension app) is a stop and start of its VPN service, as tailscale_down's heal does."""
+    if flavor == "standalone":
+        return [["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", "-k", f"system/{TAILSCALED_LABEL}"]]
+    if service is None:
+        return []
+    return [["/usr/sbin/scutil", "--nc", "stop", service], ["/usr/sbin/scutil", "--nc", "start", service]]
+
+
+def route_ok(state: str | None, via: str | None) -> bool:
+    """Running with the route on the tunnel; a CLI that gave no BackendState (a loaded mini) is judged on the route."""
+    return state in ("Running", None) and via is not None and via.startswith("utun")
+
+
+def drain_state_path(state_path: Path) -> Path:
+    return state_path.with_name(TAILSCALE_DRAIN_STATE)
+
+
+def drain_gave_up(path: Path, now: float) -> str:
+    """Why a drain may not start again yet (one hit its cap less than TAILSCALE_RESTART_EVERY_S ago), or ""; an
+    unreadable record refuses."""
+    try:
+        doc = json.loads(path.read_text())
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError):
+        return f"the drain record ({TAILSCALE_DRAIN_STATE}) is unreadable"
+    if isinstance(doc, dict) and "gave_up_at" not in doc:
+        # A drain was started and never recorded a cap. One that ended early (restart, route back) leaves it; one
+        # whose cap record could not be written leaves it too, so a start older than the cap counts as a cap
+        # from the cap's time: no new drain until 6 h after it.
+        started = doc.get("drain_started_at")
+        if not attempt_time_ok(started, now):
+            return f"the drain record ({TAILSCALE_DRAIN_STATE}) is unreadable"
+        if doc.get("ended") or now - started < TAILSCALE_DRAIN_MAX_S:
+            return ""
+        at = started + TAILSCALE_DRAIN_MAX_S
+        if now - at < TAILSCALE_RESTART_EVERY_S:
+            return (f"a drain started at {iso(started)} did not record its end; no drain before "
+                    f"{iso(at + TAILSCALE_RESTART_EVERY_S)}")
+        return ""
+    at = doc.get("gave_up_at") if isinstance(doc, dict) else None
+    if not attempt_time_ok(at, now):
+        return f"the drain record ({TAILSCALE_DRAIN_STATE}) is unreadable"
+    if now - at < TAILSCALE_RESTART_EVERY_S:
+        return (f"a drain hit its {TAILSCALE_DRAIN_MAX_S // 3600} h cap at {iso(at)} ({doc.get('busy', '?')}); "
+                f"no drain before {iso(at + TAILSCALE_RESTART_EVERY_S)}")
+    return ""
+
+
+def finish_drain(mini: Mini, marker: dict[str, Any], now: float, drain_path: Path) -> None:
+    """End a drain before its cap (restart done, route back, a gate refused) and record that it ended, so
+    drain_gave_up does not read it as a cap. A record that cannot be written reads as a cap: fail closed."""
+    if mini.end_drain(marker):
+        with contextlib.suppress(OSError):
+            write_json(drain_path, {"drain_started_at": marker["since"], "ended": iso(now)})
+
+
+def drain_capped(mini: Mini, marker: dict[str, Any], now: float, drain_path: Path, busy: str) -> str:
+    """End a drain at its cap: the cooldown record first (so no new drain starts for TAILSCALE_RESTART_EVERY_S),
+    then the marker, which goes even when the record cannot be written (no host stays closed to jobs; a drain
+    whose record cannot be written never starts again, start_drain's precondition). The note to report."""
+    start = marker["since"]
+    try:
+        write_json(drain_path, {"gave_up_at": now, "at": iso(now), "drain_since": iso(start), "busy": str(busy)[:200]})
+        kept = ""
+    except OSError as error:
+        kept = f"the drain record could not be written ({type(error).__name__}); "
+    mini.end_drain(marker)
+    return (f"{kept}{busy}: still there after the {TAILSCALE_DRAIN_MAX_S // 3600} h drain cap (draining since "
+            f"{iso(start)}); the drain ended and jobs are admitted again; look at it")
+
+
+def drain_housekeeping(mini: Mini, now: float, heal_ok: bool, drain_path: Path, route_clear: bool) -> str:
+    """A pass that did not run tailscale_no_route's heal (the route is clear, the CLI and route gave no answer, or
+    the finding is not reported yet) still ends a drain of ours that has no reason to stay: the route is clear, a
+    kill switch is on, or the cap is past. The note for the report ("" when nothing ended at the cap)."""
+    kind, marker = mini.host_reservation()
+    if kind != "ours":
+        return ""
+    if route_clear or not heal_ok or mini.tailscale_restart_off():
+        finish_drain(mini, marker, now, drain_path)
+        return ""
+    if now - marker["since"] >= TAILSCALE_DRAIN_MAX_S:
+        return drain_capped(mini, marker, now, drain_path, "the route could not be judged this run")
+    return ""
+
+
+def heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
+                         path: Path, since: float | None = None) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    """tailscale_no_route's restart behind every gate: (the finding as reported, the heal it ran or None, fixed).
+    auto_fix stays pending only while a restart is still possible and none has failed: a restart that did not fix it
+    (or an unreadable restart state) is impossible, the state ci-dash's health_alerts raises to an operator.
+    Under --apply, the drain this pass owns (one it found, or one it started) ends here unless the pass keeps it
+    (still waiting on jobs or the host lock): a gate that now refuses or a restart that ran ends it. A pass that
+    found no drain and lost the race to start one owns none, so it never removes another pass's marker."""
+    kind, marker = mini.host_reservation() if apply else ("none", None)
+    owned: list[dict[str, Any] | None] = [marker if kind == "ours" else None]
+    keep = [False]
+    try:
+        return _heal_tailscale_route(mini, f, now, runs, apply, heal_ok, path, since, kind, marker, owned, keep)
+    finally:
+        if apply and owned[0] is not None and not keep[0]:
+            finish_drain(mini, owned[0], now, drain_state_path(path))
+
+
+def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, apply: bool, heal_ok: bool,
+                          path: Path, since: float | None, kind: str, marker: dict[str, Any] | None,
+                          owned: list[dict[str, Any] | None], keep: list[bool]
+                          ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    drain_path = drain_state_path(path)
+    f = dict(f)
+    flavor = f.pop("flavor", None) or ("standalone" if "(standalone)" in f["evidence"] else "app")
+    fix = restart_fix(flavor)
+    record = load_restart_state(path)
+    failures = restart_failures(record, now)
+    if failures is None:  # the state, its last attempt's time or its count: unreadable, so no restart is coming
+        failed = (restart_window_refusal(record, now) if record is None or "last_attempt_at" in record
+                  and not attempt_time_ok(record.get("last_attempt_at"), now) else
+                  f"the restart state's failure count is unreadable ({record.get('failures')!r})"[:120])
+    else:
+        failed = restart_failed_note(record, failures, now) if failures else ""
+
+    def stop(auto_fix: str, why: str) -> tuple[dict[str, Any], None, bool]:
+        # pending only for a short wait (busy right now, the two-runs rule); once a restart failed, always impossible
+        if failed:
+            auto_fix, why = "impossible", f"{failed}; {why}" if why else failed
+        f["auto_fix"], f["note"] = auto_fix, f"{fix}; {why}"[:300]
+        return f, None, False
+
+    def wait(why: str) -> tuple[dict[str, Any], None, bool]:
+        # busy for 6 h is no short wait (a stranded host lock, a stuck jobs/ entry): it alerts
+        stuck = (isinstance(since, (int, float)) and not isinstance(since, bool) and math.isfinite(since)
+                 and 0 <= since and now - since >= TAILSCALE_RESTART_EVERY_S)
+        if not isinstance(why, NoAnswer) and stuck and not failed:  # a failed restart's note already alerts
+            return stop("impossible", f"waiting for an idle mini since {iso(since)} (6 h or more): {why}")
+        return stop("impossible" if isinstance(why, NoAnswer) else "pending", f"waiting for an idle mini: {why}")
+
+    if not heal_ok:
+        return stop("impossible", f"healing is off ({KILL_SWITCH})")
+    off = mini.tailscale_restart_off()
+    if off:
+        return stop("impossible", f"the Tailscale restart is off ({off})")
+    names = mini.host_names()
+    refused = ci_mini_refusal(names, mini.ci_mini_facts()) or opt_in_refusal(mini.tailscale_opt_in(), names or [])
+    if refused:
+        return stop("impossible", f"not restarted here: {refused}; its owner does that")
+    commands = restart_commands(flavor, mini.vpn_service() if flavor == "app" else None)
+    if not commands:
+        return stop("impossible", "no Tailscale VPN service (scutil --nc list) to restart")
+    if flavor == "standalone" and not mini.sudo_allows(commands[0]):
+        user = os.environ.get("USER") or "the runner user"
+        return stop("impossible", f"needs the sudoers rule `{user} ALL=(root) NOPASSWD: /bin/launchctl kickstart -k "
+                    f"system/{TAILSCALED_LABEL}` (glaeda-mini-fleet sudo-plan --sudoers)")
+    if not apply or runs < REPORT_AFTER.get("tailscale_no_route", 1):
+        return stop("pending", "mini-health --apply restarts it when the mini is idle, at most once per 6 h")
+    if failures is None or failures >= TAILSCALE_RESTART_GIVE_UP:
+        return stop("impossible", "")
+    window = restart_window_refusal(record, now)
+    if window:  # hours, not a short wait; a failed restart's note already names the next try
+        return stop("impossible", "" if failed else window)
+    def drain_over(busy: str) -> tuple[dict[str, Any], None, bool]:
+        note = drain_capped(mini, owned[0], now, drain_path, busy)
+        owned[0] = None
+        return stop("impossible", note)
+
+    start = marker["since"] if kind == "ours" else None
+    if kind == "ours":  # draining: what still runs, not our own marker
+        busy = mini.drain_busy()
+        if busy and not isinstance(busy, NoAnswer):
+            if now - start >= TAILSCALE_DRAIN_MAX_S:
+                return drain_over(busy)
+            keep[0] = True
+            return stop("pending", f"{busy}: draining since {iso(start)}, no new job is admitted "
+                        f"({mini.reservation_path()}); the cap is {iso(start + TAILSCALE_DRAIN_MAX_S)}")
+        if busy:
+            return wait(busy)  # no answer: the drain ends (a pass that cannot look does not hold jobs off)
+    else:
+        busy = mini.host_busy()
+        if busy:
+            waited = (isinstance(since, (int, float)) and not isinstance(since, bool) and math.isfinite(since)
+                      and now - since >= TAILSCALE_DRAIN_AFTER_S)
+            if isinstance(busy, NoAnswer) or not waited:
+                return wait(busy)
+            gave_up = drain_gave_up(drain_path, now)
+            if gave_up:
+                return stop("impossible", f"{gave_up}; waiting for an idle mini: {busy}")
+            refused = ("someone else's reservation holds the host" if kind == "other" else mini.fleet_reservation())
+            if refused:
+                return wait(type(refused)(f"{busy}; no drain: {refused}"))  # a NoAnswer stays one: it alerts
+            try:  # the record first: a drain whose cap could not be recorded must not be able to start
+                write_json(drain_path, {"drain_started_at": int(now), "at": iso(now)})
+            except OSError as error:
+                return wait(NoAnswer(f"{busy}; no drain: cannot write {drain_path.name} ({type(error).__name__})"))
+            why = mini.start_drain(now, f"drain for a Tailscale restart: tailscale_no_route since {iso(since)} "
+                                   "(glaeda-mini-health)")
+            if why:
+                return wait(f"{busy}; no drain: {why}")
+            kind, marker = mini.host_reservation()
+            if kind != "ours":
+                return wait(f"{busy}; no drain: the marker could not be read back")
+            owned[0], keep[0] = marker, True
+            return stop("pending", f"{busy}: draining from now, no new job is admitted ({mini.reservation_path()}); "
+                        f"no idle moment since {iso(since)}; the cap is {iso(now + TAILSCALE_DRAIN_MAX_S)}")
+    with mini.hold_host_lock() as held:
+        if held and start is not None and not isinstance(held, NoAnswer):
+            if now - start >= TAILSCALE_DRAIN_MAX_S:
+                return drain_over(held)  # a lock nobody lets go of is capped as a job is
+            keep[0] = True  # a short wait: the drain holds
+        if held:
+            return wait(held)
+        busy = mini.jobs_running()
+        if busy and start is not None and not isinstance(busy, NoAnswer):
+            keep[0] = True
+        if busy:
+            return wait(busy)
+        record = load_restart_state(path)  # another pass may have gone first
+        window = restart_window_refusal(record, now)
+        if window:
+            return stop("impossible", window)
+        failures = restart_failures(record, now)
+        if failures is None or failures >= TAILSCALE_RESTART_GIVE_UP:
+            return stop("impossible", "the restart state changed under the host lock")
+        # counted as failed before it runs, so a crash mid-restart is a failed restart; a fixed route rewrites 0
+        attempt = {"schema": TAILSCALE_RESTART_SCHEMA, "last_attempt_at": now, "at": iso(now), "flavor": flavor,
+                   "commands": commands, "evidence": f["evidence"], "result": "started", "ok": False,
+                   "failures": failures + 1}
+        try:
+            write_json(path, attempt)  # written before the restart runs: a crash mid-restart still counts
+        except OSError as error:
+            return stop("impossible", f"cannot write the restart state ({type(error).__name__}): not restarted")
+        started = mini.clock()
+        ran, what = mini.run_restart(commands)
+        mini.sleep(TAILSCALE_RESTART_SETTLE_S)  # one bounded wait, then one re-check
+        checked = now + max(0.0, mini.clock() - started)
+        got = mini.tailscale()
+        state = got[1] if got else None
+        via = mini.tailnet_route() if state in ("Running", None) else None
+        fixed = route_ok(state, via)
+        result = (f"Running, {TAILNET_PROBE_IP} via {via}" if fixed else
+                  f"still {state or 'no BackendState'}, {TAILNET_PROBE_IP} via {via or 'unknown'}")
+        with contextlib.suppress(OSError):
+            write_json(path, {**attempt, "result": result, "ok": fixed, "ran": what[:300], "checked_at": iso(checked),
+                              "failures": 0 if fixed else failures + 1})
+    action = f"restarted Tailscale ({flavor}{'' if ran else ', a command failed'}): {result}; {what}"
+    heal = {"id": f["id"], "ok": fixed, "action": action[:200]}
+    if fixed:
+        return f, heal, True
+    nxt = ("no more until the route is seen clear" if failures + 1 >= TAILSCALE_RESTART_GIVE_UP else
+           f"next try after {iso(now + TAILSCALE_RESTART_EVERY_S)}")
+    f["auto_fix"] = "impossible"
+    f["note"] = (f"Tailscale restart ({flavor}{'' if ran else ', a command failed'}) at {iso(now)} did not restore "
+                 f"the route: {result}; {nxt}; {what}")[:300]
+    return f, heal, False
+
+
 def agent_label(agent: str) -> str:
-    return "com.teamleaderleo.glaeda.cmux-runner" + ("" if agent == "0" else f".{agent}")
+    """The runner LaunchAgent for a finding's agent: "0", an instance number, or a dedicated runner's name."""
+    base = "com.teamleaderleo.glaeda.cmux-runner"
+    return base if agent == "0" else f"{base}.{agent}" if agent.isdigit() else f"{base}.dedicated.{agent}"
 
 
 def heal_runner(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
@@ -579,16 +2854,71 @@ def heal_leaked_test_apps(mini: Mini) -> tuple[bool, str]:
     return bool(notes), "; ".join(notes) if notes else "no orphaned cmux DEV.app remained after recheck"
 
 
+def heal_node_toolchain(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    toolchain = f["id"].split(":", 1)[1]
+    return mini.install_rust_toolchain(toolchain)
+
+
+def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    ok, what = mini.install_daemon_heal()
+    status = mini.daemon_heal_status() if ok else None
+    verdict = (status or {}).get("verdict")
+    if isinstance(verdict, dict):  # healed only once its own report says so, not when the bytes are in place
+        return bool(verdict.get("state") == "current" and status.get("loaded") is not False), what
+    return bool(status and status.get("current") and status.get("loaded") is not False), what
+
+
+# Tailscale findings under which a fleet route over the tailnet cannot answer: claude_route waits for them.
+TUNNEL_DOWN = frozenset({"tailscale_down", "tailscale_no_route"})
+
+# code -> runs in a row seen before --apply reports it (default 1): a route gap during a Tailscale reconnect
+# lasts seconds, so one sighting is no finding.
+REPORT_AFTER = {"tailscale_no_route": 2}
+
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
+    "daemon_heal_stale": (heal_daemon_heal, 1),
     "testmanagerd_wedged": (heal_testmanagerd, 1),
     "tailscale_down": (heal_tailscale, 2),
     "runner_stopped": (heal_runner, 2),
     "leaked_test_apps": (lambda mini, _f: heal_leaked_test_apps(mini), 1),
+    "node_toolchain_missing": (heal_node_toolchain, 1),
+    "claude_route": (heal_claude_route, 1),
+    "claude_missing": (heal_claude_missing, 1),
 }
 
 
 # ---------------------------------------------------------------- run
+
+
+GATE_RESTARTS = "listener-restarts.jsonl"  # glaeda-cmux-runner-hook GATE_RESTARTS_FILE, in the gate's state dir
+
+
+def gate_restarts_healed(home: Any, now: float) -> list[dict[str, Any]]:
+    """The listener gate's restarts of a stuck listener in the last HEALED_KEEP_S (glaeda-cmux-runner-hook
+    stuck_acquire: a listener that acknowledged a job request and started no Worker), as healed entries for
+    ci-dash: one per restart, code listener_acquire_stuck. Unreadable or missing: none."""
+    if not isinstance(home, Path):
+        return []
+    try:
+        lines = (home / ".local/state/glaeda/cmux-runner" / GATE_RESTARTS).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    out = []
+    for line in lines:
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or not isinstance(doc.get("t"), (int, float)) or now - doc["t"] >= HEALED_KEEP_S:
+            continue
+        code, runner = str(doc.get("cause") or "listener_acquire_stuck"), str(doc.get("runner") or "")
+        out.append({"id": f"{code}:{runner}:{doc.get('request')}", "code": code, "t": doc["t"], "at": doc.get("at"),
+                    "since": doc.get("acknowledged"),
+                    "evidence": f"{runner} acknowledged job request {doc.get('request')} and started no Worker in "
+                                f"{doc.get('held_s')} s (bound {doc.get('bound_s')} s)",
+                    "action": "the runner gate restarted the listener", "auto_fix": "done"})
+    return out
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -610,8 +2940,24 @@ def iso(t: float) -> str:
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def capture_only_tailscale(f: dict[str, Any]) -> dict[str, Any]:
+    """A Tailscale finding on a host with no glaeda runner: only a Stopped app Tailscale keeps its heal (`tailscale
+    up`, HEALS' two runs in a row); a stuck Starting is reported, and tailscale_no_route gets no restart."""
+    if f["code"] == "tailscale_down" and f["auto_fix"] == "pending" and "Stopped" not in f["evidence"]:
+        return {**f, "auto_fix": "impossible", "note": "a host with no glaeda runner heals only a Stopped Tailscale "
+                "(tailscale up); its owner stops and starts the Tailscale VPN service"}
+    if f["code"] == "tailscale_no_route":
+        out = {k: v for k, v in f.items() if k != "flavor"}
+        return {**out, "auto_fix": "impossible", "note": f"{f['note']}; not restarted here: no glaeda runner on this "
+                "host (a capture-only mini), the restart is a CI runner mini's; its owner does that"[:300]}
+    return f
+
+
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
-        report_path: Path = REPORT, heal_ok: bool = True) -> dict[str, Any]:
+        report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Tailscale (tailscale_down
+    healed only when Stopped, by `tailscale up`; tailscale_no_route reported, never restarted), its Claude Code
+    (missing, route), runner_unmanaged and unmanaged_service."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -619,19 +2965,71 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - (h.get("t") or 0) < HEALED_KEEP_S]
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
-    found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
-             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini))
-    tm = check_testmanagerd(mini, now)
-    carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
-    found += [previous["testmanagerd_wedged"]] if carried else tm or []
+    carried = tunnel_down = False
+    if runner:
+        tailnet = check_tailscale(mini)
+        # a tunnel that is down or off its route explains a `claude -p` that does not answer: claude_route neither
+        # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
+        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
+        found = (check_console(mini) + check_power(mini) + check_load_high(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
+                 + check_foreign_runners(mini) + check_unmanaged_services(mini)
+                 + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
+                 + check_leaked_test_apps(mini)
+                 + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
+                 + check_disk_accounting(mini) + check_disk_pass(mini, now) + check_git_mirror(mini, now)
+                 + check_daemon_heal(mini) + check_ota(mini, now)
+                 + check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
+        if apply and mini.tailnet_route_ok:
+            clear_restart_failures(restart_state_path(state_path), now)
+        tm = check_testmanagerd(mini, now)
+        carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
+        found += [previous["testmanagerd_wedged"]] if carried else tm or []
+    else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
+        # Its Tailscale is checked too: cmux-mac-mini (capture-only, 2026-11-17) came back from a power loss with
+        # Tailscale Stopped (WantRunning=false) and stayed off the tailnet until a person ran `tailscale up`. That is
+        # the one Tailscale heal here; tailscale_no_route's restart stays a CI runner mini's (reported, never run).
+        # A tunnel that is down still holds Claude's install and reroute, as on a runner host (a probe through it
+        # hangs and spends a try).
+        tailnet = [capture_only_tailscale(f) for f in check_tailscale(mini)]
+        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
+        found = (tailnet + check_claude_missing(mini)
+                 + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
+                 + check_foreign_runners(mini) + check_unmanaged_services(mini))
 
     findings, heals = [], []
+    route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
     for f in found:
         f = dict(f)
         s = seen.get(f["id"]) or {"since": now, "runs": 0}
         s["runs"] = s.get("runs", 0) + 1
         seen[f["id"]] = s
+        if apply and f["code"] == "load_high" and now - s["since"] < LOAD_HIGH_SUSTAINED_S:
+            continue  # a spike is not a sustained overload
+        if apply and s["runs"] < REPORT_AFTER.get(f["code"], 1):
+            continue  # seen, not yet reported
         f["since"] = iso(s["since"])
+        if f["code"] == "tailscale_no_route" and not runner:  # reported only: no restart off a CI runner mini
+            findings.append(f)
+            continue
+        if f["code"] == "tailscale_no_route":  # its own gates and 6 h window, not HEALS' tries
+            route_healed = True
+            f, done_heal, fixed = heal_tailscale_route(mini, f, now, s["runs"], apply, heal_ok,
+                                                       restart_state_path(state_path), s["since"])
+            if done_heal:
+                heals.append(done_heal)
+            if fixed:
+                healed.append({"id": f["id"], "code": f["code"], "t": now, "at": iso(now), "since": f["since"],
+                               "evidence": f["evidence"], "action": done_heal["action"], "auto_fix": "done"})
+                seen.pop(f["id"], None)
+                continue
+            findings.append(f)
+            continue
+        if f["code"] in ("claude_route", "claude_missing") and tunnel_down:
+            # claude_missing's heal ends in a route probe: neither installs nor reroutes until the tunnel is back
+            f["note"] = (f"not {'rerouted' if f['code'] == 'claude_route' else 'installed'} while the tunnel is down "
+                         f"({', '.join(sorted(TUNNEL_DOWN))}): the route may answer once Tailscale is back")[:300]
+            findings.append(f)
+            continue
         heal = HEALS.get(f["code"])
         t = tries.get(f["id"]) or {"n": 0, "at": 0}
         # a heal that worked and did not last (a runner that exits again) counts too, so nothing loops for a day
@@ -658,9 +3056,26 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 f["note"] = f"healing is off ({KILL_SWITCH})"
         findings.append(f)
     ids = {f["id"] for f in findings}
-    seen = {k: v for k, v in seen.items() if k in ids}
+    if apply and runner and not route_healed:
+        # clear: no finding about the tunnel, or a CLI that timed out while the route itself was on a utun
+        codes = {f["code"] for f in found}
+        route_clear = "tailscale_no_route" not in codes and (mini.route_on_tunnel or "tailscale_probe_error" not in codes)
+        capped = drain_housekeeping(mini, now, heal_ok, drain_state_path(state_path), route_clear)
+        for f in findings:
+            if capped and f["code"] == "tailscale_probe_error":
+                f["auto_fix"], f["note"] = "impossible", f"{f.get('note', '')}; {capped}"[:300]
+    # a CLI that gave no BackendState never looked at the route: tailscale_no_route's count neither grows nor
+    # starts again (cmuxs-mac-mini-5, 2026-10-26: a 15 s status timeout every other run kept it at 1 for hours)
+    # (a probe error whose route lookup named a utun did look: the route is clear, so the count starts again)
+    unlooked = ({"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found)
+                and not mini.route_on_tunnel else set())
+    seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found} | unlooked}
     tries = {k: v for k, v in tries.items() if k in ids}
-    report = {"schema": SCHEMA, "at": iso(now), "findings": findings, "healed": healed[-HEALED_MAX:]}
+    report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
+              "healed": sorted(healed + getattr(mini, "daemon_healed", []) +
+                               (gate_restarts_healed(getattr(mini, "home", None), now) if runner else []),
+                               key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
+              "ota": ota_summary(mini.ota_converge())}
     if apply:
         write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
         write_json(report_path, report)
@@ -675,8 +3090,32 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     mini = Mini()
     if not mini.runner_dirs():
+        # No runner report here, but the daemon healer serves every macOS host (the AWS dev-build hosts too).
+        stale = [f for f in check_daemon_heal(mini) if f["code"] == "daemon_heal_stale"]
+        last = load_json(NO_RUNNER_HEAL).get("at") or 0
+        due = time.time() - last >= HEAL_EVERY_S  # the same pace as a runner host's heals
+        healed = None
+        if args.apply and stale and stale[0]["auto_fix"] == "pending" and due and not KILL_SWITCH.exists():
+            healed = heal_daemon_heal(mini, stale[0])
+            write_json(NO_RUNNER_HEAL, {"at": time.time(), "ok": healed[0], "action": healed[1]})
+        # A capture-only mini still runs Claude for its captures: its route is checked and healed, and the
+        # report is written where capture-host reads it.
+        claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
+                      runner=False) if mini.claude_bin() or check_claude_missing(mini) else None)
+        # without Claude there is no report to write, but a hand-made runner is still said
+        foreign = check_foreign_runners(mini) + check_unmanaged_services(mini) if claude is None else []
+        if foreign and args.apply:
+            for f in foreign:
+                print(json.dumps({"finding": f["id"], "evidence": f["evidence"]}, separators=(",", ":")), flush=True)
+        heals = ([{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}] if healed else []) \
+            + (claude["heals"] if claude else [])
         if not args.apply:
-            print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host"}))
+            print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
+                              "findings": [f["id"] for f in stale + foreign]
+                              + [f["id"] for f in (claude or {}).get("findings", [])]}))
+        elif heals or (claude and claude["changed"]):
+            print(json.dumps({"findings": [f["id"] for f in (claude or {}).get("findings", [])], "heals": heals},
+                             separators=(",", ":")), flush=True)
         return 0
     report = run(mini, args.apply, heal_ok=not KILL_SWITCH.exists())
     if not args.apply:

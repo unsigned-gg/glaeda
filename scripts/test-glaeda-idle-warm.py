@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +108,66 @@ class GateTest(Base):
         unpinned = self.runner("actions-runner-glaeda-5", "--capacity-units 4")
         self.assertEqual(warm.runner_setup([unpinned]), "no toolchain Xcode pin in the runner hooks")
 
+    def test_a_catch_up_keeps_the_nightly_builders_reserve(self) -> None:
+        # The runners' own hook says where the reserve is: a dedicated builder's 40 GiB floor + 20 GiB growth.
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.runner("actions-runner-glaeda-nightly-next", "--min-free-gib 40 --dedicated-admit /admit.sh")
+        self.assertEqual(hook.builder_reserve_gib(self.dir), 40)
+        gib = 1024 ** 3
+        warm.free_bytes = lambda path: 31 * gib  # cmux7s on 2026-10-28
+        why = warm.nightly_reserve_refusal(hook)
+        self.assertIn("31.0 GiB free", why)
+        self.assertIn("40 GiB floor + 20 GiB", why)
+        warm.free_bytes = lambda path: 59 * gib
+        self.assertIn("59.0 GiB free", warm.nightly_reserve_refusal(hook))
+        warm.free_bytes = lambda path: 61 * gib
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "")
+        warm.free_bytes = lambda path: None
+        self.assertIn("under the dedicated nightly builder", warm.nightly_reserve_refusal(hook), "unknown is short")
+        # A nightly job freeing disk here goes first, whatever is free.
+        warm.free_bytes = lambda path: 400 * gib
+        waiting = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: "build-nightly-app",
+                                        builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("a nightly job waits here for free disk (build-nightly-app)", warm.nightly_reserve_refusal(waiting))
+
+    def test_a_reserve_that_cannot_be_read_keeps_the_catch_up_off(self) -> None:
+        def broken() -> float:
+            raise OSError("transient")
+        for bad in (types.SimpleNamespace(builder_reserve_gib=lambda home: broken(), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: float("nan"), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: -1.0)):
+            self.assertIsNone(warm.nightly_reserve(bad))
+            self.assertIn("cannot read the dedicated nightly builder's disk reserve", warm.nightly_reserve_refusal(bad))
+        waiter_broken = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: broken(),
+                                              builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("cannot read the nightly disk waiters", warm.nightly_reserve_refusal(waiter_broken))
+        # The hook's own reader takes an unreadable capacity directory for no waiter; a catch-up does not.
+        quiet = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: None,
+                                      builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertEqual(warm.nightly_reserve_refusal(quiet), "", "no capacity directory yet: nothing waits")
+        (warm.FLEET_DIR / "capacity").mkdir(parents=True, exist_ok=True)
+        with unittest.mock.patch.object(warm.os, "scandir", side_effect=PermissionError("denied")):
+            self.assertIn("cannot read the nightly disk waiters (PermissionError)", warm.nightly_reserve_refusal(quiet))
+
+    def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
+        warm.free_bytes = lambda path: 1024 ** 3
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "", "no dedicated builder: disk-pressure's job alone")
+        self.assertEqual(warm.nightly_reserve(types.SimpleNamespace()), (0.0, 0.0))
+        self.assertEqual(warm.nightly_reserve_refusal(types.SimpleNamespace()), "")
+
+    def test_idle_refusal_answers_with_the_reserve(self) -> None:
+        saved = warm.compile_state, warm.nightly_reserve_refusal
+        stub = types.SimpleNamespace(thermal_pressure_level=lambda: 0)
+        try:
+            warm.running = lambda: ""
+            warm.compile_state = lambda now=None: (None, "")
+            warm.nightly_reserve_refusal = lambda hook_module: "31.0 GiB free, under the reserve"
+            with unittest.mock.patch.object(warm.os, "getloadavg", return_value=(0.0, 0.0, 0.0)):
+                self.assertEqual(warm.idle_refusal(stub, 5000.0, self.state), "31.0 GiB free, under the reserve")
+        finally:
+            warm.compile_state, warm.nightly_reserve_refusal = saved
+
     def test_last_job_reads_the_telemetry_tail(self) -> None:
         log = self.dir / "jobs.jsonl"
         self.assertIsNone(warm.last_job_at(log))
@@ -164,7 +225,10 @@ class GateTest(Base):
                 return subprocess.CompletedProcess(args, 0)
             warm.subprocess.run = fetch
             self.assertEqual(warm.main_head(self.state), "b" * 40)
-            self.assertIn("+refs/heads/main:refs/remotes/origin/main", calls[0])
+            # NEXT's tip, not classic main (Leo, 2026-11-12: "this one just keeps building that shit").
+            self.assertEqual(warm.BRANCH, "feat-cmux-next")
+            self.assertIn("+refs/heads/feat-cmux-next:refs/remotes/origin/feat-cmux-next", calls[0])
+            self.assertNotIn("+refs/heads/main:refs/remotes/origin/main", calls[0])
             # Up to date, or GitHub unreachable: no fetch, the mirror's head.
             self.assertEqual(warm.main_head(self.state), "b" * 40)
             warm.remote_head = lambda: ""
@@ -217,12 +281,13 @@ class AttemptTest(Base):
 
 class LedgerTest(Base):
     def test_take_holds_a_compile_worth_of_locks_and_names_them(self) -> None:
-        scope = {"units": 4, "roots": 2, "compile_slots": 2, "xcode": ""}
+        scope = {"units": 14, "roots": 2, "compile_slots": 2, "xcode": ""}
         (self.dir / "fleet" / "host.lock").touch()
         taken = warm.take(hook, self.capacity, scope, 2)
         self.assertIsInstance(taken, tuple, taken)
         fds, held = taken
-        self.assertEqual(held, ["root-2", "persistent-dd", "unit-0", "unit-1"])
+        self.assertEqual(held, ["root-2", "persistent-dd", *[f"unit-{n}" for n in range(hook.CLASS_COST["compile"][0])]],
+                         "a compile's cores: 5 of the mini's 14")
         holder = json.loads((self.capacity / "idle-warm.json").read_text())
         self.assertEqual(holder, {"pid": os.getpid(), "held": held, "root": 2})
         # the flocks are real: another taker (a job's admission) finds them taken
@@ -313,6 +378,123 @@ class RunTest(Base):
         paused = warm.run(True, self.state)
         self.assertEqual(paused["state"], "skip")
         self.assertIn("paused", paused["reason"])
+
+    def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None,
+                      no_ps: str = "", waiter: str = "None") -> dict:
+        """build() in a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends
+        the fake build's `sleep` grandchild too; asserts no `sleep SLEEP` is left."""
+        driver = self.dir / "glaeda-idle-warm-watch-driver.py"
+        driver.write_text(textwrap.dedent(f"""
+            import importlib.machinery, importlib.util, json
+            from pathlib import Path
+            loader = importlib.machinery.SourceFileLoader("w", {os.fspath(ROOT / 'scripts' / 'glaeda-idle-warm')!r})
+            spec = importlib.util.spec_from_loader("w", loader)
+            warm = importlib.util.module_from_spec(spec)
+            loader.exec_module(warm)
+            warm.FLEET_DIR = Path({os.fspath(self.dir / 'fleet')!r})
+            warm.BUILD_DISK_WATCH_S = 0.2
+            if {timeout_s!r} is not None:
+                warm.BUILD_TIMEOUT_S = {timeout_s!r}
+            warm.free_bytes = lambda path: {free}
+            mode = {no_ps!r}
+            if mode:
+                real_popen = warm.subprocess.Popen
+                def no_ps(args, *rest, **kwargs):
+                    if not (args and args[0] == "/bin/ps"):
+                        return real_popen(args, *rest, **kwargs)
+                    if mode == "spawn":
+                        raise OSError("ps failed")
+                    if mode == "exit":  # ps runs, lists nothing and fails
+                        return real_popen(["/bin/sh", "-c", "exit 1"], *rest, **kwargs)
+                    proc = real_popen(args, *rest, **kwargs)
+                    def broken(*a, **k):
+                        raise OSError("read failed")
+                    proc.communicate = broken
+                    if mode == "stuck":  # a ps that is never reaped
+                        def never(timeout=None):
+                            if timeout is None:
+                                raise AssertionError("an unbounded wait on ps")
+                            raise warm.subprocess.TimeoutExpired(args, timeout)
+                        proc.wait = never
+                    return proc
+                warm.subprocess.Popen = no_ps
+            warm._grouped = warm.own_group()
+            assert warm._grouped
+            print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
+                                        Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3,
+                                        nightly_waiter={waiter})))
+        """))
+        proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "FAKE_SLEEP": sleep})
+        time.sleep(0.2)
+        leftover = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {sleep}$"], capture_output=True, text=True).stdout
+        self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
+        if no_ps:
+            return {"returncode": proc.returncode}
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_finished_build_whose_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        for mode in ("spawn", "read", "stuck", "exit"):
+            with self.subTest(ps=mode):
+                result = self.grouped_build(self.fake_setup() if mode == "spawn" else self.state / ".catch-up" / "cmux",
+                                            "100 * 1024 ** 3", "0", no_ps=mode)
+                self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_nightly_job_waiting_for_disk_stops_the_build(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "143",
+                                    waiter="lambda: 'a nightly job waits here for free disk (build-nightly-app)'")
+        self.assertEqual(result["kept"], "false")
+        self.assertEqual(result["reason"], "stopped: a nightly job waits here for free disk (build-nightly-app)")
+
+    def test_the_reserve_is_read_again_once_the_locks_are_taken(self) -> None:
+        # A nightly waiter that appears between the idle check and the locks keeps the build from starting.
+        if sys.platform != "darwin":
+            return
+        self.fake_setup()
+        calls = []
+        def refusal(hook_module):
+            calls.append(1)
+            return "a nightly job waits here for free disk (late)"
+        saved = warm.nightly_reserve_refusal
+        try:
+            warm.nightly_reserve_refusal = refusal
+            done = warm.run(True, self.state)
+        finally:
+            warm.nightly_reserve_refusal = saved
+        self.assertEqual((done["state"], done["reason"]), ("skip", "a nightly job waits here for free disk (late)"))
+        self.assertTrue(calls)
+        self.assertFalse((self.dir / "calls").exists(), "no build started")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        # ps fails: the group cannot be seen empty, so the catch-up ends its whole group, itself included.
+        result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps="spawn")
+        self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_build_under_the_builders_floor_is_stopped(self) -> None:
+        checkout = self.fake_setup()
+        started = time.monotonic()
+        result = self.grouped_build(checkout, "39 * 1024 ** 3", "131")
+        self.assertLess(time.monotonic() - started, 30, "stopped long before the fake build ends")
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("stopped at 39.0 GiB free, under the dedicated nightly builder's 40 GiB floor", result["reason"])
+        self.assertEqual(self.grouped_build(checkout, "100 * 1024 ** 3", "0")["kept"], "true",
+                         "room to spare: the build finishes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_watched_build_still_times_out(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "133", timeout_s=1)
+        self.assertEqual((result["kept"], result["reason"]), ("false", "timed out after 1 s"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_unknown_free_disk_stops_the_whole_build_group(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "None", "137")
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("cannot read free disk", result["reason"])
 
     def test_kill_switch_and_no_owned_state(self) -> None:
         if sys.platform != "darwin":
@@ -765,6 +947,57 @@ class FuzzTest(Base):
         self.assertFalse(hook.pid_alive(app_pid), "the app is gone")
 
 
+class EngineFloorTest(Base):
+    """A build older than cmux#48852 runs the engine at the floor, never its own: its engine opens a world-writable
+    /tmp/cmux-debug-<tag>.sock that the signing-guest check refuses (a guest worker, 2026-11-22)."""
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(self.repo), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, app: str) -> str:
+        (self.repo / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").write_text(app, encoding="utf-8")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved["ENGINE_FLOOR"] = warm.ENGINE_FLOOR
+        self.repo = self.state / ".catch-up" / "cmux"
+        (self.repo / "scripts").mkdir(parents=True)
+        (self.repo / "dogfood" / "fuzz" / "cmuxfuzz").mkdir(parents=True)
+        (self.repo / "scripts" / "fuzz").write_text("#!/bin/sh\n", encoding="utf-8")
+        self.git("init", "-q")
+        self.old = self.commit("SOCK = '/tmp/cmux-debug-{tag}.sock'\n")
+        warm.ENGINE_FLOOR = self.commit("path = tempfile.mkdtemp(prefix='cmux-fuzz-')\n")
+        self.new = self.commit("path = tempfile.mkdtemp(prefix='cmux-fuzz-')  # newer\n")
+        os.environ.pop("GLAEDA_IDLE_FUZZ_ENGINE", None)
+
+    def test_an_old_build_runs_the_floor_engine_and_a_new_one_its_own(self) -> None:
+        engines = warm.fuzz_dir() / "engines"
+        self.assertEqual(warm.stage_engine(self.state, self.old), engines / warm.ENGINE_FLOOR)
+        self.assertIn("mkdtemp", (engines / warm.ENGINE_FLOOR / "dogfood/fuzz/cmuxfuzz/app.py").read_text())
+        self.assertFalse((engines / self.old).exists(), "the old engine is never exported")
+        self.assertEqual(warm.stage_engine(self.state, self.new), engines / self.new)
+        self.assertIn("newer", (engines / self.new / "dogfood/fuzz/cmuxfuzz/app.py").read_text())
+
+    def test_an_old_engine_staged_before_the_fix_is_never_run(self) -> None:
+        stale = warm.fuzz_dir() / "engines" / self.old
+        (stale / "dogfood" / "fuzz" / "cmuxfuzz").mkdir(parents=True)
+        (stale / "scripts").mkdir()
+        (stale / "scripts" / "fuzz").write_text("", encoding="utf-8")
+        (stale / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").write_text("SOCK = '/tmp/x.sock'\n", encoding="utf-8")
+        (stale / ".complete").write_text(self.old + "\n", encoding="utf-8")
+        self.assertEqual(warm.stage_engine(self.state, self.old), warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR)
+        self.git("checkout", "-q", "--detach", self.old)
+        broken = self.state / ".catch-up" / "cmux" / ".git"
+        broken.rename(broken.with_name("git.off"))  # no repo can export: only a kept engine at the floor may run
+        self.assertEqual(warm.stage_engine(self.state, "f" * 40), warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR)
+        (warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR / "dogfood/fuzz/cmuxfuzz/app.py").write_text("old\n")
+        self.assertIsNone(warm.stage_engine(self.state, "f" * 40), "the stale engine is no fallback")
+
+
 class TrimTest(Base):
     def test_runs_a_preemption_cut_short_are_trimmed_once_old(self) -> None:
         runs = self.dir / "runs"
@@ -788,12 +1021,119 @@ class TrimTest(Base):
 
 
 class CheckoutTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Never the host's own git mirror (a mini running this suite has one at FLEET_DIR/git).
+        saved = os.environ.get("GLAEDA_GIT_MIRROR_DIR")
+        self.addCleanup(lambda: os.environ.__setitem__("GLAEDA_GIT_MIRROR_DIR", saved) if saved is not None
+                        else os.environ.pop("GLAEDA_GIT_MIRROR_DIR", None))
+        self.mirror_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.mirror_tmp.cleanup)
+        os.environ["GLAEDA_GIT_MIRROR_DIR"] = os.path.join(self.mirror_tmp.name, "git")
+
+    def source_repo(self, source: Path) -> str:
+        run = lambda *args: subprocess.run(["git", *args], cwd=source, check=True, capture_output=True)
+        source.mkdir()
+        run("init", "-q", "-b", warm.BRANCH)
+        run("config", "uploadpack.allowFilter", "true")
+        for text in ("zero\n", "one\n"):
+            (source / "a.txt").write_text(text * 2000)
+            run("add", "a.txt")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", text.strip())
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def make_mirror(self, source: Path) -> Path:
+        mirror = Path(os.environ["GLAEDA_GIT_MIRROR_DIR"]) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(source), os.fspath(mirror)], check=True,
+                       capture_output=True)
+        (mirror / "glaeda-verified").write_text("")
+        return mirror
+
+    def checkout_with(self, source: Path, work: Path, head: str) -> None:
+        saved, saved_depth = warm.REPO_URL, warm.CLONE_DEPTH
+        warm.CLONE_DEPTH, warm.REPO_URL = 1, source.as_uri()
+        try:
+            warm.prepare_checkout(work, head)
+        finally:
+            warm.REPO_URL, warm.CLONE_DEPTH = saved, saved_depth
+
+    @staticmethod
+    def own_blobs(checkout: Path) -> int:
+        """Blobs in the checkout's own object store (packs and loose), not what its alternates serve."""
+        count = 0
+        for idx in sorted((checkout / ".git" / "objects" / "pack").glob("*.idx")):
+            out = subprocess.run(["git", "verify-pack", "-v", os.fspath(idx)], cwd=checkout, capture_output=True,
+                                 text=True).stdout
+            count += sum(1 for line in out.splitlines() if " blob " in line)
+        for sub in (checkout / ".git" / "objects").glob("[0-9a-f][0-9a-f]"):
+            for obj in sub.iterdir():
+                kind = subprocess.run(["git", "cat-file", "-t", sub.name + obj.name], cwd=checkout,
+                                      capture_output=True, text=True).stdout.strip()
+                count += kind == "blob"
+        return count
+
+    def test_the_checkout_borrows_the_minis_git_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            head = self.source_repo(source)
+            mirror = self.make_mirror(source)
+            work.mkdir()
+            self.checkout_with(source, work, head)
+            checkout = work / "cmux"
+            git_dir = checkout / ".git"
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+            self.assertEqual((git_dir / "objects/info/alternates").read_text().strip(),
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(json.loads((git_dir / warm.BORROW_RECORD).read_text())["objects"],
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(self.own_blobs(checkout), 0, "the checked-out blob is read from the mirror")
+            # A rebuilt mirror (a reseed is a new directory) may lack what the checkout relied on: start over.
+            mirror.rename(mirror.with_name("old.git"))  # held aside, so the new one cannot reuse its inode
+            self.make_mirror(source)
+            (checkout / "marker").write_text("old clone")
+            self.checkout_with(source, work, head)
+            self.assertFalse((checkout / "marker").exists())
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+            self.assertEqual(self.own_blobs(checkout), 0)
+            # The mirror gone: the clone that borrowed it starts over from GitHub and borrows nothing.
+            warm.shutil.rmtree(mirror)
+            self.checkout_with(source, work, head)
+            self.assertFalse((git_dir / "objects/info/alternates").exists())
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+
+    def test_a_clone_made_before_the_mirror_borrows_it_and_drops_its_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            head = self.source_repo(source)
+            work.mkdir()
+            self.checkout_with(source, work, head)  # no mirror yet
+            checkout = work / "cmux"
+            self.assertGreater(self.own_blobs(checkout), 0)
+            mirror = self.make_mirror(source)
+            self.checkout_with(source, work, head)
+            self.assertEqual((checkout / ".git/objects/info/alternates").read_text().strip(),
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(self.own_blobs(checkout), 0, "repack -a -d -l dropped what the mirror holds")
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+
+    def test_only_a_verified_mirror_is_borrowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            self.source_repo(source)
+            mirror = self.make_mirror(source)
+            self.assertIsNotNone(warm.mirror_identity(mirror))
+            (mirror / "glaeda-repair-pending").write_text("")
+            self.assertIsNone(warm.mirror_identity(mirror))
+            (mirror / "glaeda-repair-pending").unlink()
+            (mirror / "glaeda-verified").unlink()
+            self.assertIsNone(warm.mirror_identity(mirror))
+
     def test_first_clone_is_shallow_blobless_and_checks_out_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source, work = Path(tmp) / "source", Path(tmp) / "work"
             run = lambda *args, cwd=source: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
             source.mkdir()
-            run("init", "-q", "-b", "main")
+            run("init", "-q", "-b", warm.BRANCH)  # the branch the catch-up fetches
             run("config", "uploadpack.allowFilter", "true")
             for text in ("zero\n", "one\n"):  # two commits, so a depth-1 clone is shallow
                 (source / "a.txt").write_text(text)

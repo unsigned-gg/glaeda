@@ -380,17 +380,19 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
                 raise BundleError("saved generation differs from the pinned candidate")
         # Enumerate only the four owned directories with an explicit entry cap.
         # Extra code or bytecode cannot silently become part of a checked generation.
-        for prefix, fd in {"": generation, **directories}.items():
-            required = ({name for name in expected if "/" not in name} | set(directories)
-                        if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
-            found = set()
-            with os.scandir(fd) as entries:
-                for entry in entries:
-                    found.add(entry.name)
-                    if len(found) > len(required):
-                        raise BundleError("saved generation contains unexpected entries")
-            if found != required:
-                raise BundleError("saved generation inventory changed")
+        def check_inventory() -> None:
+            for prefix, fd in {"": generation, **directories}.items():
+                required = ({name for name in expected if "/" not in name} | set(directories)
+                            if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
+                found = set()
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        found.add(entry.name)
+                        if len(found) > len(required):
+                            raise BundleError("saved generation contains unexpected entries")
+                if found != required:
+                    raise BundleError("saved generation inventory changed")
+        check_inventory()
         observed_parent = private_parent(destination.parent)
         try:
             fresh, original = os.fstat(observed_parent), os.fstat(parent)
@@ -398,6 +400,17 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
                 raise BundleError("saved generation parent moved")
         finally:
             os.close(observed_parent)
+        # File and directory times miss a change made within one coarse filesystem clock tick (Linux): a same-size
+        # rewrite or a new entry can leave every stat field as it was. Read every file and enumerate
+        # again, before the identity checks below, which come last.
+        for name, before in observations.items():
+            parts = name.split("/")
+            directory = directories[parts[0]] if len(parts) == 2 else generation
+            data = raw if name == "candidate.tar.gz" else expected[name]
+            again, _ = read_generation_file(directory, parts[-1], len(data), stat.S_IMODE(before.st_mode))
+            if again != data:
+                raise BundleError("saved generation file changed during inspection")
+        check_inventory()
         for name, fd, parent_fd in [(destination.name, generation, parent),
                                    *((name, fd, generation) for name, fd in directories.items())]:
             named, held = os.stat(name, dir_fd=parent_fd, follow_symlinks=False), os.fstat(fd)
@@ -421,15 +434,18 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
         os.close(parent)
 
 
-def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
+def build(root: Path, expected_source: str, target: str, output: Path, binary: Path | None = None) -> dict:
     source = source_identity(root, expected_source)
     toolchain = command(root, ["rustc", "-Vv"]).decode().strip()
     if f"host: {target}" not in toolchain.splitlines() or target not in TARGETS:
         raise BundleError("candidate build requires a supported native target")
-    build_root = root / "target/fleet-candidate-build"
-    command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda", "--target", target, "--target-dir", str(build_root)], capture=False)
+    if binary is None:
+        build_root = root / "target/fleet-candidate-build"
+        command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda", "--target", target, "--target-dir", str(build_root)], capture=False)
+        binary = build_root / target / "release/glaeda"
+    # --binary: release.yml's glaeda, built once per Rust inputs (scripts/release_build_cache.py)
     payload = {name: file_bytes(root / name) for name in FILES}
-    payload["bin/glaeda"] = file_bytes(build_root / target / "release/glaeda")
+    payload["bin/glaeda"] = file_bytes(binary)
     payload["THIRD_PARTY_NOTICES.txt"] = notices(root, target)
     manifest = {
         "schema": SCHEMA, "source": source, "target": target,
@@ -457,6 +473,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build")
     b.add_argument("--output", type=Path, required=True)
+    b.add_argument("--binary", type=Path, help="a glaeda built from this source's Rust inputs, instead of cargo build")
     v = sub.add_parser("verify")
     v.add_argument("archive", type=Path)
     v.add_argument("--sha256", required=True)
@@ -474,7 +491,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "build":
-            result = build(Path(__file__).resolve().parents[1], args.source, args.target, args.output)
+            result = build(Path(__file__).resolve().parents[1], args.source, args.target, args.output, args.binary)
         elif args.command == "inspect":
             result = inspect_generation(args.directory, args.sha256, args.source, args.target)
         elif args.command == "stage":

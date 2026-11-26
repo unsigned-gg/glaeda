@@ -174,16 +174,19 @@ def verified_contents(raw: bytes, expected_digest: str, source: str, target: str
         raise BundleError("fleet-CAS archive or manifest is malformed") from error
 
 
-def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
+def build(root: Path, expected_source: str, target: str, output: Path, binary: Path | None = None) -> dict:
     source = source_identity(root, expected_source)
     if target not in TARGETS:
         raise BundleError("unsupported fleet-CAS target")
     toolchain = command(root, ["rustc", "-Vv"]).decode().strip()
     if f"host: {target}" not in toolchain.splitlines():
         raise BundleError("fleet-CAS build requires a native supported target")
-    build_root = root / "target/fleet-cas-bundle-build"
-    command(root, ["cargo", "build", "--locked", "--release", "--manifest-path", "tools/fleet-cas-prototype/Cargo.toml", "--target", target, "--target-dir", str(build_root)], capture=False)
-    files = {"fleet-cas": read_file(build_root / target / "release/fleet-cas")}
+    if binary is None:
+        build_root = root / "target/fleet-cas-bundle-build"
+        command(root, ["cargo", "build", "--locked", "--release", "--manifest-path", "tools/fleet-cas-prototype/Cargo.toml", "--target", target, "--target-dir", str(build_root)], capture=False)
+        binary = build_root / target / "release/fleet-cas"
+    # --binary: release.yml's fleet-cas, built once per Rust inputs (scripts/release_build_cache.py)
+    files = {"fleet-cas": read_file(binary)}
     for name in FILES[1:]:
         files[name] = read_file(root / "tools/fleet-cas-prototype/scripts" / name)
     if source_identity(root, expected_source) != source:
@@ -270,12 +273,12 @@ def stage(archive: Path, destination: Path, source: str, target: str, expected_d
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    b = sub.add_parser("build"); b.add_argument("--source", required=True); b.add_argument("--target", required=True); b.add_argument("--output", type=Path, required=True); b.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    b = sub.add_parser("build"); b.add_argument("--source", required=True); b.add_argument("--target", required=True); b.add_argument("--output", type=Path, required=True); b.add_argument("--binary", type=Path, help="a fleet-cas built from this source's Rust inputs, instead of cargo build"); b.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     v = sub.add_parser("verify"); v.add_argument("archive", type=Path); v.add_argument("--source", required=True); v.add_argument("--target", required=True); v.add_argument("--sha256", required=True, help="SHA-256 from the authenticated release.json asset entry")
     s = sub.add_parser("stage"); s.add_argument("archive", type=Path); s.add_argument("--source", required=True); s.add_argument("--target", required=True); s.add_argument("--sha256", required=True, help="SHA-256 from the authenticated release.json asset entry"); s.add_argument("--destination", type=Path, required=True); s.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     try:
-        if args.command == "build": result = build(args.root, args.source, args.target, args.output)
+        if args.command == "build": result = build(args.root, args.source, args.target, args.output, args.binary)
         elif args.command == "verify":
             raw = read_file(args.archive, MAX_ARCHIVE)
             result = {"state": "verified", **verified_contents(raw, args.sha256, args.source, args.target)[0]}

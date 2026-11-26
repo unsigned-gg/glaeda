@@ -3,27 +3,56 @@
 
     glaeda-fleet-cas-prune                 plan: sizes, budgets, what would go
     glaeda-fleet-cas-prune --apply         prune (the hourly LaunchAgent from glaeda-mini-setup)
+    glaeda-fleet-cas-prune --apply --store-gc-only
+                                           only the fleet-store gc: the store host's own hourly agent
+                                           (glaeda-fleet-cas store with a custom store root, such as
+                                           the coordinator's external SSD), which has no mini caches
+    glaeda-fleet-cas-prune --apply --node-only
+                                           only the node-store cap (glaeda-disk's pressure passes, which run
+                                           before every job and under the runner floor)
+    glaeda-fleet-cas-prune --apply --cap-only --node-gib N --local-cas-gib N
+                                           only the two caps: the node store under N and a reader's local
+                                           CAS whole once over N, under the local CAS's own in-use rules; no
+                                           sweep, no fleet-store gc (glaeda-disk's pressure pass while the
+                                           volume's build caches are over their budget). When ps fails the
+                                           node cap still holds and the local CAS waits for the next pass.
 
 Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODES.md):
 
   cas         Xcode's own local CAS. The node does not manage it and its layout is Xcode's, so
-              it only ever goes whole, once it is over --local-cas-gib. On a reader it only
+              it only ever goes whole, once it is over --local-cas-gib (20): its standalone
+              files (v8.<offset>.leaf) are named from v8.index, so removing one alone would leave
+              the index naming an object that is gone. It goes while nothing has it open (no
+              process holds its `lock` file, which LLVM's on-disk CAS holds shared while open)
+              and the host lock is free, and either no build runs, or it is idle: nothing in it
+              was written or read in the last --local-cas-quiet-min minutes (60), nor since the
+              oldest running build started, so no running build has used it. (hq#11385: cmux9s
+              always runs unrelated runner jobs, so "no build runs" never held there and its CAS
+              sat at 29 GiB over the 20 GiB cap, under the disk floor.) On a reader it only
               speeds up repeat builds (everything in it comes back from the node); the writer
               empties it at the start of every writer build, so the writer's is left alone.
   node-store  the node daemon's cache of the fleet store: one file per object (cas/) or index
               entry (kv/), named by hash in two-hex-digit shards. Any file may go: a missing one
               is fetched again, and its signature re-verified, on the next lookup. Oldest mtime
-              goes first until the store is under 90% of --node-gib. stats.json stays. The
-              writer's node store must stay consistent with the fleet store, so it is never
-              pruned here.
+              goes first until the store is under 90% of --node-gib. stats.json stays. It is a
+              hard cap: it holds while builds run (on a busy mini a build always runs, and
+              cmux15's writer store reached 73 GiB, 2026-10-26). Removing a file mid-build is a
+              cache miss, never a wrong result: a missing object is fetched again from the fleet
+              store and its ID recomputed from the bytes (get_or_fetch), or the build compiles; a
+              reader's index entries are signed by the writer and fetched again the same way.
+              On the writer only cas/ objects go, which are content-addressed and written through
+              before they are acknowledged. Its kv/ index entries stay: the fleet store keeps the
+              first value for a key, so a writer that lost its own entry and computed another
+              would then serve a value the fleet store does not hold (kv_put).
 
-A missing index entry in the middle of a build means a compile, so nothing is deleted while a
-build can be running: the run is skipped (exit 0, "deferred") while any xcodebuild, Xcode build
-service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked out without any lock;
-only the deletes run under the fleet host lock (host.lock, the same flock with-host-lock and the
-runner hook take), taken without waiting, after checking for a build once more. Holding it
-refuses new jobs and takes idle listeners offline (#1206), so it is held only for a rename and
-the unlinks; the renamed local CAS is removed after the lock is released.
+A missing local CAS in the middle of a build that uses it breaks the build, so the local CAS goes
+only while no build can be using it: none of its lock files is held, and either no xcodebuild, Xcode
+build service or GitHub Actions Runner.Worker runs, or its newest mtime or atime is older than both
+the oldest such process's start and the quiet window. Sizes and the plan are worked out without any
+lock; the local CAS rename runs under the fleet host lock (host.lock, the same flock with-host-lock
+and the runner hook take) and the CAS's own lock files, all taken without waiting, after checking
+once more. Holding the host lock refuses new jobs and takes idle listeners offline (#1206), so it is held only for
+the rename; the renamed local CAS is removed after the lock is released.
 
 The fleet store (xcode/fleet-store, on the store host only) is pruned by `fleet-cas gc`, which
 knows which entries are still read (glaeda#1216): kept are entries used within --gc-keep-days,
@@ -31,13 +60,18 @@ everything they reach, and anything written in the last day. It runs at most onc
 this same hourly job, and always as a dry run first: the real run goes ahead only when the dry
 run reports 0 "kept entries naming no stored object" (the check of gc's object-ID heuristic),
 otherwise the numbers are logged and nothing is deleted. gc takes no lock: a race with the running
-store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. Prints one JSON line per run.
+store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. While the store's volume has under 15% free, gc keeps entries
+used within half of --gc-keep-days (at least 3) and may run every 6 hours instead of daily.
+Prints one JSON line per run.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import errno
+import importlib.machinery
+import importlib.util
 import fcntl
 import json
 import os
@@ -56,8 +90,63 @@ GIB = 1024**3
 BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
+# Standalone objects of the local CAS: written once, named from its index, many (96k on cmux9s), so the re-check
+# under the locks skips them (writing one also changes its directory's mtime, which is checked).
+CAS_STANDALONE = re.compile(r"\.\d+\.(?:leaf|leaf\+0|data)$")
 GC_EVERY = 86400  # seconds between fleet-store gc runs
+GC_EVERY_PRESSED = 6 * 3600  # ... while the store's volume is under GC_PRESSURE free
+GC_PRESSURE = 0.15
+GC_MIN_KEEP_DAYS = 3
 GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
+# Crash reports of the processes that load Xcode's CAS plugin (libToolchainCASPlugin.dylib).
+CRASH_REPORTS = Path(os.environ.get("GLAEDA_FLEET_CAS_CRASH_REPORTS",
+                                    os.path.expanduser("~/Library/Logs/DiagnosticReports")))
+CAS_CLIENTS = ("SWBBuildService", "XCBBuildService", "swift-frontend", "clang")
+CAS_PLUGIN = "libToolchainCASPlugin.dylib"
+CRASH_LOOKBACK = 7 * 86400  # crash reports older than this are not read
+
+
+def load_glaeda_disk(path: Path | None = None):
+    """glaeda-disk installed beside this script, as a module (registered in sys.modules, which its dataclasses need)."""
+    path = Path(__file__).with_name("glaeda-disk") if path is None else path
+    name = "glaeda_disk_for_prune"
+    loader = importlib.machinery.SourceFileLoader(name, os.fspath(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    gd = importlib.util.module_from_spec(spec)
+    sys.modules[name] = gd
+    try:
+        loader.exec_module(gd)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return gd
+
+
+def reserved_above_floor(gd=None) -> str:
+    """Why this host is left alone: a fleet reservation holds it (glaeda-disk's host_reservation, which fails closed)
+    and free disk is at or above its runner floor. "" when not."""
+    try:
+        gd = load_glaeda_disk() if gd is None else gd
+        why = gd.host_reservation()
+        floor = gd.runner_floor_gib()
+    except Exception as error:  # noqa: BLE001  (fail closed: no glaeda-disk to ask, so treat the host as reserved)
+        return f"cannot read fleet reservations ({type(error).__name__}); kept as reserved"
+    if not why:
+        return ""
+    free = shutil.disk_usage(ROOT if ROOT.is_dir() else Path.home()).free / GIB
+    return "" if floor > 0 and free < floor else f"{why}; {free:.0f} GiB free, floor {floor:g}"
+
+
+def toolchain_overlap(paths: list[Path], gd=None) -> str:
+    """Why none of PATHS may be pruned: one is at, inside or above the job toolchain (glaeda-disk toolchain_held: an
+    aliased node-store/cas or cas that leads into ~/.rustup or ~/.cargo/bin), or glaeda-disk cannot be asked (fail
+    closed). "" when every path is clear."""
+    try:
+        gd = load_glaeda_disk() if gd is None else gd
+        held = [os.fspath(p) for p in paths if gd.toolchain_held(p, fresh=True)]
+    except Exception as error:  # noqa: BLE001
+        return f"cannot check the job toolchain ({type(error).__name__}); nothing pruned"
+    return f"{', '.join(held)} overlaps the job toolchain; nothing pruned" if held else ""
 
 
 def busy(commands: list[str]) -> str:
@@ -65,6 +154,189 @@ def busy(commands: list[str]) -> str:
         if BUSY.search(c):
             return c.strip()[:160]
     return ""
+
+
+def parse_etime(text: str) -> int | None:
+    """ps's etime, [[dd-]hh:]mm:ss, in seconds; None when it is not that."""
+    days, _, rest = text.strip().rpartition("-")
+    parts = rest.split(":")
+    if not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts) or (days and not days.isdigit()):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return secs + int(days or 0) * 86400
+
+
+def build_starts(now: float | None = None) -> list[float] | None:
+    """When each running build (a BUSY process) started, or None when ps fails or an age cannot be read."""
+    now = time.time() if now is None else now
+    try:
+        out = subprocess.run(["ps", "-axww", "-o", "etime=,command="], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    starts = []
+    for line in out.stdout.splitlines():
+        etime, _, command = line.strip().partition(" ")
+        if not BUSY.search(command.strip()):
+            continue
+        secs = parse_etime(etime)
+        if secs is None:
+            return None
+        starts.append(now - secs)
+    return starts
+
+
+def last_touch(path: Path, quick: bool = False) -> float:
+    """The newest file mtime or atime, or directory mtime, under path (a directory's atime moves when this very walk
+    lists it, so it is not counted; a new object changes its directory's mtime). quick skips standalone objects."""
+    newest = 0.0
+    for dirpath, _, files in os.walk(path):
+        try:
+            newest = max(newest, os.lstat(dirpath).st_mtime)
+        except OSError:
+            pass
+        for name in files:
+            if quick and CAS_STANDALONE.search(name):
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime, st.st_atime)
+    return newest
+
+
+def cas_locks(local: Path) -> list[int] | None:
+    """Every `lock` file of the local CAS (cas/lock, cas/<name>/lock) taken exclusive without waiting, or None, with
+    none kept, when one is held: LLVM's on-disk CAS holds its lock shared while a process has it open."""
+    held: list[int] = []
+    for dirpath, dirs, files in os.walk(local):
+        if dirpath != os.fspath(local):
+            dirs[:] = []  # never down into the object directories
+        if "lock" not in files:
+            continue
+        try:
+            fd = os.open(os.path.join(dirpath, "lock"), os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            for h in held:
+                os.close(h)
+            return None
+        held.append(fd)
+    return held
+
+
+def idle_cutoff(starts: list[float], quiet_s: float, now: float | None = None) -> float:
+    """The local CAS is idle when nothing in it was touched at or after this: the oldest running build's start or
+    the start of the quiet window, whichever is earlier."""
+    now = time.time() if now is None else now
+    return min([now - quiet_s, *starts])
+
+
+def crash_time(report: Path) -> tuple[float, bool] | None:
+    """(when it crashed, whether the crashing thread was in Xcode's CAS plugin) for one .ips report, or None when it
+    cannot be read. The report's own timestamp, not its mtime: macOS rewrites old reports when it submits them."""
+    try:
+        header, _, body = report.read_text(errors="replace").partition("\n")
+        head, data = json.loads(header), json.loads(body)
+        when = datetime.datetime.strptime(head["timestamp"], "%Y-%m-%d %H:%M:%S.%f %z").timestamp()
+        thread = data["threads"][data.get("faultingThread", 0)]
+        images = data["usedImages"]
+        in_plugin = any((images[f["imageIndex"]].get("name") or "") == CAS_PLUGIN
+                        for f in thread.get("frames", []) if 0 <= f.get("imageIndex", -1) < len(images))
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):  # a partly written report
+        return None
+    return when, in_plugin
+
+
+def corrupt_local_cas(local: Path, reports: Path | None = None, now: float | None = None) -> str:
+    """Why the local CAS is corrupt, "" when nothing says so: an Xcode process crashed inside the CAS plugin after
+    the CAS was created. LLVM's on-disk CAS keeps its index in a memory-mapped file, so an unclean shutdown can leave
+    the index naming bytes that were never written; from then on every build that inserts there crashes with
+    "The Xcode build system has crashed" (cmux7s, 2026-11-10 to 11-17: 29 SWBBuildService crashes in
+    OnDiskHashMappedTrie::insertLazy, every trusted seed red), and the size budget never drops it because a build
+    that crashes never grows it."""
+    reports = CRASH_REPORTS if reports is None else reports
+    now = time.time() if now is None else now
+    try:
+        st = local.stat()
+    except OSError:
+        return ""
+    born = getattr(st, "st_birthtime", st.st_ctime)
+    newest = None
+    for client in CAS_CLIENTS:
+        for report in reports.glob(f"{client}*.ips"):
+            try:
+                if report.stat().st_mtime < max(born, now - CRASH_LOOKBACK):
+                    continue
+            except OSError:
+                continue
+            seen = crash_time(report)
+            # the report's own time, not its mtime, decides both the lookback and "after the CAS was made"
+            fresh = seen is not None and seen[1] and seen[0] > max(born, now - CRASH_LOOKBACK)
+            if fresh and (newest is None or seen[0] > newest[0]):
+                newest = (seen[0], report.name)
+    if newest is None:
+        return ""
+    return f"corrupt: {newest[1]} crashed in {CAS_PLUGIN} after the local CAS was created"
+
+
+def drop_local_cas(local: Path, building: str, quiet_s: float, corrupt: bool = False) -> tuple[str, Path | None]:
+    """Rename the local CAS aside when no build can be using it (the module docstring): (what happened, the renamed
+    path or None). Removing the renamed tree is the caller's, once every lock is released. A corrupt one goes
+    without the idle check: any build that touches it crashes, so a running build gains nothing from it, and its
+    lock still keeps a process that has it open from losing it mid-use."""
+
+    def not_idle(building: str, quick: bool) -> str:
+        """Why the CAS may be in use by a running build, "" when none runs or none has touched it."""
+        if not building:
+            return ""
+        starts = build_starts()
+        if starts is None:
+            return f"deferred: a build is running ({building}) and its start cannot be read"
+        cutoff = idle_cutoff(starts, quiet_s)
+        touched = last_touch(local, quick=quick)
+        if touched >= cutoff:
+            return (f"deferred: a build is running ({building}) and the local CAS was used "
+                    f"{max(0.0, time.time() - touched) / 60:.0f} min ago, at or after "
+                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(cutoff))}")
+        return ""
+
+    if not corrupt and (why := not_idle(building, quick=False)):  # the full walk, with no lock held: the slow part
+        return why, None
+    cas = cas_locks(local) if local.is_dir() else []
+    if cas is None:
+        return "deferred: a process has the local CAS open (it holds the CAS lock)", None
+    lock = None
+    try:
+        # While runner jobs run they each hold it shared, so an exclusive hold never comes on a busy mini (cmux9s,
+        # 2026-11-15: "deferred: a build holds the host lock" after #1998). Shared still keeps a fleet build
+        # (with-host-lock, exclusive) from starting until the rename is done, and fails while one runs.
+        lock = take_lock(HOST_LOCK, shared=bool(building))
+        if lock is None:
+            return "deferred: a build holds the host lock", None
+        again = running_commands()
+        if again is None:
+            return "deferred: a build started (ps failed)", None
+        if not corrupt and (why := not_idle(busy(again), quick=True)):
+            return why, None
+        if not local.is_dir():
+            return "removed", None
+        renamed = ROOT / f"{PRUNING}{os.getpid()}"
+        os.rename(local, renamed)
+        return "removed", renamed
+    finally:
+        if lock not in (None, -1):
+            os.close(lock)
+        for fd in cas:
+            os.close(fd)
 
 
 def running_commands() -> list[str] | None:
@@ -98,10 +370,18 @@ def tree_bytes(path: Path) -> int:
     return total
 
 
-def node_files(store: Path) -> list[tuple[float, int, str]]:
-    """(mtime, bytes, path) of every object and index entry; stats.json and anything else stays."""
+TMP_STALE_S = 6 * 3600  # a CAS temp file untouched this long belongs to no live write
+
+
+def node_files(store: Path, subs: tuple[str, ...] = ("cas", "kv")) -> list[tuple[float, int, str]]:
+    """(mtime, bytes, path) of every object (cas/) and index entry (kv/) under subs; stats.json and anything else
+    stays. A name with a dot is an in-flight write (the daemon writes name.tmp<pid>.<seq> and renames it when done,
+    as fleet-cas gc.rs skips them): unlinking one would fail that write and the build, so it is never counted or
+    removed while young. One untouched for TMP_STALE_S is a write an interrupted daemon left; it counts and goes
+    first."""
     out = []
-    for sub in ("cas", "kv"):
+    stale_before = time.time() - TMP_STALE_S
+    for sub in subs:
         for dirpath, _, files in os.walk(store / sub):
             for f in files:
                 p = os.path.join(dirpath, f)
@@ -109,13 +389,19 @@ def node_files(store: Path) -> list[tuple[float, int, str]]:
                     st = os.lstat(p)
                 except OSError:
                     continue
+                if "." in f:
+                    if st.st_mtime >= stale_before:
+                        continue  # in flight
+                    out.append((0.0, st.st_blocks * 512, p))  # abandoned: before every object
+                    continue
                 out.append((st.st_mtime, st.st_blocks * 512, p))
     return out
 
 
-def plan_node(files: list[tuple[float, int, str]], budget: int) -> list[tuple[float, int, str]]:
-    """Oldest first until the rest fits in 90% of the budget; nothing while it is under budget."""
-    total = sum(b for _, b, _ in files)
+def plan_node(files: list[tuple[float, int, str]], budget: int, total: int | None = None) -> list[tuple[float, int, str]]:
+    """Oldest first until the store (total, by default the files' sum) fits in 90% of the budget; nothing while it is
+    under budget."""
+    total = sum(b for _, b, _ in files) if total is None else total
     if total <= budget:
         return []
     goal = int(budget * 0.9)
@@ -137,14 +423,15 @@ def sweep(root: Path) -> int:
     return freed
 
 
-def take_lock(path: Path):
-    """The host lock without waiting, or None when a build holds it. No lock file: no lock."""
+def take_lock(path: Path, shared: bool = False):
+    """The host lock without waiting, or None when a build holds it. No lock file: no lock. shared: runner jobs hold
+    it shared for their whole run (docs/CMUX_MINI_RUNNER.md), so only a fleet build's exclusive hold refuses it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)  # flock needs no write access
     except FileNotFoundError:
         return -1
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except OSError as e:
         os.close(fd)
         if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
@@ -153,14 +440,25 @@ def take_lock(path: Path):
     return fd
 
 
-def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
-    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe."""
+def free_fraction(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    return usage.free / usage.total if usage.total else 1.0
+
+
+def store_gc(root: Path, keep_days: int, now: float | None = None, free: float | None = None) -> dict:
+    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe. Under disk pressure
+    (less than GC_PRESSURE of the volume free) it keeps half the days, at least GC_MIN_KEEP_DAYS, every 6 hours."""
     store, binary, stamp = root / "fleet-store", root / "bin" / "fleet-cas", root / "run" / "gc.last"
     if not (store / "kv").is_dir() or not (store / "cas").is_dir():
         return {}
     now = time.time() if now is None else now
+    free = free_fraction(store) if free is None else free
+    pressed = free < GC_PRESSURE
+    every = GC_EVERY_PRESSED if pressed else GC_EVERY
+    if pressed:
+        keep_days = max(GC_MIN_KEEP_DAYS, keep_days // 2)
     try:
-        if now - stamp.stat().st_mtime < GC_EVERY:
+        if now - stamp.stat().st_mtime < every:
             return {"gc": "not due"}
     except FileNotFoundError:
         pass
@@ -185,20 +483,51 @@ def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
         return {"gc": "skipped: kept entries name no stored object, so the ID heuristic is suspect",
                 "gc_dry_run": dry}
     code, real = gc()
-    return {"gc": "ran" if code == 0 else "failed", "gc_dry_run": dry, "gc_run": real}
+    return {"gc": "ran" if code == 0 else "failed", "gc_keep_days": keep_days, "gc_free": round(free, 3),
+            "gc_dry_run": dry, "gc_run": real}
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="delete (default: plan only)")
     ap.add_argument("--node-gib", type=float, default=20, help="node-store budget (default %(default)s)")
-    ap.add_argument("--local-cas-gib", type=float, default=30,
+    ap.add_argument("--local-cas-gib", type=float, default=20,
                     help="the local Xcode CAS goes whole above this (default %(default)s)")
+    ap.add_argument("--local-cas-quiet-min", type=float, default=60,
+                    help="while builds run, the local CAS goes only if untouched this long (default %(default)s)")
+    ap.add_argument("--node-only", action="store_true",
+                    help="only the node-store cap: no local CAS, no sweep, no fleet-store gc")
+    ap.add_argument("--cap-only", action="store_true",
+                    help="only the node-store cap and the local CAS cap: no sweep, no fleet-store gc")
+    ap.add_argument("--store-gc-only", action="store_true",
+                    help="only the fleet-store gc, for a store host with a custom store root under /Volumes")
     ap.add_argument("--gc-keep-days", type=int, default=14,
                     help="on the store host: fleet-cas gc keeps entries used within this many days")
     a = ap.parse_args(argv)
+    if a.cap_only and (a.node_only or a.store_gc_only):
+        ap.error("--cap-only excludes --node-only and --store-gc-only")
+    caps = a.node_only or a.cap_only  # the caps alone: no sweep, no gc, and the node cap needs no build check
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
-    if a.apply:
+    if a.store_gc_only:
+        # A dedicated store volume (glaeda-fleet-cas checks it is its own APFS volume under /Volumes) holds no mini
+        # cache and no toolchain, and the host need not run glaeda-disk, so the mini guards below do not apply.
+        if not os.fspath(ROOT).startswith("/Volumes/"):
+            rec["result"] = f"refused: --store-gc-only needs a store root under /Volumes, not {ROOT}"
+            print(json.dumps(rec))
+            return 2
+        rec.update(store_gc(ROOT, a.gc_keep_days) if a.apply else {"gc": "plan only"})
+        rec["result"] = "ok"
+        print(json.dumps(rec))
+        return 0
+    if a.apply and (held := reserved_above_floor()):  # a reserved host's caches are its holder's until the floor
+        rec["result"] = f"deferred: {held}"
+        print(json.dumps(rec))
+        return 0
+    if a.apply and (held := toolchain_overlap([ROOT, ROOT / "cas", ROOT / "node-store" / "cas", ROOT / "node-store" / "kv"])):
+        rec["result"] = f"deferred: {held}"
+        print(json.dumps(rec))
+        return 0
+    if a.apply and not caps:
         rec.update(store_gc(ROOT, a.gc_keep_days))
     if not (ROOT / "fleet-cas.env").exists():
         rec["result"] = "no fleet-cas on this host"
@@ -207,65 +536,58 @@ def main(argv: list[str] | None = None) -> int:
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
     commands = running_commands()
-    if commands is None:
+    if commands is None and not caps:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"
         print(json.dumps(rec))
         return 0
-    if a.apply and (why := busy(commands)):
-        rec["result"] = f"deferred: a build is running ({why})"
-        print(json.dumps(rec))
-        return 0
-    if a.apply:
+    building = busy(commands) if commands is not None else "ps failed"  # the caps: the node cap needs no build check
+    if a.apply and not caps:
         rec["swept_bytes"] = sweep(ROOT)
     # Measure and plan with no lock held: these walks are the slow part.
     local = ROOT / "cas"
+    # measured in every mode (--node-only too): glaeda-disk's cache budget counts both stores from this report
     local_bytes = tree_bytes(local) if local.is_dir() else 0
     rec["local_cas_bytes"] = local_bytes
-    drop_local = not writer and local_bytes > a.local_cas_gib * GIB
+    corrupt = corrupt_local_cas(local) if not writer and not a.node_only else ""
+    drop_local = not writer and not a.node_only and (local_bytes > a.local_cas_gib * GIB or bool(corrupt))
+    ps_failed = drop_local and commands is None  # only --cap-only gets here without ps: the local CAS waits
     store = ROOT / "node-store"
     files = node_files(store) if store.is_dir() else []
     rec["node_store_bytes"] = sum(b for _, b, _ in files)
-    doomed = [] if writer else plan_node(files, int(a.node_gib * GIB))
-    rec["local_cas"] = ("kept: the writer empties it before every writer build" if writer
-                        else ("would remove" if drop_local else "within budget"))
-    rec["node_store"] = ("kept: the writer's node store must match the fleet store" if writer
-                         else f"would remove {len(doomed)} oldest files, "
-                              f"{sum(b for _, b, _ in doomed) / GIB:.1f} GiB")
-    if not a.apply or not (drop_local or doomed):
+    # the writer's kv/ entries stay (above); its objects count against the cap with them
+    prunable = [f for f in files if not writer or f"{os.sep}kv{os.sep}" not in f[2][len(os.fspath(store)):]]
+    doomed = plan_node(prunable, int(a.node_gib * GIB), total=rec["node_store_bytes"])
+    rec["local_cas"] = ("not judged (--node-only)" if a.node_only
+                        else "kept: the writer empties it before every writer build" if writer
+                        else "deferred: ps failed, cannot rule out a running build" if ps_failed
+                        else (f"would remove ({corrupt})" if corrupt
+                              else "would remove" if drop_local else "within budget"))
+    rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
+    if not a.apply:
         rec["result"] = "ok"
         print(json.dumps(rec))
         return 0
-    lock = take_lock(HOST_LOCK)
-    if lock is None:
-        rec["result"] = "deferred: a build holds the host lock"
-        print(json.dumps(rec))
-        return 0
-    renamed = None
-    try:
-        again = running_commands()
-        if again is None or (why := busy(again)):
-            rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
-            print(json.dumps(rec))
-            return 0
-        if drop_local and local.is_dir():
-            renamed = ROOT / f"{PRUNING}{os.getpid()}"
-            os.rename(local, renamed)
-            rec["local_cas"] = "removed"
-        freed = 0
+    freed = 0
+    if doomed:  # the hard cap: no lock and no build check; a file a running build still wants is fetched again
         for _, b, p in doomed:
             try:
                 os.unlink(p)
                 freed += b
             except FileNotFoundError:
                 pass
-        if doomed:
-            rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
-    finally:
-        if lock != -1:
-            os.close(lock)
-    if renamed is not None:  # the slow part, with the lock released: nothing reads this path
+        rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
+    rec["node_store_freed_bytes"] = freed
+    renamed, rec["result"] = None, "ok"
+    if ps_failed:
+        rec["result"] = rec["local_cas"]
+    elif drop_local:
+        rec["local_cas"], renamed = drop_local_cas(local, building, a.local_cas_quiet_min * 60, corrupt=bool(corrupt))
+        if rec["local_cas"] != "removed":
+            rec["result"] = rec["local_cas"]
+        elif corrupt:
+            rec["local_cas"] = f"removed ({corrupt})"
+    if renamed is not None:  # the slow part, with the locks released: nothing reads this path
         shutil.rmtree(renamed, ignore_errors=True)
-    rec["result"] = "ok"
     print(json.dumps(rec))
     return 0
 

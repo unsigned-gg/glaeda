@@ -1,5 +1,13 @@
 # Roadmap
 
+> **Status, 2026-11:** the milestones below (M1 to M7, the Lima/VZ disposable-worker and resident
+> runtime track in `src/`) are paused. The live track is the cmux runner fleet and its tooling in
+> `scripts/`: [`CMUX_MINI_RUNNER.md`](CMUX_MINI_RUNNER.md), [`GLAEDA_OTA.md`](GLAEDA_OTA.md),
+> [`GLAEDA_ROUTE.md`](GLAEDA_ROUTE.md), [`FLEET_OPERATIONS.md`](FLEET_OPERATIONS.md),
+> [`FLEET_STATUS.md`](FLEET_STATUS.md), [`DEVBOX_DISK_AND_PROJECTS.md`](DEVBOX_DISK_AND_PROJECTS.md) and
+> [`../skills/github-ci-wait/SKILL.md`](../skills/github-ci-wait/SKILL.md). This page still owns the
+> runtime track's open work: the threat model's unenforced controls cite its milestone headings.
+
 Glaeda's product goal is **blazingly hot, trust-tiered execution for compute workloads**.
 
 The core rule is:
