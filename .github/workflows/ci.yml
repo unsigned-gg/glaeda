@@ -33,7 +33,8 @@ jobs:
   # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
     if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
-    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -107,7 +108,8 @@ jobs:
   go:
     needs: changes
     if: ${{ needs.changes.outputs.go == 'true' }}
-    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
 
     steps:
@@ -138,7 +140,8 @@ jobs:
   scripts:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
 
     steps:
@@ -404,7 +407,8 @@ jobs:
   runner-tests:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -434,7 +438,8 @@ jobs:
   lint:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -514,7 +519,8 @@ jobs:
   test:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -570,7 +576,8 @@ jobs:
   cli:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 15
 
     steps:
@@ -710,7 +717,8 @@ jobs:
     name: fleet-cas-build (x86_64-unknown-linux-gnu)
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.fleet_cas == 'true' }}
-    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -773,7 +781,8 @@ jobs:
     name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
     needs: [changes, go, scripts, runner-tests, lint, test, cli, fleet-cas-build]
-    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
+    runs-on: {group: ent-cygnus, labels: [cygnus]}  # hardened Kata ARC fleet
+    container: harbor.unsigned.gg/platform/ci-rust-runner:v0.1.14@sha256:d73d3748c0f22e7386109d12b01ccdf7282b0f529aab2c629b4e5ed558d42bc1
     timeout-minutes: 5
     steps:
       - name: Require every Verify job
