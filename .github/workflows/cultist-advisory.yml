@@ -21,7 +21,7 @@ concurrency:
 jobs:
   diff:
     name: change-scoped evidence
-    runs-on: ubuntu-24.04
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 10
     continue-on-error: true
     env:

@@ -1,7 +1,11 @@
 name: Podman closure probe
 
+# Requires sudo apt-get and privileged Podman probes on GitHub-hosted Ubuntu images
+# (SOP: ci-runner-always-internal). Scoped off pull_request onto push (main) and
+# workflow_dispatch so PRs run 100% self-hosted.
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - .github/workflows/podman-closure-probe.yml
       - scripts/test-podman-closure-package.sh

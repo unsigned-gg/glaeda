@@ -19,7 +19,7 @@ concurrency:
 jobs:
   fresh-hosted:
     name: Fresh hosted control
-    runs-on: ubuntu-24.04
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 15
     steps:
       - name: Check out repository
@@ -56,7 +56,7 @@ jobs:
 
   prepared-hosted:
     name: Cache-prepared hosted control
-    runs-on: ubuntu-24.04
+    runs-on: {group: ent-default, labels: [ci-rust]}  # estate Rust toolchain runner (SOP: ci-runner-always-internal)
     timeout-minutes: 15
     steps:
       - name: Check out repository

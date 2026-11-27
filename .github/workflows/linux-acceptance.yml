@@ -1,7 +1,11 @@
 name: Linux acceptance
 
+# Requires sudo apt-get (musl-tools) and Docker daemon, which are unavailable on
+# Cygnus ARC self-hosted runners (SOP: ci-runner-always-internal). Scoped off
+# pull_request onto push (main) and workflow_dispatch so PRs run 100% self-hosted.
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - .github/workflows/linux-acceptance.yml
       - scripts/macbook-runner-vm.sh

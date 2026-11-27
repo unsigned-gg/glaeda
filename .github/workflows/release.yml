@@ -22,7 +22,7 @@ jobs:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
-          - runner: ubuntu-24.04
+          - runner: {group: ent-default, labels: [ci-rust]}
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -62,7 +62,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: {group: ent-default, labels: [self-hosted]}  # estate runner fleet (SOP: ci-runner-always-internal)
     timeout-minutes: 15
     if: github.repository == 'teamleaderleo/glaeda' && github.ref == 'refs/heads/main'
     # canary.json has this one writer; a newer push waiting here supersedes an older pending one
